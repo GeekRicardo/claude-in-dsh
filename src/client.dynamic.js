@@ -1,4 +1,4 @@
-// cc-mode Client half (v49) — composer controls + Claude-shaped tool rows,
+// cc-mode Client half (v58) — composer controls + Claude-shaped tool rows,
 // wearing dsh's own chrome.
 //
 // Nothing here renders a conversation: the transcript is dsh's own, because the
@@ -205,12 +205,15 @@ return {
       shadowHolders += 1
       if (shadowDisposers.length > 0) return
       try {
-        shadowDisposers.push(slots.register({ name: 'conversation.input.model' }, ClaudeModelSeat))
+        // priority -1: lowest renders, so this seat shadows the shipped one. The
+        // dynamic runner assigned a negative priority implicitly; a bundle must
+        // say it, or a single slot refuses the second registration at 0.
+        shadowDisposers.push(slots.register({ name: 'conversation.input.model', priority: -1 }, ClaudeModelSeat))
       } catch (error) {
         console.error('cc-mode: could not shadow the model seat:', error)
       }
       try {
-        shadowDisposers.push(slots.register({ name: 'conversation.input.plan' }, ClaudePostureSeat))
+        shadowDisposers.push(slots.register({ name: 'conversation.input.plan', priority: -1 }, ClaudePostureSeat))
       } catch (error) {
         console.error('cc-mode: could not shadow the access seat:', error)
       }
@@ -221,7 +224,7 @@ return {
       // dsh-balance itself is untouched; it never learns this happened.
       try {
         shadowDisposers.push(slots.register(
-          { name: 'conversation.composer.dock', id: 'dsh-balance', order: 10, label: 'Claude usage' },
+          { name: 'conversation.composer.dock', id: 'dsh-balance', order: 10, label: 'Claude usage', priority: -1 },
           UsageReadout,
         ))
       } catch (error) {
@@ -1479,6 +1482,6 @@ return {
       document.body.removeAttribute('data-ccmode')
     }, 'cc-mode: release the shadowed seats')
 
-    console.log('cc-mode: client v56 ready — native chrome, ' + Object.keys(TOOL_SUMMARY).length + ' tool rows')
+    console.log('cc-mode: client v58 ready — native chrome, ' + Object.keys(TOOL_SUMMARY).length + ' tool rows')
   },
 }
