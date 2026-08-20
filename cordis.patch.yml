@@ -1,0 +1,8 @@
+# claude-in-dsh bundle patch
+#
+# 安装后（dependencies + dsh.profile.bundles 均含 claude-in-dsh），
+# 启动时 profile boot 合并本 patch，把插件行插入 host composition。
+# 本行只消费宿主服务、不发布服务，所以不包 isolate realm。
+- insert:
+    - id: claude-in-dsh
+      name: 'claude-in-dsh'
