@@ -1630,12 +1630,12 @@ return {
           }
         }
         if (forked) {
-          projectClaudeEvents(session, [],
+          queueProjection(sessionId, [],
             '（终端侧这段 Claude 对话有 ' + rows.length + ' 条新消息，位于另一条分支；dsh 里已续聊，两条分支无法合并，故不自动同步。）')
           console.log('cc-mode:', sessionId, 'terminal branch advanced by', rows.length, 'message(s) — forked, notice only')
           return 0
         }
-        const written = projectClaudeEvents(session, rows, '')
+        const written = queueProjection(sessionId, rows, '')
         console.log('cc-mode:', sessionId, 'mirrored', written, 'terminal message(s) into the imported conversation')
         return written
       })()
@@ -1707,7 +1707,7 @@ return {
       persistStates()
       if (stranded.length === 0) return 0
 
-      const written = projectClaudeEvents(session, stranded,
+      const written = queueProjection(sessionId, stranded,
         '（这段回复此前因为轮次编号问题没能显示出来，这里补回；插件已改为与 dsh 一致的编号方式。）')
       console.log('cc-mode:', sessionId, 'recovered', written, 'message(s) stranded by the old turn numbering')
       return written
@@ -1806,7 +1806,7 @@ return {
           return 0
         }
 
-        const written = projectClaudeEvents(session, fresh,
+        const written = queueProjection(sessionId, fresh,
           '（dsh 重启期间 Claude 继续完成了这一轮，以下是断档期间的内容。）')
         await new Promise((resolve) => {
           const writer = silenceStdin(subprocess.spawn({
@@ -1837,42 +1837,56 @@ return {
      * proper boundaries in the high-numbered import band, one turn per human
      * prompt, tools through the live mapping. Returns messages written.
      */
-    function projectClaudeEvents(session, kept, notice) {
-      // Numbering is the whole ballgame here, and the lesson was expensive:
-      // dsh's history assembly DROPS a turn whose number is lower than one it
-      // has already seen. The live agent numbers turns from a counter it read
-      // when it was constructed, so any number this plugin invents is one the
-      // agent may later undercut — an earlier design projected into a high
-      // band (1000000+) and every subsequent live turn silently vanished from
-      // the transcript on reload.
-      //
-      // So projections invent NO turn at all. They append into the location
-      // the log already ends at, using step numbers above whatever that turn
-      // used. The log's turn sequence stays exactly as dsh wrote it, and the
-      // projected content renders at the end where it belongs.
-      // The anchor is the HIGHEST-numbered turn, not the last one written. In a
-      // log already scrambled by the old band numbering the final turn can be a
-      // low number sitting after a high one, and appending there would inherit
-      // exactly the backwards-turn problem this avoids.
-      let anchorTurn
-      for (const event of session.events) {
-        if (event.type !== 'turn/start' || typeof event.data.turn !== 'number') continue
-        if (anchorTurn === undefined || event.data.turn > anchorTurn) anchorTurn = event.data.turn
-      }
-      let anchorStep = 0
-      if (anchorTurn !== undefined) {
-        for (const event of session.events) {
-          const data = event.data || {}
-          if (data.turn !== anchorTurn) continue
-          if (typeof data.step === 'number' && data.step > anchorStep) anchorStep = data.step
-        }
-      }
+    // Content waiting for a turn of its own. A projection cannot invent a turn
+    // number safely, so it queues here and the agent is woken with a carrier
+    // message: dsh opens the next turn, the pre-step seam sees the carrier, and
+    // the content is written into that turn. No model call is made.
+    const pendingProjections = new Map()
 
-      // Tool calls this transcript already carries. Re-emitting one is not a
-      // harmless duplicate: dsh's conversation assembly refuses a second start
-      // for the same call id ("received more than one start Match") and the
-      // whole history load fails. Projections therefore skip any call already
-      // present, and skip a result whose call is not in this projection.
+    function queueProjection(sessionId, rows, notice) {
+      if ((rows === undefined || rows.length === 0) && (notice === undefined || notice.length === 0)) return 0
+      const queued = pendingProjections.get(sessionId) || []
+      queued.push({ rows: rows || [], notice: notice || '' })
+      pendingProjections.set(sessionId, queued)
+      if (agents === undefined) return 0
+      let agent
+      try { agent = agents.get(sessionId) } catch (error) { agent = undefined }
+      if (agent === undefined || typeof agent.followup !== 'function') return 0
+      try {
+        agent.followup({
+          id: uuid(),
+          role: 'user',
+          content: [{ type: 'text', text: CARRIER_TEXT }],
+          source: { kind: 'plugin', plugin: 'claude-in-dsh' },
+        })
+      } catch (error) {
+        console.error('cc-mode: could not wake the agent to render projected content:', errorText(error))
+      }
+      return rows === undefined ? 0 : rows.length
+    }
+
+    /** Marker text of the carrier message; never shown, never sent to Claude. */
+    const CARRIER_TEXT = '\u0000claude-in-dsh:render-pending\u0000'
+
+    function isCarrier(message) {
+      const content = message === undefined ? undefined : message.content
+      if (!Array.isArray(content)) return false
+      return content.some((block) => block && block.type === 'text' && block.text === CARRIER_TEXT)
+    }
+
+    function projectClaudeEvents(session, kept, notice, turn) {
+      // Content projected outside a live turn used to invent its own turn
+      // number, and every scheme was wrong in a different way: a high band left
+      // dsh's later turns non-monotonic (they vanished on reload), and
+      // appending into an existing turn produced updates whose `turn/start` sat
+      // outside the loaded history window ("received an update before its
+      // start Match").
+      //
+      // So a projection numbers nothing. The caller hands it the turn dsh
+      // itself opened — the plugin wakes the agent with a carrier message and
+      // dsh assigns the next number — and this writes into that turn with its
+      // own step numbering. Every start is in the window with its updates, and
+      // the turn sequence stays entirely dsh's.
       const knownCallIds = new Set()
       const answeredCallIds = new Set()
       for (const event of session.events) {
@@ -1885,17 +1899,10 @@ return {
       }
 
       const openedHere = []
-      const fresh = anchorTurn === undefined
-      const turn = fresh ? 1 : anchorTurn
-      let step = fresh ? 0 : anchorStep
+      let step = 0
+      let stepOpen = false
       const append = (type, data) => session.append(type, data,
         type === 'user/message' || type === 'assistant/message' || type === 'tool/result' ? { surfaceOp: 'append' } : undefined)
-
-      // A session with no turn at all (a fresh import) still needs one, and
-      // turn 1 is what the agent itself would use next: equal numbers merge
-      // into one location, they never go backwards.
-      if (fresh) append('turn/start', { turn: turn })
-      let stepOpen = false
       const closeStep = () => { if (stepOpen) { append('step/end', { turn: turn, step: step }); stepOpen = false } }
       const openStep = () => {
         closeStep()
@@ -1924,20 +1931,18 @@ return {
           const results = content.filter((block) => block && block.type === 'tool_result')
           if (results.length > 0) {
             for (const block of results) {
-              // Skip only a result the transcript already has. A call that is
-              // in the log but still unanswered needs exactly this result —
-              // dropping it (an earlier version did) left the card waiting and
-              // the turn teardown then stamped it "没有等到结果".
+              // Skip only a result the transcript already has; a call that is
+              // logged but still unanswered needs exactly this result.
               const resultFor = String(block.tool_use_id || '')
               if (answeredCallIds.has(resultFor)) continue
               answeredCallIds.add(resultFor)
               if (!stepOpen) openStep()
               append('tool/result', { turn: turn, step: step, message: {
                 id: uuid(), role: 'user',
-                source: { kind: 'tool', callId: String(block.tool_use_id || '') },
+                source: { kind: 'tool', callId: resultFor },
                 content: [{
                   type: 'tool-result',
-                  toolCallId: String(block.tool_use_id || ''),
+                  toolCallId: resultFor,
                   content: resultBlocksOf(block.content),
                   isError: block.is_error === true,
                 }],
@@ -1948,9 +1953,9 @@ return {
           }
           let text = content.filter((block) => block && block.type === 'text' && typeof block.text === 'string')
             .map((block) => block.text).join('\n\n').trim()
-          // Terminal bookkeeping the CLI logs as user messages. A slash command
-          // becomes the line the user actually typed; its stdout echo and the
-          // caveat wrapper are not conversation and are dropped.
+          // Terminal bookkeeping the CLI logs as user messages: a slash command
+          // becomes the line the user typed; stdout echoes and caveat wrappers
+          // are not conversation.
           if (text.indexOf('<command-name>') !== -1) {
             const name = (text.match(/<command-name>([^<]*)<\/command-name>/) || [])[1] || ''
             const argsText = (text.match(/<command-args>([^<]*)<\/command-args>/) || [])[1] || ''
@@ -1982,13 +1987,10 @@ return {
           append('tool/call', { turn: turn, step: step, callId: block.id, name: block.name, arguments: block.arguments })
         }
       }
+
       closeStep()
-      if (fresh) append('turn/end', { turn: turn, reason: { kind: 'blocked' } })
-      // Deliberately NOT repairDanglingToolCalls here: that closes every
-      // unanswered call in the WHOLE session, and a projection has no business
-      // declaring older calls dead — it produced a wall of red "没有等到结果"
-      // rows. Calls this projection itself opened and could not answer are
-      // closed below; everything else is left to the turn that owns it.
+      // Only calls this projection opened and could not answer; the session-wide
+      // teardown would stamp every older unanswered call red.
       for (const callId of openedHere) {
         if (answeredCallIds.has(callId)) continue
         append('tool/result', { turn: turn, step: step, message: {
@@ -2026,7 +2028,7 @@ return {
       // sync's business, never lost between the two.
       const sizeAtImport = await fileSizeOfShellWord(path)
       const raw = await runCapture(['/bin/sh', '-c',
-        'grep -E \'"type":"(user|assistant)"\' ' + path + ' 2>/dev/null | tail -c 3000000'], 20000)
+        'grep -E \'"type":"(user|assistant)"\' ' + path + ' 2>/dev/null'], 120000)
 
       const rows = []
       for (const line of String(raw).split('\n')) {
@@ -2037,13 +2039,8 @@ return {
         if (event.message === null || event.message === undefined) continue
         rows.push(event)
       }
-      const LIMIT = 240
-      const dropped = rows.length > LIMIT ? rows.length - LIMIT : 0
-      const kept = dropped > 0 ? rows.slice(rows.length - LIMIT) : rows
-
-      const written = projectClaudeEvents(session, kept, dropped > 0
-        ? '（导入截断：更早的 ' + dropped + ' 条消息未回填；Claude 侧上下文完整，继续对话不受影响。）'
-        : '')
+      // No window: a truncated import is a lie about the conversation.
+      const written = queueProjection(sessionId, rows, '')
       const state = stateOf(sessionId, session)
       state.jsonlOffset = sizeAtImport
       persistStates()
@@ -2087,7 +2084,7 @@ return {
       } catch (error) {
         console.error('cc-mode: could not title the imported conversation:', errorText(error))
       }
-      return { backfilled: written, dropped: dropped }
+      return { backfilled: written, dropped: 0 }
     }
 
     /**
@@ -2339,6 +2336,7 @@ return {
      */
     function hasHumanMessage(messages) {
       for (const message of messages || []) {
+        if (isCarrier(message)) continue
         const source = message.source
         if (source === undefined || source.kind === 'user') return true
       }
@@ -2353,7 +2351,7 @@ return {
     function carryContext(sessionId, messages) {
       const carried = carriedContext.get(sessionId) || []
       for (const message of messages || []) {
-        if (carriesRuntimeNoise(message)) continue
+        if (carriesRuntimeNoise(message) || isCarrier(message)) continue
         const text = textOf(message)
         if (text.length > 0) carried.push(text.slice(0, 2000))
       }
@@ -2371,7 +2369,7 @@ return {
     function promptTextOf(messages) {
       const parts = []
       for (const message of messages || []) {
-        if (carriesRuntimeNoise(message)) continue
+        if (carriesRuntimeNoise(message) || isCarrier(message)) continue
         const text = textOf(message)
         if (text.length > 0) parts.push(text)
       }
@@ -2432,6 +2430,20 @@ return {
 
       repairDanglingToolCalls(session)
 
+      // A turn dsh opened for the plugin's own carrier: render the queued
+      // projection into THIS turn (dsh numbered it, so every start sits in the
+      // window with its updates) and end the turn without touching Claude.
+      const queued = pendingProjections.get(sessionId)
+      if (queued !== undefined && queued.length > 0) {
+        pendingProjections.delete(sessionId)
+        let total = 0
+        for (const batch of queued) total += projectClaudeEvents(session, batch.rows, batch.notice, turn)
+        console.log('cc-mode: rendered', total, 'projected message(s) into turn', turn, 'on', sessionId)
+        // Anything the user actually said in the same wake still deserves a
+        // real turn: fall through only when there is nothing human here.
+        if (!hasHumanMessage(messages)) return
+      }
+
       // Pasted images ride the last human message of this turn. dsh's
       // UserMessage objects are FROZEN, so the images go onto a copy — pushing
       // into the original throws "object is not extensible" and kills the turn.
@@ -2444,7 +2456,7 @@ return {
           if (source === undefined || source.kind === 'user') { imageTarget = index; break }
         }
       }
-      messages.forEach((message, index) => {
+      messages.filter((message) => !isCarrier(message)).forEach((message, index) => {
         const logged = index === imageTarget
           ? Object.assign({}, message, {
               content: (message.content || []).concat(images.map((image) => ({ type: 'image', attachment: image.attachment }))),
@@ -2842,7 +2854,7 @@ return {
         const session = sessionOf(sessionId)
         if (session === undefined) return { ok: false, reason: 'session not live' }
         const rows = [{ type: 'assistant', message: { model: 'claude-code', content: [{ type: 'text', text: String(args.text || 'PROJECTION-PROBE') }] } }]
-        const written = projectClaudeEvents(session, rows, '')
+        const written = queueProjection(sessionId, rows, '')
         let last = 0
         for (const event of session.events) {
           if (event.type === 'turn/start' && typeof event.data.turn === 'number') last = event.data.turn
@@ -3050,6 +3062,6 @@ return {
     reapIdleBrokers().catch((error) => console.error('cc-mode: reap failed:', errorText(error)))
     ctx.interval(() => { reapIdleBrokers().catch(() => undefined) }, 10 * 60 * 1000)
 
-    console.log('cc-mode: host v82 ready — approval bridge', approval === undefined ? 'off' : 'on')
+    console.log('cc-mode: host v86 ready — approval bridge', approval === undefined ? 'off' : 'on')
   },
 }
