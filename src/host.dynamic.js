@@ -837,6 +837,12 @@ return {
                 run.push(undefined)
                 continue
               }
+              // Checkpoint at every turn boundary. attach.json used to be
+              // written only by a clean detach, so a killed dsh left a stale
+              // offset and the next drain replayed a stretch that had already
+              // been rendered live — duplicate tool calls whose results then
+              // paired across turns, leaving cards spinning forever.
+              if (value.type === 'result') checkpointOffset(run)
               run.push(value)
             }
           }
@@ -850,6 +856,28 @@ return {
           run.push(undefined)
         }
       })()
+    }
+
+    /** Record how far this attach has consumed, so a hard kill cannot lie. */
+    function checkpointOffset(run) {
+      if (run.checkpointing === true) return
+      run.checkpointing = true
+      const offset = run.offset
+      const writer = silenceStdin(subprocess.spawn({
+        argv: ['/bin/sh', '-c', 'cat > ' + shellQuote(run.dir + '/attach.json')],
+        cwd: '/',
+        stdio: { stdin: 'pipe', stdout: 'ignore', stderr: 'ignore' },
+        graceMs: 1000,
+      }))
+      if (writer === undefined || writer === null || writer.stdin === undefined) {
+        run.checkpointing = false
+        return
+      }
+      try {
+        writer.stdin.write(JSON.stringify({ offset: offset }))
+        writer.stdin.end()
+      } catch (error) { /* the next checkpoint tries again */ }
+      writer.done.then(() => { run.checkpointing = false }, () => { run.checkpointing = false })
     }
 
     /** Put one line into a run's fifo and wait until it is actually in. */
@@ -1052,7 +1080,13 @@ return {
      * every reason to exist. A directory whose log has not moved for hours and
      * which this process is not attached to is done.
      */
-    const IDLE_REAP_MS = 6 * 60 * 60 * 1000
+    // An idle Claude is a whole Node process (hundreds of MB). Six hours was
+    // far too generous on a small machine: brokers for conversations nobody
+    // had touched in hours sat in RAM and swap. Forty-five minutes still
+    // survives a lunch break, a dsh restart, and any plugin update, and the
+    // conversation resumes from ~/.claude with --resume anyway — the cost of
+    // reaping is one process start on the next message, not lost context.
+    const IDLE_REAP_MS = 45 * 60 * 1000
 
     async function reapIdleBrokers() {
       const listing = await runCapture(['/bin/sh', '-c',
@@ -1060,14 +1094,25 @@ return {
         + '[ -d "$d" ] || continue; '
         + 'echo "$d|$(stat -c %Y "$d/out.log" 2>/dev/null || echo 0)"; done'], 8000)
       const now = Date.now()
+      // Sessions dsh still knows about. A broker for a conversation that no
+      // longer exists (deleted, or from an older dsh state) is pure waste and
+      // goes as soon as it is idle at all.
+      const alive = new Set()
+      if (agents !== undefined) {
+        try { for (const agent of agents.list()) alive.add(String(agent.id)) } catch (error) { /* keep the age rule */ }
+      }
       for (const line of String(listing).split('\n')) {
         const parts = line.trim().split('|')
         if (parts.length !== 2 || parts[0].length === 0) continue
         const dir = parts[0]
         const touchedAt = parseInt(parts[1], 10) * 1000
-        if (isNaN(touchedAt) || now - touchedAt < IDLE_REAP_MS) continue
+        if (isNaN(touchedAt)) continue
+        const idleMs = now - touchedAt
+        const orphaned = alive.size > 0 && !alive.has(dir.slice(BROKER_ROOT.length + 1))
+        if (idleMs < (orphaned ? 5 * 60 * 1000 : IDLE_REAP_MS)) continue
         const sessionId = dir.slice(BROKER_ROOT.length + 1)
         if (runs.has(sessionId)) continue
+        if (activeTurns.has(sessionId)) continue
         const meta = await readJsonFile(dir + '/meta.json')
         if (meta !== null) {
           await runCapture(['/bin/sh', '-c',
@@ -1075,7 +1120,8 @@ return {
             + 'kill ' + (typeof meta.brokerPid === 'number' ? meta.brokerPid : 0) + ' 2>/dev/null; true'], 5000)
         }
         await runCapture(['/bin/sh', '-c', 'rm -rf ' + shellQuote(dir)], 5000)
-        console.log('cc-mode: reaped an idle Claude broker for', sessionId)
+        console.log('cc-mode: reaped a Claude broker for', sessionId,
+          '— idle', Math.round(idleMs / 60000), 'min' + (orphaned ? ', no live dsh session' : ''))
       }
     }
 
@@ -1654,7 +1700,32 @@ return {
         // its bytes for the live attach that will carry it on.
         if (!sawResult || rows.length === 0) return 0
 
-        const written = projectClaudeEvents(session, rows,
+        // Anchor against what the transcript already holds. Tool-use ids are
+        // the reliable seam: if this stretch overlaps content that was already
+        // rendered live, everything up to the last id dsh knows is a replay,
+        // and projecting it would duplicate calls whose results then pair
+        // across turns — which is exactly how a card ends up spinning forever.
+        const known = new Set()
+        for (const event of session.events) {
+          if (event.type === 'tool/call' && event.data && typeof event.data.callId === 'string') known.add(event.data.callId)
+        }
+        let lastKnown = -1
+        for (let index = 0; index < rows.length; index += 1) {
+          const content = rows[index].message.content
+          if (!Array.isArray(content)) continue
+          for (const block of content) {
+            if (block === null || typeof block !== 'object') continue
+            const id = block.type === 'tool_use' ? block.id : (block.type === 'tool_result' ? block.tool_use_id : undefined)
+            if (typeof id === 'string' && known.has(id)) lastKnown = index
+          }
+        }
+        const fresh = lastKnown === -1 ? rows : rows.slice(lastKnown + 1)
+        if (fresh.length === 0) {
+          console.log('cc-mode:', sessionId, 'drain found nothing new (already rendered live)')
+          return 0
+        }
+
+        const written = projectClaudeEvents(session, fresh,
           '（dsh 重启期间 Claude 继续完成了这一轮，以下是断档期间的内容。）')
         await new Promise((resolve) => {
           const writer = silenceStdin(subprocess.spawn({
@@ -2824,8 +2895,8 @@ return {
       if (total > 0) console.log('cc-mode: repaired', total, 'interrupted tool call(s) across live conversations')
     })
     reapIdleBrokers().catch((error) => console.error('cc-mode: reap failed:', errorText(error)))
-    ctx.interval(() => { reapIdleBrokers().catch(() => undefined) }, 30 * 60 * 1000)
+    ctx.interval(() => { reapIdleBrokers().catch(() => undefined) }, 10 * 60 * 1000)
 
-    console.log('cc-mode: host v73 ready — approval bridge', approval === undefined ? 'off' : 'on')
+    console.log('cc-mode: host v74 ready — approval bridge', approval === undefined ? 'off' : 'on')
   },
 }
