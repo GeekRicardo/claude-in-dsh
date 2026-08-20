@@ -57,6 +57,32 @@ return {
       { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', reasoning: true },
       { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', reasoning: false },
     ]
+    // How much context each model actually has. Claude Code advertises the 1M
+    // window as a model suffix (`claude-opus-5[1m]`), which is why the route
+    // string, not the chosen id, decides.
+    const DEFAULT_CONTEXT_WINDOW = 200000
+    function contextWindowOf(model) {
+      const name = String(model || '')
+      if (name.length === 0) return DEFAULT_CONTEXT_WINDOW
+      if (/\[1m\]/i.test(name) || /-1m\b/i.test(name)) return 1000000
+      if (/haiku/i.test(name)) return 200000
+      return DEFAULT_CONTEXT_WINDOW
+    }
+
+    /**
+     * What the conversation currently occupies, the way waku computes it: the
+     * last call's whole prompt (fresh input + both cache halves) plus what the
+     * model wrote. Anything smaller undercounts a cached conversation to almost
+     * nothing, which is the number that matters least.
+     */
+    function contextTokensOf(usage) {
+      if (usage === null || typeof usage !== 'object') return 0
+      return (Number(usage.input_tokens) || 0)
+        + (Number(usage.cache_read_input_tokens) || 0)
+        + (Number(usage.cache_creation_input_tokens) || 0)
+        + (Number(usage.output_tokens) || 0)
+    }
+
     const EFFORTS = [
       { id: '', name: '默认' },
       { id: 'low', name: 'low' },
@@ -200,6 +226,8 @@ return {
         if (saved.mode === 'claude' || saved.mode === 'dsh') state.mode = saved.mode
         if (typeof saved.route === 'string' && saved.route.length > 0) state.route = saved.route
         if (typeof saved.jsonlOffset === 'number') state.jsonlOffset = saved.jsonlOffset
+        if (typeof saved.contextTokens === 'number') state.contextTokens = saved.contextTokens
+        if (typeof saved.contextWindow === 'number') state.contextWindow = saved.contextWindow
         if (saved.bandRepaired === true) state.bandRepaired = true
         if (typeof saved.permissionMode === 'string' && PERMISSION_MODES.some((entry) => entry.id === saved.permissionMode)) {
           state.permissionMode = saved.permissionMode
@@ -228,6 +256,8 @@ return {
             model: state.model,
             ...(state.route === undefined ? {} : { route: state.route }),
             ...(state.jsonlOffset === undefined ? {} : { jsonlOffset: state.jsonlOffset }),
+            ...(state.contextTokens === undefined ? {} : { contextTokens: state.contextTokens }),
+            ...(state.contextWindow === undefined ? {} : { contextWindow: state.contextWindow }),
             ...(state.bandRepaired === true ? { bandRepaired: true } : {}),
             effort: state.effort,
             ...(claudeSessionId === '' ? {} : { claudeSessionId: claudeSessionId }),
@@ -444,6 +474,13 @@ return {
     function createTranscript(session, turn) {
       let stepNumber = 0
       let open
+      // Every call id this turn has already answered. Parallel tool calls make
+      // the CLI emit the first finished result on its own and then again inside
+      // the complete tool_result array it sends to the API, so the same id
+      // arrives twice. dsh's chat node treats a second result for one call as a
+      // protocol error — the card breaks and the transcript stops rendering
+      // from there. One result per call, whoever writes it.
+      const answered = new Set()
       // Whether this turn put any model text on screen. A one-shot command that
       // answers in its `result` alone must not leave an empty turn behind.
       let loggedAssistant = false
@@ -462,6 +499,8 @@ return {
       function finish(reason) {
         if (open === undefined) return
         for (const call of open.openCalls) {
+          if (answered.has(call)) continue
+          answered.add(call)
           session.append('tool/result', {
             turn: turn,
             step: open.step,
@@ -591,6 +630,8 @@ return {
         for (const block of message.content || []) {
           if (block.type !== 'tool_result') continue
           step.openCalls.delete(block.tool_use_id)
+          if (answered.has(block.tool_use_id)) continue
+          answered.add(block.tool_use_id)
           session.append(
             'tool/result',
             {
@@ -1402,10 +1443,40 @@ return {
      * message, nothing in the transcript. This is how the terminal treats them:
      * `/mcp` or `/context` is a panel you open, not a thing you said.
      */
+    // A one-shot command runs on the live process, which the caller does not
+    // hold open: `/compact` on a long conversation spends minutes inside the
+    // model (measured: 44s on a 23k-token context — this conversation's is two
+    // orders larger), and the CLI reports no progress but its own status line.
+    // So the RPC starts a job and returns; the panel polls it and shows what
+    // Claude is doing. The old design awaited the whole thing behind one fetch
+    // with a 90-second cap, which made every `/compact` "fail" in the UI while
+    // it went right on compacting in the background.
+    const commandJobs = new Map()
+    let commandJobSeq = 0
+    const COMMAND_DEADLINE_MS = 30 * 60 * 1000
+
+    /** Human wording for the CLI's own status line, when it emits one. */
+    function commandStatusText(status) {
+      if (status === 'compacting') return '正在压缩上下文…'
+      if (typeof status === 'string' && status.length > 0) return status + '…'
+      return ''
+    }
+
+    /**
+     * Run one of Claude's own one-shot commands on the session's live process —
+     * no dsh turn, no assistant message, nothing in the transcript. This is how
+     * the terminal treats them: `/mcp` or `/context` is a panel you open, not a
+     * thing you said. Returns the job handle; poll it with `commandJobState`.
+     */
     async function runOneShotCommand(sessionId, cwd, command) {
       if (activeTurns.has(sessionId)) return { busy: true }
       await waitForBorrow(sessionId)
       if (activeTurns.has(sessionId)) return { busy: true }
+
+      commandJobSeq += 1
+      const jobId = 'cmd-' + commandJobSeq
+      const job = { jobId: jobId, sessionId: sessionId, command: command, startedAt: Date.now(), status: '', done: false, text: '', isError: false }
+      commandJobs.set(jobId, job)
 
       const work = (async () => {
         const run = await ensureRun(sessionId, cwd)
@@ -1417,14 +1488,25 @@ return {
         if (run.writeError !== undefined) throw new Error(run.writeError)
 
         let spoken = ''
-        const deadline = Date.now() + 90000
+        let compacted
+        const deadline = Date.now() + COMMAND_DEADLINE_MS
         while (true) {
-          if (Date.now() > deadline) throw new Error('cc-mode: 命令 90 秒没有返回结果')
+          if (Date.now() > deadline) throw new Error('cc-mode: 命令 30 分钟没有返回结果')
           const message = await run.next()
           if (message === undefined) throw new Error('cc-mode: 与 Claude 的连接在命令返回前断开了')
           if (message.type === 'system' && message.subtype === 'init') {
             run.init = message
             rememberCommands(message.slash_commands)
+            continue
+          }
+          if (message.type === 'system' && message.subtype === 'status') {
+            job.status = typeof message.status === 'string' ? message.status : ''
+            continue
+          }
+          // `/compact` answers with an empty `result` — everything worth
+          // reporting rides this boundary event instead.
+          if (message.type === 'system' && message.subtype === 'compact_boundary') {
+            compacted = message.compact_metadata || {}
             continue
           }
           if (message.type === 'assistant') {
@@ -1435,19 +1517,77 @@ return {
           }
           if (message.type !== 'result') continue
           const resultText = typeof message.result === 'string' ? message.result : ''
-          return {
-            text: spoken.trim().length > 0 ? spoken : resultText,
-            isError: message.is_error === true,
+          let text = spoken.trim().length > 0 ? spoken : resultText
+          if (compacted !== undefined) {
+            const before = Number(compacted.pre_tokens) || 0
+            const after = Number(compacted.post_tokens) || 0
+            const seconds = Math.round((Number(compacted.duration_ms) || 0) / 100) / 10
+            text = '上下文已压缩：' + before.toLocaleString('en-US') + ' → ' + after.toLocaleString('en-US')
+              + ' tokens（省下 ' + Math.max(0, before - after).toLocaleString('en-US') + '），用时 ' + seconds + 's。'
+              + (text.trim().length > 0 ? '\n\n' + text : '')
+            const state = stateOf(sessionId)
+            if (after > 0) {
+              state.contextTokens = after
+              state.contextWindow = contextWindowOf(state.route || state.model)
+              persistStates()
+            }
           }
+          return { text: text, isError: message.is_error === true }
         }
       })()
 
       borrowed.set(sessionId, work)
-      try {
-        return await work
-      } finally {
+      work.then((answer) => {
+        job.text = String((answer && answer.text) || '')
+        job.isError = Boolean(answer && answer.isError)
+      }, (error) => {
+        job.text = errorText(error)
+        job.isError = true
+      }).then(() => {
+        job.done = true
+        job.status = ''
+        job.finishedAt = Date.now()
+        // A command that rewrites the session (`/compact` replaces the whole
+        // history with a summary) grows the transcript without a dsh turn. The
+        // mirror measures growth against this offset, so leaving it behind
+        // would make it project Claude's compaction summary into the chat.
+        skipTranscriptGrowth(sessionId)
         if (borrowed.get(sessionId) === work) borrowed.delete(sessionId)
+        // Panels are transient; the job list must not be.
+        setTimeout(() => commandJobs.delete(jobId), 10 * 60 * 1000)
+      })
+
+      return { jobId: jobId }
+    }
+
+    function commandJobState(jobId) {
+      const job = commandJobs.get(jobId)
+      if (job === undefined) return { missing: true }
+      return {
+        done: job.done,
+        text: job.text,
+        isError: job.isError,
+        status: commandStatusText(job.status),
+        elapsedMs: (job.finishedAt || Date.now()) - job.startedAt,
       }
+    }
+
+    /**
+     * Move the transcript mirror past whatever is on disk right now. Anything
+     * this side wrote is already rendered (or deliberately not shown); only what
+     * arrives after this point counts as another writer's work.
+     */
+    function skipTranscriptGrowth(sessionId) {
+      const state = stateOf(sessionId)
+      const run = runs.get(sessionId)
+      const cwd = run !== undefined && typeof run.cwd === 'string' ? run.cwd : ''
+      if (typeof state.jsonlOffset !== 'number' || cwd.length === 0) return
+      if (typeof state.claudeSessionId !== 'string' || state.claudeSessionId.length === 0) return
+      const transcript = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd)) + '/'
+        + shellQuote(state.claudeSessionId + '.jsonl')
+      fileSizeOfShellWord(transcript).then((size) => {
+        if (size > state.jsonlOffset) { state.jsonlOffset = size; persistStates() }
+      }).catch(() => undefined)
     }
 
     function claudeCommands() {
@@ -1627,21 +1767,35 @@ return {
         persistStates()
         if (rows.length === 0) return 0
 
-        // Has the dsh side lived its own turn? (Any turn below the import band.)
-        let forked = false
+        // Whatever is left after the offset is genuinely someone else's
+        // writing — the terminal side, while dsh was idle. Mirror it. The old
+        // "forked, notice only" branch keyed on turn numbers below the import
+        // band, which dense numbering made true for every conversation, so it
+        // fired on the plugin's own output.
+        //
+        // Belt and braces: even with a stale offset, anything whose tool call
+        // is already in the transcript was rendered live and is skipped.
+        const seenCalls = new Set()
         for (const event of session.events) {
-          if (event.type === 'turn/start' && typeof event.data.turn === 'number' && event.data.turn < 1000000) {
-            forked = true
-            break
+          if (event.type === 'tool/call' && event.data && typeof event.data.callId === 'string') {
+            seenCalls.add(event.data.callId)
           }
         }
-        if (forked) {
-          queueProjection(sessionId, [],
-            '（终端侧这段 Claude 对话有 ' + rows.length + ' 条新消息，位于另一条分支；dsh 里已续聊，两条分支无法合并，故不自动同步。）')
-          console.log('cc-mode:', sessionId, 'terminal branch advanced by', rows.length, 'message(s) — forked, notice only')
+        const unseen = rows.filter((event) => {
+          const content = event.message.content
+          if (!Array.isArray(content)) return true
+          for (const block of content) {
+            if (block === null || typeof block !== 'object') continue
+            const id = block.type === 'tool_use' ? block.id : (block.type === 'tool_result' ? block.tool_use_id : undefined)
+            if (typeof id === 'string' && seenCalls.has(id)) return false
+          }
+          return true
+        })
+        if (unseen.length === 0) {
+          console.log('cc-mode:', sessionId, 'transcript grew by', rows.length, 'row(s) this side already rendered')
           return 0
         }
-        const written = queueProjection(sessionId, rows, '')
+        const written = queueProjection(sessionId, unseen, '')
         console.log('cc-mode:', sessionId, 'mirrored', written, 'terminal message(s) into the imported conversation')
         return written
       })()
@@ -2642,6 +2796,12 @@ return {
             continue
           }
           if (message.type === 'result') {
+            const occupied = contextTokensOf(message.usage)
+            if (occupied > 0) {
+              state.contextTokens = occupied
+              state.contextWindow = contextWindowOf(state.route || state.model)
+              persistStates()
+            }
             // Some slash commands answer in the result alone. Nothing rendered
             // plus a result carrying text is exactly that case — show it rather
             // than closing a turn that looks like it did nothing.
@@ -2662,6 +2822,11 @@ return {
         }
       } finally {
         done = true
+        // Claude appends this turn to its own transcript too. The mirror
+        // compares that file against a recorded offset, so without advancing
+        // it here the plugin reads its OWN output back and reports it as
+        // "the terminal side advanced" — which is exactly what it did.
+        skipTranscriptGrowth(sessionId)
         try { stallWatch() } catch (error) { /* already fired */ }
         activeTurns.delete(sessionId)
         if (cancelKill !== null) { try { cancelKill() } catch (error) { /* fired */ } }
@@ -2687,17 +2852,36 @@ return {
       let claimed
       try { claimed = agent.inbox.claim('next-step', active.turn) } catch (error) { return }
       for (const message of claimed) {
-        try { agent.session.append('user/message', message, { surfaceOp: 'append' }) } catch (error) { /* logged below */ }
-        if (carriesRuntimeNoise(message)) continue
+        if (carriesRuntimeNoise(message)) {
+          try { agent.session.append('user/message', message, { surfaceOp: 'append' }) } catch (error) { /* best effort */ }
+          continue
+        }
         const text = textOf(message)
-        if (text.length === 0) continue
+        // Images pasted before a mid-turn interjection belong to it: the
+        // steering path used to drop them on the floor, so a screenshot sent
+        // while Claude was working simply never arrived and the pending rail
+        // never emptied.
+        const images = pendingImages.get(sessionId) || []
+        if (images.length > 0) pendingImages.delete(sessionId)
+        // The transcript shows what was actually sent, images included. dsh's
+        // UserMessage is frozen, so the attachments ride a copy.
+        const shown = images.length === 0 ? message : Object.assign({}, message, {
+          content: (message.content || []).concat(images.map((image) => ({ type: 'image', attachment: image.attachment }))),
+        })
+        try { agent.session.append('user/message', shown, { surfaceOp: 'append' }) } catch (error) { /* logged below */ }
+        if (text.length === 0 && images.length === 0) continue
+        const content = images.map((image) => ({
+          type: 'image',
+          source: { type: 'base64', media_type: image.mediaType, data: image.data },
+        }))
+        if (text.length > 0) content.push({ type: 'text', text: text })
         try {
           active.run.write({
             type: 'user',
-            message: { role: 'user', content: [{ type: 'text', text: text }] },
+            message: { role: 'user', content: content },
             parent_tool_use_id: null,
           })
-          console.log('cc-mode: steered the running turn')
+          console.log('cc-mode: steered the running turn' + (images.length > 0 ? ' with ' + images.length + ' image(s)' : ''))
         } catch (error) {
           console.error('cc-mode: steering failed:', errorText(error))
         }
@@ -2761,6 +2945,9 @@ return {
         effort: state.effort,
         running: run !== undefined && run.reader !== null && !run.closed,
         claudeSessionId: run === undefined ? null : run.claudeSessionId,
+        // How full the model's context window is, for the composer's ring.
+        contextTokens: Number(state.contextTokens) || 0,
+        contextWindow: Number(state.contextWindow) || 0,
         approvalAvailable: approval !== undefined,
         // Once a session has taken a turn it belongs to that engine for good.
         committed: committed === undefined ? null : committed,
@@ -2964,6 +3151,8 @@ return {
         return runOneShotCommand(sessionId, cwd, command)
       }),
 
+      harness.handle('claude.command.poll', (args) => commandJobState(String(args.jobId || ''))),
+
       // The client half reports here when a DOM-injected surface cannot find
       // what it expects; there is no other way to see inside the page.
       harness.handle('debug', (args) => {
@@ -3114,6 +3303,6 @@ return {
     reapIdleBrokers().catch((error) => console.error('cc-mode: reap failed:', errorText(error)))
     ctx.interval(() => { reapIdleBrokers().catch(() => undefined) }, 10 * 60 * 1000)
 
-    console.log('cc-mode: host v88 ready — approval bridge', approval === undefined ? 'off' : 'on')
+    console.log('cc-mode: host v90 ready — approval bridge', approval === undefined ? 'off' : 'on')
   },
 }

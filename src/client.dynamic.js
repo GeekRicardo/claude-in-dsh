@@ -137,17 +137,11 @@ return {
       .ccmode-ring-ok { color:var(--dsw-alias-state-success-primary, #3fb950); }
       .ccmode-ring-warn { color:#d97706; }
       .ccmode-ring-crit { color:var(--dsw-alias-state-error-primary, #e5484d); }
-      .ccmode-rail { display:inline-flex; align-items:center; gap:10px; }
-      .ccmode-rail-item { position:relative; flex:0 0 64px; width:64px; height:64px; display:block; }
-      .ccmode-rail-thumb { width:64px; height:64px; object-fit:cover; display:block; border-radius:16px;
-        border:1px solid var(--dsw-alias-border-l2-darkmode-thin, rgba(128,128,128,0.3));
-        background:var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,0.12)); }
-      .ccmode-rail-remove { position:absolute; top:4px; right:4px; width:18px; height:18px; padding:0;
-        border:none; border-radius:50%; display:grid; place-items:center; cursor:pointer; font-size:10px;
-        background:var(--dsw-alias-button-contrast-fill, rgba(0,0,0,0.6));
-        color:var(--dsw-alias-label-primary-inverted, #fff); opacity:0; transition:opacity .2s ease-in-out; }
-      .ccmode-rail-item:hover .ccmode-rail-remove, .ccmode-rail-remove:focus-visible { opacity:1; }
-      .ccmode-rail-fallback { font-size:11px; color:var(--dsw-alias-label-secondary, inherit); }
+      /* The rail itself wears dsh's own attachment classes (see DSH_RAIL) so it
+         is pixel-identical to the shipped one; only the no-preview fallback and
+         the remove glyph are ours. */
+      .ccmode-rail-fallback { font-size:11px; padding:4px 12px 0;
+        color:var(--dsw-alias-label-secondary, inherit); }
       .ccmode-images-chip { display:inline-flex; align-items:center; gap:6px; font-size:11px;
         color:var(--dsw-alias-label-secondary, inherit); white-space:nowrap; }
       .ccmode-images-clear { border:none; background:transparent; color:inherit; cursor:pointer; font-size:11px; padding:0 2px; }
@@ -260,6 +254,14 @@ return {
         shadowDisposers.push(slots.register({ name: 'conversation.input.plan', priority: -1 }, ClaudePostureSeat))
       } catch (error) {
         console.error('cc-mode: could not shadow the access seat:', error)
+      }
+      // The draft-image rail inside the composer card. Only taken while a
+      // Claude conversation is current — a dsh conversation keeps the shipped
+      // rail, drop overlay and all.
+      try {
+        shadowDisposers.push(slots.register({ name: 'conversation.input.attachments', priority: -1 }, PendingImagesChip))
+      } catch (error) {
+        console.error('cc-mode: could not shadow the attachment rail:', error)
       }
       // The composer dock is a list slot keyed by entry id, and the lowest
       // priority wins a cell — a dynamic package always gets a lower one. So
@@ -818,35 +820,106 @@ return {
       }
     }
 
+    // dsh's own composer rail, class for class (ui-attachment's
+    // ComposerAttachments + AttachmentRail). Reusing the shipped names is what
+    // makes the Claude rail sit in the same place, at the same size, in the
+    // same theme as a dsh draft image — the seat below is the one the shipped
+    // rail fills, so anything else here would read as a foreign widget.
+    const DSH_RAIL = {
+      outer: '_54WpYG_rail',
+      root: 'JVDQca_root',
+      rail: 'JVDQca_rail',
+      item: 'JVDQca_item',
+      thumb: 'JVDQca_thumbnail',
+      remove: 'JVDQca_remove',
+    }
+
+    function closeGlyph() {
+      return h('svg', { width: 12, height: 12, viewBox: '0 0 14 14', 'aria-hidden': 'true' },
+        h('path', {
+          fill: 'currentColor',
+          d: 'M7 5.94 10.47 2.47a.75.75 0 1 1 1.06 1.06L8.06 7l3.47 3.47a.75.75 0 1 1-1.06 1.06L7 8.06l-3.47 3.47a.75.75 0 0 1-1.06-1.06L5.94 7 2.47 3.53a.75.75 0 0 1 1.06-1.06L7 5.94Z',
+        }))
+    }
+
+    function railCard(key, url, alt, onRemove) {
+      return h('div', { key: key, className: DSH_RAIL.item },
+        h('button', { type: 'button', className: DSH_RAIL.thumb, title: alt },
+          h('img', { src: url, alt: alt })),
+        h('button', { type: 'button', className: DSH_RAIL.remove, 'aria-label': '移除', onClick: onRemove },
+          closeGlyph()))
+    }
+
+    /**
+     * The composer's draft-image rail while Claude drives. It fills dsh's own
+     * `conversation.input.attachments` seat — the strip INSIDE the composer
+     * card, above the text — rather than a band under it, because that is where
+     * dsh shows a pasted image and where the user looks for it. dsh's own
+     * drafts (a drag-and-drop that its gate did allow) still render here, so
+     * taking the seat never hides anything.
+     */
     function PendingImagesChip(props) {
-      const sessionId = String(props.sessionId || '')
+      // The attachment seat is 'session-maybe' scoped, so it may arrive without
+      // a sessionId; the engine chip records which conversation the composer
+      // belongs to for exactly this case.
+      const sessionId = String((props && props.sessionId) || currentClaudeSessionId || '')
       const [, bump] = React.useState(0)
       React.useEffect(() => {
         const notify = () => bump((n) => n + 1)
         imageWatchers.add(notify)
         return () => imageWatchers.delete(notify)
       }, [])
+
       const count = imageCounts.get(sessionId) || 0
       const state = stateOf(sessionId)
-      if (state.mode !== 'claude' || count === 0) return null
-      const thumbs = imageThumbs.get(sessionId) || []
-      const clearAll = () => host.call('image.clear', { sessionId: sessionId })
+      const claude = state.mode === 'claude'
+
+      // A started turn eats the stash on the host side. Nothing pushes that
+      // back, so while images are pending the rail asks — otherwise it would
+      // keep showing an image that has already been sent.
+      React.useEffect(() => {
+        if (!claude || sessionId.length === 0 || count === 0) return undefined
+        const stop = ctx.interval(() => {
+          host.call('image.pending', { sessionId: sessionId })
+            .then((answer) => {
+              const now = (answer && answer.count) || 0
+              if (now === count) return
+              if (now === 0) imageThumbs.delete(sessionId)
+              setImageCount(sessionId, now)
+            })
+            .catch(() => {})
+        }, 1200)
+        return () => { stop() }
+      }, [sessionId, claude, count])
+
+      const drafts = (props && props.attachments) || []
+      const thumbs = claude ? (imageThumbs.get(sessionId) || []) : []
+      if (drafts.length === 0 && (!claude || count === 0)) return null
+
+      const removeAll = () => host.call('image.clear', { sessionId: sessionId })
         .then(() => { imageThumbs.delete(sessionId); setImageCount(sessionId, 0) })
         .catch(() => {})
-      // Same geometry as dsh's own attachment rail: 64px cards, 16px radius,
-      // remove control inside the card.
-      return h('span', { className: 'ccmode-rail' },
-        thumbs.slice(0, count).map((url, index) => h('span', { key: index, className: 'ccmode-rail-item' },
-          h('img', { className: 'ccmode-rail-thumb', src: url, alt: '待发送图片' }),
-          h('button', {
-            type: 'button',
-            className: 'ccmode-rail-remove',
-            title: '移除全部待发送图片',
-            onClick: clearAll,
-          }, '✕'))),
-        thumbs.length === 0
-          ? h('span', { className: 'ccmode-rail-fallback' }, '📷 ' + count + ' 张图片将随下一条消息发送')
-          : null)
+
+      const cards = drafts.map((draft, index) => railCard(
+        'draft:' + (draft.id || index),
+        draft.previewUrl,
+        (draft.file && draft.file.name) || '待发送图片',
+        () => { if (props && typeof props.onRemoveImage === 'function') props.onRemoveImage(draft.id) },
+      ))
+      for (let index = 0; index < Math.min(thumbs.length, count); index += 1) {
+        cards.push(railCard('claude:' + index, thumbs[index], '待发送图片（Claude）', removeAll))
+      }
+
+      // Stashed on the host but this tab never saw the bytes (another tab
+      // pasted them, or the page reloaded): say so rather than draw nothing.
+      if (claude && count > thumbs.length) {
+        cards.push(h('div', { key: 'more', className: 'ccmode-rail-fallback' },
+          '📷 另有 ' + (count - thumbs.length) + ' 张图片将随下一条消息发送'))
+      }
+
+      return h('div', { className: DSH_RAIL.outer },
+        h('div', { className: DSH_RAIL.root },
+          h('div', { className: DSH_RAIL.rail, role: 'group' }, cards)))
     }
 
     // ---------- Claude subscription usage, under the composer ----------
@@ -1359,15 +1432,20 @@ return {
         }).catch((error) => { console.error('cc-mode: claude.info 失败:', error) })
       }
 
-      host.call('claude.command', { sessionId: sessionId, cwd: cwd, command: command }).then((answer) => {
+      // The host runs the command as a job and this polls it. `/compact` alone
+      // spends tens of seconds to minutes inside the model, so the panel has to
+      // stay honest about that instead of holding one request open and calling
+      // the wait a failure.
+      const fail = (reason) => {
         if (importPanel !== scrim) return
         body.textContent = ''
-        if (answer && answer.busy === true) {
-          body.appendChild(el('div', 'ccmode-import-empty', '这个会话正在跑一轮，等它结束再执行。'))
-          return
-        }
+        body.appendChild(el('div', 'ccmode-import-empty', '执行失败：' + reason))
+      }
+      const settle = (answer) => {
+        if (importPanel !== scrim) return
         const text = String((answer && answer.text) || '').trim()
         if (command === '/mcp' && body.getElementsByClassName('ccmode-mcp').length > 0) return
+        body.textContent = ''
         if (text.length === 0) {
           body.appendChild(el('div', 'ccmode-import-empty', '这条命令没有输出'))
           return
@@ -1375,11 +1453,41 @@ return {
         const out = el('pre', 'ccmode-command-out', text)
         if (answer && answer.isError === true) out.className += ' ccmode-command-error'
         body.appendChild(out)
-      }).catch((error) => {
+      }
+      const waiting = (state) => {
         if (importPanel !== scrim) return
+        if (command === '/mcp' && body.getElementsByClassName('ccmode-mcp').length > 0) return
+        const seconds = Math.round((state.elapsedMs || 0) / 1000)
+        const label = (state.status && state.status.length > 0 ? state.status : '执行中…')
+          + (seconds > 2 ? ' ' + seconds + 's' : '')
         body.textContent = ''
-        body.appendChild(el('div', 'ccmode-import-empty', '执行失败：' + String(error && error.message ? error.message : error)))
-      })
+        body.appendChild(el('div', 'ccmode-import-empty', label))
+      }
+
+      host.call('claude.command', { sessionId: sessionId, cwd: cwd, command: command }).then((answer) => {
+        if (importPanel !== scrim) return
+        if (answer && answer.busy === true) {
+          body.textContent = ''
+          body.appendChild(el('div', 'ccmode-import-empty', '这个会话正在跑一轮，等它结束再执行。'))
+          return
+        }
+        const jobId = String((answer && answer.jobId) || '')
+        if (jobId.length === 0) { settle(answer); return }
+        const poll = () => {
+          if (importPanel !== scrim) return
+          host.call('claude.command.poll', { jobId: jobId }).then((state) => {
+            if (importPanel !== scrim) return
+            if (state === null || state === undefined || state.missing === true) {
+              fail('这条命令的执行记录已经过期')
+              return
+            }
+            if (state.done === true) { settle(state); return }
+            waiting(state)
+            window.setTimeout(poll, 1000)
+          }).catch((error) => fail(String(error && error.message ? error.message : error)))
+        }
+        poll()
+      }).catch((error) => fail(String(error && error.message ? error.message : error)))
     }
 
     function openImportPreview(sessionId, cwd, claudeSessionId, workspace) {
@@ -1785,13 +1893,6 @@ return {
     ctx.effect(() => () => closeImportPanel(), 'cc-mode: import panel')
 
     // ---------- seats ----------
-
-    // Above the composer card, its own line — where dsh puts anything that
-    // needs room (its own attachment rail sits in the same band).
-    slots.inject('conversation.input.dock', () => slots.register(
-      { name: 'conversation.input.dock', id: 'ccmode-images', order: 5, label: '待发送图片' },
-      (props) => h(PendingImagesChip, { sessionId: props && props.sessionId }),
-    ))
 
     slots.inject('conversation.composer.dock', () => slots.register(
       { name: 'conversation.composer.dock', id: 'ccmode-context', order: 20, label: '上下文占用' },
