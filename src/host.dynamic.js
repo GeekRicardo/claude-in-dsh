@@ -1868,6 +1868,18 @@ return {
         }
       }
 
+      // Tool calls this transcript already carries. Re-emitting one is not a
+      // harmless duplicate: dsh's conversation assembly refuses a second start
+      // for the same call id ("received more than one start Match") and the
+      // whole history load fails. Projections therefore skip any call already
+      // present, and skip a result whose call is not in this projection.
+      const knownCallIds = new Set()
+      for (const event of session.events) {
+        if (event.type === 'tool/call' && event.data && typeof event.data.callId === 'string') {
+          knownCallIds.add(event.data.callId)
+        }
+      }
+
       const fresh = anchorTurn === undefined
       const turn = fresh ? 1 : anchorTurn
       let step = fresh ? 0 : anchorStep
@@ -1907,6 +1919,9 @@ return {
           const results = content.filter((block) => block && block.type === 'tool_result')
           if (results.length > 0) {
             for (const block of results) {
+              // A result for a call this projection did not write would attach
+              // to the existing card, which already has its own result.
+              if (knownCallIds.has(String(block.tool_use_id || ''))) continue
               if (!stepOpen) openStep()
               append('tool/result', { turn: turn, step: step, message: {
                 id: uuid(), role: 'user',
@@ -1943,6 +1958,7 @@ return {
         }
 
         const blocks = assistantBlocksOf(content)
+          .filter((block) => block.type !== 'tool-call' || !knownCallIds.has(block.id))
         if (blocks.length === 0) continue
         openStep()
         append('assistant/message', { turn: turn, step: step, message: {
@@ -1952,6 +1968,7 @@ return {
         written += 1
         for (const block of blocks) {
           if (block.type !== 'tool-call') continue
+          knownCallIds.add(block.id)
           append('tool/call', { turn: turn, step: step, callId: block.id, name: block.name, arguments: block.arguments })
         }
       }
@@ -3006,6 +3023,6 @@ return {
     reapIdleBrokers().catch((error) => console.error('cc-mode: reap failed:', errorText(error)))
     ctx.interval(() => { reapIdleBrokers().catch(() => undefined) }, 10 * 60 * 1000)
 
-    console.log('cc-mode: host v80 ready — approval bridge', approval === undefined ? 'off' : 'on')
+    console.log('cc-mode: host v81 ready — approval bridge', approval === undefined ? 'off' : 'on')
   },
 }
