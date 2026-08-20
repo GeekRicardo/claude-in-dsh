@@ -1360,6 +1360,46 @@ return {
      * Read straight from its own transcripts — the same files `claude --resume`
      * lists from.
      */
+    /**
+     * Full-text search over this directory's Claude transcripts, for the
+     * import panel: which conversations mention the query, and a short snippet
+     * around the first hit so the row can show WHY it matched. Fixed-string,
+     * case-insensitive, done by grep — the transcripts are plain UTF-8 jsonl.
+     */
+    async function searchClaudeConversations(cwd, query) {
+      const dir = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd))
+      const needle = String(query || '').trim()
+      if (needle.length === 0) return { hits: [] }
+      const matched = await runCapture(['/bin/sh', '-c',
+        'cd ' + dir + ' 2>/dev/null && grep -liF -- ' + shellQuote(needle) + ' *.jsonl 2>/dev/null | head -20'], 15000)
+      const hits = []
+      for (const name of String(matched).split('\n')) {
+        const file = name.trim()
+        if (file.length === 0 || !file.endsWith('.jsonl')) continue
+        const line = await runCapture(['/bin/sh', '-c',
+          'grep -iF -m1 -- ' + shellQuote(needle) + ' ' + dir + '/' + shellQuote(file) + ' 2>/dev/null | head -c 200000'], 10000)
+        hits.push({
+          claudeSessionId: file.replace(/\.jsonl$/, ''),
+          snippet: snippetAround(String(line), needle),
+        })
+      }
+      return { hits: hits }
+    }
+
+    /** ±60 characters of readable context around the first hit in a raw jsonl line. */
+    function snippetAround(line, needle) {
+      const at = line.toLowerCase().indexOf(needle.toLowerCase())
+      if (at === -1) return ''
+      const slice = line.slice(Math.max(0, at - 60), at + needle.length + 60)
+      return slice
+        .replace(/\\n/g, ' ')
+        .replace(/\\"/g, '"')
+        .replace(/["{}\[\]]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 140)
+    }
+
     async function listClaudeConversations(cwd) {
       const dir = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd))
       const listing = await runCapture(['/bin/sh', '-c',
@@ -1466,21 +1506,48 @@ return {
       const dropped = rows.length > LIMIT ? rows.length - LIMIT : 0
       const kept = dropped > 0 ? rows.slice(rows.length - LIMIT) : rows
 
-      const turn = 0
+      // Turn numbering is the delicate part. The persistence validator
+      // refuses turn/end below 1 (a turn-0 import corrupted its session on
+      // reload), reload DROPS messages that sit outside turn boundaries, and
+      // the live agent's own counter starts at 1 — so imported turns take a
+      // high base: they replay with proper boundaries, never collide with
+      // lived turns, and after a restart the counter simply continues above.
+      const BASE = 1000000
+      let turn = BASE
       let step = 0
+      let turnOpen = false
       let stepOpen = false
-      const append = (type, data) => session.append(type, data, type === 'user/message' || type === 'assistant/message' || type === 'tool/result' ? { surfaceOp: 'append' } : undefined)
+      const append = (type, data) => session.append(type, data,
+        type === 'user/message' || type === 'assistant/message' || type === 'tool/result' ? { surfaceOp: 'append' } : undefined)
       const closeStep = () => { if (stepOpen) { append('step/end', { turn: turn, step: step }); stepOpen = false } }
+      const closeTurn = () => {
+        if (!turnOpen) return
+        closeStep()
+        append('turn/end', { turn: turn, reason: { kind: 'blocked' } })
+        turnOpen = false
+      }
+      const openTurn = () => {
+        if (turnOpen) return
+        turn += 1
+        step = 0
+        append('turn/start', { turn: turn })
+        turnOpen = true
+      }
+      const openStep = () => {
+        openTurn()
+        closeStep()
+        step += 1
+        append('step/start', { turn: turn, step: step })
+        stepOpen = true
+      }
 
-      append('turn/start', { turn: turn })
       if (dropped > 0) {
-        append('step/start', { turn: turn, step: ++step })
+        openStep()
         append('assistant/message', { turn: turn, step: step, message: {
           id: uuid(), role: 'assistant',
           content: [{ type: 'text', text: '（导入截断：更早的 ' + dropped + ' 条消息未回填；Claude 侧上下文完整，继续对话不受影响。）' }],
           source: { kind: 'model', provider: PROVIDER, model: NOTICE_MODEL },
         } })
-        append('step/end', { turn: turn, step: step })
       }
 
       let written = 0
@@ -1494,6 +1561,7 @@ return {
           const results = content.filter((block) => block && block.type === 'tool_result')
           if (results.length > 0) {
             for (const block of results) {
+              if (!stepOpen) openStep()
               append('tool/result', { turn: turn, step: step, message: {
                 id: uuid(), role: 'user',
                 source: { kind: 'tool', callId: String(block.tool_use_id || '') },
@@ -1522,18 +1590,16 @@ return {
             text = ''
           }
           if (text.length === 0) continue
-          closeStep()
+          closeTurn()
+          openTurn()
           append('user/message', { id: uuid(), role: 'user', content: [{ type: 'text', text: text }], source: { kind: 'user' } })
           written += 1
           continue
         }
 
-        // assistant: one step per message, exactly like a live turn
         const blocks = assistantBlocksOf(content)
         if (blocks.length === 0) continue
-        closeStep()
-        append('step/start', { turn: turn, step: ++step })
-        stepOpen = true
+        openStep()
         append('assistant/message', { turn: turn, step: step, message: {
           id: uuid(), role: 'assistant', content: blocks,
           source: { kind: 'model', provider: PROVIDER, model: message.model || 'claude-code' },
@@ -1544,8 +1610,7 @@ return {
           append('tool/call', { turn: turn, step: step, callId: block.id, name: block.name, arguments: block.arguments })
         }
       }
-      closeStep()
-      append('turn/end', { turn: turn, reason: { kind: 'blocked' } })
+      closeTurn()
       repairDanglingToolCalls(session)
 
       // The list row should read as the conversation it now is, not as an
@@ -2312,6 +2377,12 @@ return {
         return { conversations: await listClaudeConversations(cwd) }
       }),
 
+      harness.handle('claude.search', async (args) => {
+        const cwd = String(args.cwd || '')
+        if (cwd.length === 0) return { hits: [] }
+        return searchClaudeConversations(cwd, String(args.query || ''))
+      }),
+
       harness.handle('claude.preview', async (args) => previewClaudeConversation(
         String(args.cwd || ''), String(args.claudeSessionId || ''), 40)),
 
@@ -2426,6 +2497,6 @@ return {
     reapIdleBrokers().catch((error) => console.error('cc-mode: reap failed:', errorText(error)))
     ctx.interval(() => { reapIdleBrokers().catch(() => undefined) }, 30 * 60 * 1000)
 
-    console.log('cc-mode: host v61 ready — approval bridge', approval === undefined ? 'off' : 'on')
+    console.log('cc-mode: host v64 ready — approval bridge', approval === undefined ? 'off' : 'on')
   },
 }

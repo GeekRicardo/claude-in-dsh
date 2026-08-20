@@ -118,6 +118,12 @@ return {
         display:flex; flex-direction:column; gap:2px; }
       .ccmode-import-title { font-size:14px; font-weight:600; }
       .ccmode-import-sub { font-size:12px; color:var(--dsw-alias-label-tertiary, #888); }
+      .ccmode-import-search { margin-top:10px; width:100%; box-sizing:border-box; padding:7px 10px;
+        border-radius:8px; border:1px solid var(--dsw-alias-border-l2, rgba(128,128,128,0.3));
+        background:transparent; color:inherit; font-size:13px; outline:none; }
+      .ccmode-import-search:focus { border-color:var(--dsw-alias-border-inverted, rgba(128,128,128,0.55)); }
+      .ccmode-import-row-hit { font-size:11px; color:var(--dsw-alias-label-tertiary, #888);
+        white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; }
       .ccmode-import-body { flex:1; overflow:auto; padding:12px 16px; display:flex; flex-direction:column; gap:10px; }
       .ccmode-import-empty { color:var(--dsw-alias-label-tertiary, #888); font-size:13px; padding:24px 0; text-align:center; }
       .ccmode-import-msg { display:flex; gap:8px; font-size:13px; line-height:1.6; }
@@ -1177,13 +1183,21 @@ return {
       document.body.appendChild(scrim)
       importPanel = scrim
 
-      body.appendChild(el('div', 'ccmode-import-empty', '读取中…'))
-      host.call('claude.conversations', { cwd: cwd }).then((answer) => {
-        if (importPanel !== scrim) return
-        const rows = (answer && answer.conversations) || []
+      // Search: titles filter locally; transcript CONTENT is grepped by the
+      // host, and a content-only match explains itself with a snippet.
+      const search = el('input', 'ccmode-import-search')
+      search.type = 'search'
+      search.placeholder = '搜索标题或对话内容…'
+      head.appendChild(search)
+
+      let allRows = []
+      let renderSeq = 0
+
+      function renderRows(rows, snippets) {
         body.textContent = ''
         if (rows.length === 0) {
-          body.appendChild(el('div', 'ccmode-import-empty', '这个目录下没有 Claude Code 对话'))
+          body.appendChild(el('div', 'ccmode-import-empty',
+            allRows.length === 0 ? '这个目录下没有 Claude Code 对话' : '没有匹配的对话'))
           return
         }
         for (const row of rows) {
@@ -1191,9 +1205,46 @@ return {
           item.appendChild(el('span', 'ccmode-import-row-title', row.title || row.claudeSessionId.slice(0, 8)))
           item.appendChild(el('span', 'ccmode-import-row-meta',
             agoText(row.updatedAt) + ' · ' + Math.round(row.bytes / 1024) + 'KB'))
+          const snippet = snippets !== undefined ? snippets.get(row.claudeSessionId) : undefined
+          if (snippet !== undefined && snippet.length > 0) {
+            item.appendChild(el('span', 'ccmode-import-row-hit', '…' + snippet + '…'))
+          }
           item.addEventListener('click', () => showPreview(scrim, body, foot, note, sessionId, cwd, row, workspace))
           body.appendChild(item)
         }
+      }
+
+      function runSearch(query) {
+        const seq = ++renderSeq
+        const needle = query.trim().toLowerCase()
+        if (needle.length === 0) { renderRows(allRows); return }
+        const titleHits = allRows.filter((row) =>
+          (row.title || '').toLowerCase().indexOf(needle) !== -1
+          || (row.firstPrompt || '').toLowerCase().indexOf(needle) !== -1)
+        renderRows(titleHits)
+        host.call('claude.search', { cwd: cwd, query: query.trim() }).then((answer) => {
+          if (importPanel !== scrim || seq !== renderSeq) return
+          const snippets = new Map()
+          for (const hit of (answer && answer.hits) || []) snippets.set(hit.claudeSessionId, hit.snippet || '')
+          const seen = new Set(titleHits.map((row) => row.claudeSessionId))
+          const contentHits = allRows.filter((row) => !seen.has(row.claudeSessionId) && snippets.has(row.claudeSessionId))
+          renderRows(titleHits.concat(contentHits), snippets)
+        }).catch(() => { /* title-only results already shown */ })
+      }
+
+      let searchTimer = null
+      search.addEventListener('input', () => {
+        if (searchTimer !== null) clearTimeout(searchTimer)
+        searchTimer = setTimeout(() => runSearch(search.value), 300)
+      })
+      search.addEventListener('keydown', (event) => { if (event.key === 'Escape') { search.value = ''; renderRows(allRows) } })
+
+      body.appendChild(el('div', 'ccmode-import-empty', '读取中…'))
+      host.call('claude.conversations', { cwd: cwd }).then((answer) => {
+        if (importPanel !== scrim) return
+        allRows = (answer && answer.conversations) || []
+        renderRows(allRows)
+        search.focus()
       }).catch((error) => {
         if (importPanel !== scrim) return
         body.textContent = ''
@@ -1484,6 +1535,6 @@ return {
       document.body.removeAttribute('data-ccmode')
     }, 'cc-mode: release the shadowed seats')
 
-    console.log('cc-mode: client v59 ready — native chrome, ' + Object.keys(TOOL_SUMMARY).length + ' tool rows')
+    console.log('cc-mode: client v62 ready — native chrome, ' + Object.keys(TOOL_SUMMARY).length + ' tool rows')
   },
 }
