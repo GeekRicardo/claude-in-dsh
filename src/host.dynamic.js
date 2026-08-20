@@ -77,11 +77,13 @@ return {
       if (session === undefined) return
       const route = String(model || '')
       if (route.length === 0) return
-      const known = session.requestContext === undefined ? undefined : session.requestContext()
       const contextWindow = contextWindowOf(route)
+      let known
+      try { known = typeof session.requestContext === 'function' ? session.requestContext() : undefined } catch (error) { known = undefined }
       if (known !== undefined && known.model === route && known.contextWindow === contextWindow) return
       try {
         session.append('request/context', { provider: PROVIDER, model: route, contextWindow: contextWindow })
+        console.log('cc-mode: context window published —', route, contextWindow)
       } catch (error) {
         console.error('cc-mode: could not publish the context window:', errorText(error))
       }
@@ -2668,6 +2670,10 @@ return {
       }
 
       claudeSeen.add(sessionId)
+      // Not only on the init handshake: a dsh restart re-attaches to the broker's
+      // live Claude, so no handshake arrives and the window would never be
+      // published for exactly the conversations that have one.
+      announceContextWindow(session, state.route || state.model || 'claude-code')
       // Whatever Claude finished while nothing was attached belongs in the
       // transcript BEFORE this turn's content. Opening the conversation
       // usually does this through state.get, but a user who reopens and types
@@ -3324,6 +3330,6 @@ return {
     reapIdleBrokers().catch((error) => console.error('cc-mode: reap failed:', errorText(error)))
     ctx.interval(() => { reapIdleBrokers().catch(() => undefined) }, 10 * 60 * 1000)
 
-    console.log('cc-mode: host v91 ready — approval bridge', approval === undefined ? 'off' : 'on')
+    console.log('cc-mode: host v92 ready — approval bridge', approval === undefined ? 'off' : 'on')
   },
 }
