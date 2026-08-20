@@ -2136,11 +2136,13 @@ return {
       activeTurns.set(sessionId, { turn: turn, run: run })
 
       let interrupted = false
+      let abortedAt = 0
       let done = false
       let cancelKill = null
       const onAbort = () => {
         if (interrupted) return
         interrupted = true
+        abortedAt = Date.now()
         try { run.control({ subtype: 'interrupt' }) } catch (error) { /* gone */ }
         cancelKill = ctx.timeout(() => { if (!done) stopRun(sessionId).catch(() => undefined) }, 8000)
       }
@@ -2648,6 +2650,6 @@ return {
     reapIdleBrokers().catch((error) => console.error('cc-mode: reap failed:', errorText(error)))
     ctx.interval(() => { reapIdleBrokers().catch(() => undefined) }, 30 * 60 * 1000)
 
-    console.log('cc-mode: host v68 ready — approval bridge', approval === undefined ? 'off' : 'on')
+    console.log('cc-mode: host v69 ready — approval bridge', approval === undefined ? 'off' : 'on')
   },
 }
