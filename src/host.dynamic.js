@@ -61,26 +61,38 @@ return {
     // window as a model suffix (`claude-opus-5[1m]`), which is why the route
     // string, not the chosen id, decides.
     const DEFAULT_CONTEXT_WINDOW = 200000
+
+    /**
+     * Tell dsh how big this conversation's context window is.
+     *
+     * dsh already ships a context meter — the ring beside the send button, with
+     * the breakdown popover — and it already has the numerator: its
+     * `contextPressure` projection reads the `usage` this plugin puts on every
+     * `assistant/message`. The only thing missing was the denominator, which
+     * comes from a `request/context` event that a Claude conversation never
+     * produces (it makes no dsh model request). One event and dsh's own meter
+     * lights up, so there is no reason for the plugin to draw a second ring.
+     */
+    function announceContextWindow(session, model) {
+      if (session === undefined) return
+      const route = String(model || '')
+      if (route.length === 0) return
+      const known = session.requestContext === undefined ? undefined : session.requestContext()
+      const contextWindow = contextWindowOf(route)
+      if (known !== undefined && known.model === route && known.contextWindow === contextWindow) return
+      try {
+        session.append('request/context', { provider: PROVIDER, model: route, contextWindow: contextWindow })
+      } catch (error) {
+        console.error('cc-mode: could not publish the context window:', errorText(error))
+      }
+    }
+
     function contextWindowOf(model) {
       const name = String(model || '')
       if (name.length === 0) return DEFAULT_CONTEXT_WINDOW
       if (/\[1m\]/i.test(name) || /-1m\b/i.test(name)) return 1000000
       if (/haiku/i.test(name)) return 200000
       return DEFAULT_CONTEXT_WINDOW
-    }
-
-    /**
-     * What the conversation currently occupies, the way waku computes it: the
-     * last call's whole prompt (fresh input + both cache halves) plus what the
-     * model wrote. Anything smaller undercounts a cached conversation to almost
-     * nothing, which is the number that matters least.
-     */
-    function contextTokensOf(usage) {
-      if (usage === null || typeof usage !== 'object') return 0
-      return (Number(usage.input_tokens) || 0)
-        + (Number(usage.cache_read_input_tokens) || 0)
-        + (Number(usage.cache_creation_input_tokens) || 0)
-        + (Number(usage.output_tokens) || 0)
     }
 
     const EFFORTS = [
@@ -226,8 +238,6 @@ return {
         if (saved.mode === 'claude' || saved.mode === 'dsh') state.mode = saved.mode
         if (typeof saved.route === 'string' && saved.route.length > 0) state.route = saved.route
         if (typeof saved.jsonlOffset === 'number') state.jsonlOffset = saved.jsonlOffset
-        if (typeof saved.contextTokens === 'number') state.contextTokens = saved.contextTokens
-        if (typeof saved.contextWindow === 'number') state.contextWindow = saved.contextWindow
         if (saved.bandRepaired === true) state.bandRepaired = true
         if (typeof saved.permissionMode === 'string' && PERMISSION_MODES.some((entry) => entry.id === saved.permissionMode)) {
           state.permissionMode = saved.permissionMode
@@ -256,8 +266,6 @@ return {
             model: state.model,
             ...(state.route === undefined ? {} : { route: state.route }),
             ...(state.jsonlOffset === undefined ? {} : { jsonlOffset: state.jsonlOffset }),
-            ...(state.contextTokens === undefined ? {} : { contextTokens: state.contextTokens }),
-            ...(state.contextWindow === undefined ? {} : { contextWindow: state.contextWindow }),
             ...(state.bandRepaired === true ? { bandRepaired: true } : {}),
             effort: state.effort,
             ...(claudeSessionId === '' ? {} : { claudeSessionId: claudeSessionId }),
@@ -1526,11 +1534,6 @@ return {
               + ' tokens（省下 ' + Math.max(0, before - after).toLocaleString('en-US') + '），用时 ' + seconds + 's。'
               + (text.trim().length > 0 ? '\n\n' + text : '')
             const state = stateOf(sessionId)
-            if (after > 0) {
-              state.contextTokens = after
-              state.contextWindow = contextWindowOf(state.route || state.model)
-              persistStates()
-            }
           }
           return { text: text, isError: message.is_error === true }
         }
@@ -2764,6 +2767,20 @@ return {
                 state.route = message.model || 'claude-code'
                 persistStates()
               }
+              announceContextWindow(session, state.route)
+            }
+            // Auto-compaction happens mid-turn and takes tens of seconds. The
+            // terminal says so; without this dsh just went quiet and then
+            // carried on as if nothing had happened.
+            if (message.subtype === 'compact_boundary' && parent === null) {
+              const meta = message.compact_metadata || {}
+              const before = Number(meta.pre_tokens) || 0
+              const after = Number(meta.post_tokens) || 0
+              const auto = String(meta.trigger || '') !== 'manual'
+              if (before > 0 || after > 0) {
+                transcript.note('◆ 上下文' + (auto ? '已自动压缩' : '已压缩') + '：'
+                  + before.toLocaleString('en-US') + ' → ' + after.toLocaleString('en-US') + ' tokens')
+              }
             }
             continue
           }
@@ -2796,12 +2813,6 @@ return {
             continue
           }
           if (message.type === 'result') {
-            const occupied = contextTokensOf(message.usage)
-            if (occupied > 0) {
-              state.contextTokens = occupied
-              state.contextWindow = contextWindowOf(state.route || state.model)
-              persistStates()
-            }
             // Some slash commands answer in the result alone. Nothing rendered
             // plus a result carrying text is exactly that case — show it rather
             // than closing a turn that looks like it did nothing.
@@ -2945,9 +2956,6 @@ return {
         effort: state.effort,
         running: run !== undefined && run.reader !== null && !run.closed,
         claudeSessionId: run === undefined ? null : run.claudeSessionId,
-        // How full the model's context window is, for the composer's ring.
-        contextTokens: Number(state.contextTokens) || 0,
-        contextWindow: Number(state.contextWindow) || 0,
         approvalAvailable: approval !== undefined,
         // Once a session has taken a turn it belongs to that engine for good.
         committed: committed === undefined ? null : committed,
@@ -3316,6 +3324,6 @@ return {
     reapIdleBrokers().catch((error) => console.error('cc-mode: reap failed:', errorText(error)))
     ctx.interval(() => { reapIdleBrokers().catch(() => undefined) }, 10 * 60 * 1000)
 
-    console.log('cc-mode: host v90 ready — approval bridge', approval === undefined ? 'off' : 'on')
+    console.log('cc-mode: host v91 ready — approval bridge', approval === undefined ? 'off' : 'on')
   },
 }
