@@ -1874,12 +1874,17 @@ return {
       // whole history load fails. Projections therefore skip any call already
       // present, and skip a result whose call is not in this projection.
       const knownCallIds = new Set()
+      const answeredCallIds = new Set()
       for (const event of session.events) {
         if (event.type === 'tool/call' && event.data && typeof event.data.callId === 'string') {
           knownCallIds.add(event.data.callId)
+        } else if (event.type === 'tool/result') {
+          const source = event.data && event.data.message ? event.data.message.source : undefined
+          if (source !== undefined && source.callId !== undefined) answeredCallIds.add(String(source.callId))
         }
       }
 
+      const openedHere = []
       const fresh = anchorTurn === undefined
       const turn = fresh ? 1 : anchorTurn
       let step = fresh ? 0 : anchorStep
@@ -1919,9 +1924,13 @@ return {
           const results = content.filter((block) => block && block.type === 'tool_result')
           if (results.length > 0) {
             for (const block of results) {
-              // A result for a call this projection did not write would attach
-              // to the existing card, which already has its own result.
-              if (knownCallIds.has(String(block.tool_use_id || ''))) continue
+              // Skip only a result the transcript already has. A call that is
+              // in the log but still unanswered needs exactly this result —
+              // dropping it (an earlier version did) left the card waiting and
+              // the turn teardown then stamped it "没有等到结果".
+              const resultFor = String(block.tool_use_id || '')
+              if (answeredCallIds.has(resultFor)) continue
+              answeredCallIds.add(resultFor)
               if (!stepOpen) openStep()
               append('tool/result', { turn: turn, step: step, message: {
                 id: uuid(), role: 'user',
@@ -1969,12 +1978,30 @@ return {
         for (const block of blocks) {
           if (block.type !== 'tool-call') continue
           knownCallIds.add(block.id)
+          openedHere.push(block.id)
           append('tool/call', { turn: turn, step: step, callId: block.id, name: block.name, arguments: block.arguments })
         }
       }
       closeStep()
       if (fresh) append('turn/end', { turn: turn, reason: { kind: 'blocked' } })
-      repairDanglingToolCalls(session)
+      // Deliberately NOT repairDanglingToolCalls here: that closes every
+      // unanswered call in the WHOLE session, and a projection has no business
+      // declaring older calls dead — it produced a wall of red "没有等到结果"
+      // rows. Calls this projection itself opened and could not answer are
+      // closed below; everything else is left to the turn that owns it.
+      for (const callId of openedHere) {
+        if (answeredCallIds.has(callId)) continue
+        append('tool/result', { turn: turn, step: step, message: {
+          id: uuid(), role: 'user',
+          source: { kind: 'tool', callId: callId },
+          content: [{
+            type: 'tool-result',
+            toolCallId: callId,
+            content: [{ type: 'text', text: '这次调用没有等到结果（上一次运行被中断）。' }],
+            isError: true,
+          }],
+        } })
+      }
       return written
     }
 
@@ -3023,6 +3050,6 @@ return {
     reapIdleBrokers().catch((error) => console.error('cc-mode: reap failed:', errorText(error)))
     ctx.interval(() => { reapIdleBrokers().catch(() => undefined) }, 10 * 60 * 1000)
 
-    console.log('cc-mode: host v81 ready — approval bridge', approval === undefined ? 'off' : 'on')
+    console.log('cc-mode: host v82 ready — approval bridge', approval === undefined ? 'off' : 'on')
   },
 }
