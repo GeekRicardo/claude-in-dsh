@@ -1343,10 +1343,12 @@ return {
     }
 
     function adoptConversation(sessionId, cwd, claudeSessionId, workspace) {
-      const bind = (target) => host.call('claude.adopt', { sessionId: target, claudeSessionId: claudeSessionId })
+      const bind = (target) => host.call('claude.adopt', { sessionId: target, claudeSessionId: claudeSessionId, cwd: cwd })
         .then((answer) => {
           if (answer && answer.state) put(target, answer.state)
-          if (sessions !== undefined && typeof sessions.open === 'function' && sessionId === null) sessions.open(target)
+          if (sessions !== undefined && typeof sessions.open === 'function' && sessionId === null) {
+            try { sessions.open(target) } catch (error) { console.error('cc-mode: could not open the imported conversation:', error) }
+          }
           closeImportPanel()
         })
       if (sessionId !== null) return bind(sessionId).catch((error) => console.error('cc-mode: import failed:', error))
@@ -1482,6 +1484,6 @@ return {
       document.body.removeAttribute('data-ccmode')
     }, 'cc-mode: release the shadowed seats')
 
-    console.log('cc-mode: client v58 ready — native chrome, ' + Object.keys(TOOL_SUMMARY).length + ' tool rows')
+    console.log('cc-mode: client v59 ready — native chrome, ' + Object.keys(TOOL_SUMMARY).length + ' tool rows')
   },
 }
