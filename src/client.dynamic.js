@@ -398,6 +398,15 @@ return {
     }
 
     // Shadows dsh's own model seat while Claude drives.
+    /** The catalog name for a raw route id like `claude-opus-5[1m]`. */
+    function routeLabel(route, models) {
+      if (typeof route !== 'string' || route.length === 0 || route === 'claude-code') return 'Claude 默认'
+      const bare = route.replace(/\[[^\]]*\]$/, '')
+      const hit = models.find((entry) => entry.id === bare)
+      if (hit === undefined) return route
+      return route.indexOf('[1m]') !== -1 ? hit.name + ' (1M)' : hit.name
+    }
+
     function ClaudeModelSeat(props) {
       useStore()
       const sessionId = sessionIdOf(props)
@@ -411,7 +420,11 @@ return {
       const models = catalog.models || []
       const efforts = catalog.efforts || []
       const current = models.find((entry) => entry.id === state.model)
-      const modelLabel = current ? current.name : 'Claude'
+      // With no explicit choice the chip names the model the process actually
+      // runs (from Claude's init handshake), not a vague "follow the default".
+      const modelLabel = state.model.length > 0 && current
+        ? current.name
+        : routeLabel(state.route, models)
       const reasoning = current === undefined ? true : current.reasoning !== false
       const effortLabel = state.effort.length === 0 ? '默认' : state.effort
 
@@ -1535,6 +1548,6 @@ return {
       document.body.removeAttribute('data-ccmode')
     }, 'cc-mode: release the shadowed seats')
 
-    console.log('cc-mode: client v62 ready — native chrome, ' + Object.keys(TOOL_SUMMARY).length + ' tool rows')
+    console.log('cc-mode: client v65 ready — native chrome, ' + Object.keys(TOOL_SUMMARY).length + ' tool rows')
   },
 }

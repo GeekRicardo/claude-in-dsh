@@ -188,6 +188,7 @@ return {
         // A conversation switched to Claude but not yet committed by a turn
         // would otherwise come back as DSH after a restart.
         if (saved.mode === 'claude' || saved.mode === 'dsh') state.mode = saved.mode
+        if (typeof saved.route === 'string' && saved.route.length > 0) state.route = saved.route
         if (typeof saved.permissionMode === 'string' && PERMISSION_MODES.some((entry) => entry.id === saved.permissionMode)) {
           state.permissionMode = saved.permissionMode
         }
@@ -213,6 +214,7 @@ return {
             mode: state.mode,
             permissionMode: state.permissionMode,
             model: state.model,
+            ...(state.route === undefined ? {} : { route: state.route }),
             effort: state.effort,
             ...(claudeSessionId === '' ? {} : { claudeSessionId: claudeSessionId }),
           }
@@ -1613,32 +1615,45 @@ return {
       closeTurn()
       repairDanglingToolCalls(session)
 
-      // The list row should read as the conversation it now is, not as an
-      // unnamed session: title it from the first human prompt, exactly what
-      // the Claude terminal shows for this transcript.
+      // The list row must carry the Claude conversation's OWN title — the same
+      // name `claude --resume` and the terminal show (its custom-title, or the
+      // ai-title). Written UNCONDITIONALLY: the moment the backfilled first
+      // prompt lands, dsh's title service auto-names the session from it, so a
+      // presence check always loses that race. A user-sourced title supersedes
+      // the automatic one by dsh's own rename semantics. A transcript that was
+      // never titled keeps dsh's automatic name (the first prompt) — same
+      // outcome the fallback used to produce.
       try {
-        const hasTitle = session.events.some((event) => event.type === 'session/title')
-        if (!hasTitle) {
-          let text = ''
-          for (const event of kept) {
-            if (event.type !== 'user') continue
-            const content = event.message.content
-            const candidate = typeof content === 'string'
-              ? content
-              : (Array.isArray(content)
-                  ? content.filter((block) => block && block.type === 'text' && typeof block.text === 'string')
-                      .map((block) => block.text).join(' ')
-                  : '')
-            if (candidate.indexOf('<command-') !== -1 || candidate.indexOf('<local-command') !== -1
-              || candidate.indexOf('<system-reminder>') === 0) continue
-            if (candidate.trim().length > 0) { text = candidate; break }
+        let text = ''
+        const titled = await runCapture(['/bin/sh', '-c',
+          'grep -E \'"type":"(ai-title|custom-title)"\' ' + path + ' 2>/dev/null | tail -5'], 8000)
+        for (const line of String(titled).split('\n')) {
+          if (line.trim().length === 0) continue
+          let event = null
+          try { event = JSON.parse(line) } catch (error) { continue }
+          // A custom title is the user's own rename and outranks the AI one.
+          if (event.type === 'custom-title' && typeof event.customTitle === 'string' && event.customTitle.trim().length > 0) {
+            text = event.customTitle
+            break
           }
-          text = text.replace(/\s+/g, ' ').trim().slice(0, 60)
-          if (text.length > 0) {
+          if (event.type === 'ai-title' && typeof event.aiTitle === 'string' && text.length === 0) text = event.aiTitle
+        }
+        text = text.replace(/\s+/g, ' ').trim().slice(0, 60)
+        if (text.length > 0) {
+          // Through the title service, not a bare append: dsh names sessions
+          // asynchronously with an LLM, and a raw session/title event written
+          // now simply loses to that later result (latest event wins). rename()
+          // pins the title and supersedes the pending automatic generation.
+          const titleService = ctx.get('sessionTitle')
+          if (titleService !== undefined && typeof titleService.rename === 'function') {
+            titleService.rename(session, text)
+          } else {
             session.append('session/title', { title: text, messageSeqs: [], source: { kind: 'user' } })
           }
         }
-      } catch (error) { /* a nameless import is still an import */ }
+      } catch (error) {
+        console.error('cc-mode: could not title the imported conversation:', errorText(error))
+      }
       return { backfilled: written, dropped: dropped }
     }
 
@@ -2087,7 +2102,10 @@ return {
                 state.claudeSessionId = run.claudeSessionId
                 persistStates()
               }
-              state.route = message.model || 'claude-code'
+              if (state.route !== (message.model || 'claude-code')) {
+                state.route = message.model || 'claude-code'
+                persistStates()
+              }
             }
             continue
           }
@@ -2233,6 +2251,9 @@ return {
         mode: state.mode,
         permissionMode: state.permissionMode,
         model: state.model,
+        // What the process actually runs (from its init handshake) — shown
+        // when no explicit model is chosen, instead of a vague "default".
+        route: state.route === undefined ? null : state.route,
         effort: state.effort,
         running: run !== undefined && run.reader !== null && !run.closed,
         claudeSessionId: run === undefined ? null : run.claudeSessionId,
@@ -2246,7 +2267,24 @@ return {
     const disposers = [
       harness.handle('catalog', () => ({ models: MODELS, efforts: EFFORTS, permissionModes: PERMISSION_MODES })),
 
-      harness.handle('state.get', (args) => publicState(String(args.sessionId || ''))),
+      harness.handle('state.get', async (args) => {
+        const sessionId = String(args.sessionId || '')
+        const state = stateOf(sessionId, sessionOf(sessionId))
+        // A conversation that ran before this plugin version knows its Claude
+        // session but not the model the process reported; the broker's logged
+        // init handshake still does.
+        if (state.route === undefined && state.mode === 'claude'
+          && typeof state.claudeSessionId === 'string' && state.claudeSessionId.length > 0) {
+          try {
+            const init = await lastHandshake(sessionId)
+            if (init !== undefined && typeof init.model === 'string' && init.model.length > 0) {
+              state.route = init.model
+              persistStates()
+            }
+          } catch (error) { /* the chip falls back to "Claude 默认" */ }
+        }
+        return publicState(sessionId)
+      }),
 
       harness.handle('mode.set', (args) => {
         const sessionId = String(args.sessionId || '')
@@ -2497,6 +2535,6 @@ return {
     reapIdleBrokers().catch((error) => console.error('cc-mode: reap failed:', errorText(error)))
     ctx.interval(() => { reapIdleBrokers().catch(() => undefined) }, 30 * 60 * 1000)
 
-    console.log('cc-mode: host v64 ready — approval bridge', approval === undefined ? 'off' : 'on')
+    console.log('cc-mode: host v67 ready — approval bridge', approval === undefined ? 'off' : 'on')
   },
 }
