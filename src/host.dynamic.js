@@ -573,29 +573,50 @@ return {
       // protocol error — the card breaks and the transcript stops rendering
       // from there. One result per call, whoever writes it.
       const answered = new Set()
+      // Calls announced but not yet answered, and the step each was announced
+      // in — so a result that arrives after its step closed still lands on the
+      // card it belongs to instead of the step that happens to be open.
+      const pending = new Map()
       // Whether this turn put any model text on screen. A one-shot command that
       // answers in its `result` alone must not leave an empty turn behind.
       let loggedAssistant = false
 
       /**
-       * Close a step, and never leave a tool call unanswered.
+       * Close the current step. A tool call still running is NOT settled here.
+       *
+       * It used to be, and that quietly lost results: Claude starts the next
+       * assistant message — a new step — while an earlier call is still
+       * running, which is ordinary for parallel calls. Settling on the step
+       * boundary stamped that live call "这次调用没有等到结果", and the real
+       * result, arriving a second later, was then dropped as a duplicate. A
+       * call belongs to the turn, not to the step it was announced in.
+       */
+      function closeStep() {
+        if (open === undefined) return
+        session.append('step/end', { turn: turn, step: open.step })
+        open = undefined
+      }
+
+      /**
+       * End the turn, and never leave a tool call unanswered.
        *
        * The model-visible surface pairs every assistant tool call with its
        * result; DeepSeek rejects a history where one is missing
        * ("An assistant message with 'tool_calls' must be followed by tool
        * messages"). A turn cut short between `tool/call` and `tool/result` —
        * a cancel, a plugin reload, a crash — used to leave exactly that, and
-       * it poisoned the conversation for good. So an unanswered call gets a
-       * result saying it was interrupted.
+       * it poisoned the conversation for good. So a call that really is never
+       * going to be answered gets a result saying it was interrupted — but
+       * only once the turn is over, when that is actually true.
        */
       function finish(reason) {
-        if (open === undefined) return
-        for (const call of open.openCalls) {
+        for (const entry of pending) {
+          const call = entry[0]
           if (answered.has(call)) continue
           answered.add(call)
           session.append('tool/result', {
             turn: turn,
-            step: open.step,
+            step: entry[1],
             message: {
               id: uuid(),
               role: 'user',
@@ -609,16 +630,15 @@ return {
             },
           }, { surfaceOp: 'append' })
         }
-        open.openCalls.clear()
-        session.append('step/end', { turn: turn, step: open.step })
-        open = undefined
+        pending.clear()
+        closeStep()
       }
 
       function beginStep() {
-        finish()
+        closeStep()
         stepNumber += 1
         session.append('step/start', { turn: turn, step: stepNumber })
-        open = { step: stepNumber, chunkSeqs: [], blocks: new Map(), assistantLogged: false, openCalls: new Set() }
+        open = { step: stepNumber, chunkSeqs: [], blocks: new Map(), assistantLogged: false }
         return open
       }
 
@@ -710,25 +730,29 @@ return {
             name: block.name,
             arguments: block.arguments,
           })
-          step.openCalls.add(block.id)
+          pending.set(block.id, step.step)
           calls.push(block)
         }
         return calls
       }
 
       function toolResults(message) {
-        if (open === undefined || typeof message.content === 'string') return
-        const step = open
+        if (typeof message.content === 'string') return
         for (const block of message.content || []) {
           if (block.type !== 'tool_result') continue
-          step.openCalls.delete(block.tool_use_id)
+          const announcedIn = pending.get(block.tool_use_id)
+          pending.delete(block.tool_use_id)
           if (answered.has(block.tool_use_id)) continue
           answered.add(block.tool_use_id)
+          // The step number is bookkeeping — dsh pairs a result to its call by
+          // callId — so this keeps writing into whatever step is open, which is
+          // the arrangement every rendered conversation so far was built on.
+          const step = open !== undefined ? open.step : (announcedIn === undefined ? stepNumber : announcedIn)
           session.append(
             'tool/result',
             {
               turn: turn,
-              step: step.step,
+              step: step,
               message: {
                 id: uuid(),
                 role: 'user',
@@ -2828,6 +2852,17 @@ return {
         if (interrupted) return
         interrupted = true
         abortedAt = Date.now()
+        // dsh going down is NOT the user pressing stop. dsh aborts every
+        // in-flight turn as it shuts down, and answering that by interrupting
+        // Claude defeats the entire point of the broker: the turn dies, the
+        // transcript fills with "[Request interrupted by user for tool use]",
+        // and the drain afterwards has nothing to recover because there is
+        // nothing left to produce. Leave it running; the broker holds it and
+        // the next attach picks the output up.
+        if (shuttingDown) {
+          console.log('cc-mode: dsh is going down — leaving turn', turn, 'running on', sessionId)
+          return
+        }
         try { run.control({ subtype: 'interrupt' }) } catch (error) { /* gone */ }
         cancelKill = ctx.timeout(() => { if (!done) stopRun(sessionId).catch(() => undefined) }, 8000)
       }
@@ -3447,6 +3482,22 @@ return {
       usage: (force) => usageSnapshot(force === true),
     })
 
+    // The teardown below sets `shuttingDown` too late to help: dsh aborts the
+    // in-flight turns inside the same dispose that eventually reaches this
+    // plugin, so the abort handler runs first and — before this — interrupted
+    // Claude. The signal arrives before any of it. dsh installs its own
+    // SIGTERM/SIGINT handlers, so adding these changes no termination
+    // behaviour; they only make the plugin hear the news first.
+    ctx.effect(() => {
+      const noteShutdown = () => { shuttingDown = true }
+      process.on('SIGTERM', noteShutdown)
+      process.on('SIGINT', noteShutdown)
+      return () => {
+        process.removeListener('SIGTERM', noteShutdown)
+        process.removeListener('SIGINT', noteShutdown)
+      }
+    }, 'cc-mode: hear about shutdown before the turns are aborted')
+
     ctx.effect(() => () => {
       shuttingDown = true
       // Detach, never stop: a hot update or a stop must not end a turn that is
@@ -3472,6 +3523,6 @@ return {
     reapIdleBrokers().catch((error) => console.error('cc-mode: reap failed:', errorText(error)))
     ctx.interval(() => { reapIdleBrokers().catch(() => undefined) }, 10 * 60 * 1000)
 
-    console.log('cc-mode: host v95 ready — approval bridge', approval === undefined ? 'off' : 'on')
+    console.log('cc-mode: host v97 ready — approval bridge', approval === undefined ? 'off' : 'on')
   },
 }
