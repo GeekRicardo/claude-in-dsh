@@ -1476,38 +1476,105 @@ return {
     }
 
     /**
-     * Project an adopted Claude transcript into the dsh session it now lives
-     * in, as ordinary durable events — the same vocabulary a live turn writes,
-     * so the native transcript UI (and every plugin on it) renders the history.
-     *
-     * Everything is written under turn 0. The agent's own counter starts real
-     * turns at 1 (and, on a reload, resumes from the last `turn/start` in the
-     * log), so the imported history can never collide with a lived turn.
+     * Catch up a conversation whose Claude kept talking while nothing was
+     * attached — the dsh-restart case: dsh's own crash recovery closes the
+     * open turn (tool calls settle as TOOL_OUTCOME_UNKNOWN), but the broker
+     * held the process, and everything it produced since the recorded attach
+     * offset is sitting in out.log. That tail is projected into the transcript
+     * as history — no model call, no quota — and the offset advanced so the
+     * next live attach does not replay it.
      */
-    async function backfillClaudeTranscript(session, cwd, claudeSessionId) {
-      // Idempotent: importing into a conversation that already shows content
-      // must not duplicate it.
-      for (const event of session.events) {
-        if (event.type === 'assistant/message') return { backfilled: 0, skipped: 'already has content' }
-      }
+    const drainInFlight = new Map()
 
-      const path = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd)) + '/' + shellQuote(claudeSessionId + '.jsonl')
-      const raw = await runCapture(['/bin/sh', '-c',
-        'grep -E \'"type":"(user|assistant)"\' ' + path + ' 2>/dev/null | tail -c 3000000'], 20000)
+    function drainDetachedOutput(sessionId, session) {
+      if (session === undefined) return Promise.resolve(0)
+      if (activeTurns.has(sessionId) || runs.has(sessionId) || drainInFlight.has(sessionId)) return Promise.resolve(0)
+      const state = stateOf(sessionId, session)
+      if (state.mode !== 'claude') return Promise.resolve(0)
 
-      const rows = []
-      for (const line of String(raw).split('\n')) {
-        if (line.trim().length === 0) continue
-        let event = null
-        try { event = JSON.parse(line) } catch (error) { continue }
-        if (event.isSidechain === true || event.isReplay === true) continue
-        if (event.message === null || event.message === undefined) continue
-        rows.push(event)
-      }
-      const LIMIT = 240
-      const dropped = rows.length > LIMIT ? rows.length - LIMIT : 0
-      const kept = dropped > 0 ? rows.slice(rows.length - LIMIT) : rows
+      const dir = sessionDir(sessionId)
+      const work = (async () => {
+        const meta = await readJsonFile(dir + '/meta.json')
+        if (meta === null) return 0
+        const attachState = await readJsonFile(dir + '/attach.json')
+        let offset = attachState !== null && typeof attachState.offset === 'number' ? attachState.offset : null
+        if (offset === null) {
+          // No recorded offset (the watchdog clears it on a stalled detach).
+          // Anchor on the call dsh's crash recovery settled as
+          // TOOL_OUTCOME_UNKNOWN: its REAL result is in the broker log, and
+          // everything from that line on is the missing tail.
+          let callId = ''
+          for (let index = session.events.length - 1; index >= 0; index -= 1) {
+            const event = session.events[index]
+            if (event.type === 'tool/call' && event.data && typeof event.data.callId === 'string') {
+              callId = event.data.callId
+              break
+            }
+          }
+          if (callId.length === 0) return 0
+          const lineNoRaw = await runCapture(['/bin/sh', '-c',
+            'grep -n -m1 -F ' + shellQuote('"tool_use_id":"' + callId + '"') + ' ' + shellQuote(dir + '/out.log') + ' | cut -d: -f1'], 15000)
+          const lineNo = parseInt(String(lineNoRaw).trim(), 10)
+          if (isNaN(lineNo) || lineNo < 1) return 0
+          const offsetRaw = await runCapture(['/bin/sh', '-c',
+            'head -n ' + (lineNo - 1) + ' ' + shellQuote(dir + '/out.log') + ' | wc -c'], 15000)
+          offset = parseInt(String(offsetRaw).trim(), 10)
+          if (isNaN(offset)) return 0
+        }
+        const size = await fileSize(dir + '/out.log')
+        if (size <= offset) return 0
 
+        const raw = await runCapture(['/bin/sh', '-c',
+          'tail -c +' + (offset + 1) + ' ' + shellQuote(dir + '/out.log') + ' | head -c 3000000'], 20000)
+        const rows = []
+        let sawResult = false
+        for (const line of String(raw).split('\n')) {
+          if (line.trim().length === 0) continue
+          let event = null
+          try { event = JSON.parse(line) } catch (error) { continue }
+          if (event.type === 'result') { sawResult = true; continue }
+          if (event.type !== 'user' && event.type !== 'assistant') continue
+          if (event.isSidechain === true || event.isReplay === true) continue
+          if (typeof event.parent_tool_use_id === 'string' && event.parent_tool_use_id.length > 0) continue
+          if (event.message === null || event.message === undefined) continue
+          rows.push(event)
+        }
+        // Only a COMPLETED stretch is history. A turn still streaming keeps
+        // its bytes for the live attach that will carry it on.
+        if (!sawResult || rows.length === 0) return 0
+
+        const written = projectClaudeEvents(session, rows,
+          '（dsh 重启期间 Claude 继续完成了这一轮，以下是断档期间的内容。）')
+        await new Promise((resolve) => {
+          const writer = silenceStdin(subprocess.spawn({
+            argv: ['/bin/sh', '-c', 'cat > ' + shellQuote(dir + '/attach.json')],
+            cwd: '/',
+            stdio: { stdin: 'pipe', stdout: 'ignore', stderr: 'ignore' },
+            graceMs: 1000,
+          }))
+          if (writer === undefined || writer.stdin === undefined) { resolve(); return }
+          writer.stdin.write(JSON.stringify({ offset: size }))
+          writer.stdin.end()
+          writer.done.then(() => resolve(), () => resolve())
+        })
+        console.log('cc-mode:', sessionId, 'drained', written, 'message(s) Claude produced while detached')
+        return written
+      })()
+
+      drainInFlight.set(sessionId, work)
+      return work.catch((error) => {
+        console.error('cc-mode: drain failed:', errorText(error))
+        return 0
+      }).finally(() => { drainInFlight.delete(sessionId) })
+    }
+
+    /**
+     * Project Claude conversation events (transcript jsonl rows and broker
+     * stream lines share the shape) into a dsh session as durable history:
+     * proper boundaries in the high-numbered import band, one turn per human
+     * prompt, tools through the live mapping. Returns messages written.
+     */
+    function projectClaudeEvents(session, kept, notice) {
       // Turn numbering is the delicate part. The persistence validator
       // refuses turn/end below 1 (a turn-0 import corrupted its session on
       // reload), reload DROPS messages that sit outside turn boundaries, and
@@ -1516,6 +1583,9 @@ return {
       // lived turns, and after a restart the counter simply continues above.
       const BASE = 1000000
       let turn = BASE
+      for (const event of session.events) {
+        if (event.type === 'turn/start' && typeof event.data.turn === 'number' && event.data.turn > turn) turn = event.data.turn
+      }
       let step = 0
       let turnOpen = false
       let stepOpen = false
@@ -1543,11 +1613,11 @@ return {
         stepOpen = true
       }
 
-      if (dropped > 0) {
+      if (typeof notice === 'string' && notice.length > 0) {
         openStep()
         append('assistant/message', { turn: turn, step: step, message: {
           id: uuid(), role: 'assistant',
-          content: [{ type: 'text', text: '（导入截断：更早的 ' + dropped + ' 条消息未回填；Claude 侧上下文完整，继续对话不受影响。）' }],
+          content: [{ type: 'text', text: notice }],
           source: { kind: 'model', provider: PROVIDER, model: NOTICE_MODEL },
         } })
       }
@@ -1614,6 +1684,45 @@ return {
       }
       closeTurn()
       repairDanglingToolCalls(session)
+      return written
+    }
+
+    /**
+     * Project an adopted Claude transcript into the dsh session it now lives
+     * in, as ordinary durable events — the same vocabulary a live turn writes,
+     * so the native transcript UI (and every plugin on it) renders the history.
+     *
+     * Everything is written under turn 0. The agent's own counter starts real
+     * turns at 1 (and, on a reload, resumes from the last `turn/start` in the
+     * log), so the imported history can never collide with a lived turn.
+     */
+    async function backfillClaudeTranscript(session, cwd, claudeSessionId) {
+      // Idempotent: importing into a conversation that already shows content
+      // must not duplicate it.
+      for (const event of session.events) {
+        if (event.type === 'assistant/message') return { backfilled: 0, skipped: 'already has content' }
+      }
+
+      const path = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd)) + '/' + shellQuote(claudeSessionId + '.jsonl')
+      const raw = await runCapture(['/bin/sh', '-c',
+        'grep -E \'"type":"(user|assistant)"\' ' + path + ' 2>/dev/null | tail -c 3000000'], 20000)
+
+      const rows = []
+      for (const line of String(raw).split('\n')) {
+        if (line.trim().length === 0) continue
+        let event = null
+        try { event = JSON.parse(line) } catch (error) { continue }
+        if (event.isSidechain === true || event.isReplay === true) continue
+        if (event.message === null || event.message === undefined) continue
+        rows.push(event)
+      }
+      const LIMIT = 240
+      const dropped = rows.length > LIMIT ? rows.length - LIMIT : 0
+      const kept = dropped > 0 ? rows.slice(rows.length - LIMIT) : rows
+
+      const written = projectClaudeEvents(session, kept, dropped > 0
+        ? '（导入截断：更早的 ' + dropped + ' 条消息未回填；Claude 侧上下文完整，继续对话不受影响。）'
+        : '')
 
       // The list row must carry the Claude conversation's OWN title — the same
       // name `claude --resume` and the terminal show (its custom-title, or the
@@ -2269,7 +2378,11 @@ return {
 
       harness.handle('state.get', async (args) => {
         const sessionId = String(args.sessionId || '')
-        const state = stateOf(sessionId, sessionOf(sessionId))
+        const session = sessionOf(sessionId)
+        const state = stateOf(sessionId, session)
+        // Fire-and-forget: content Claude produced across a dsh restart lands
+        // in the transcript as soon as it is read, without blocking the UI.
+        drainDetachedOutput(sessionId, session)
         // A conversation that ran before this plugin version knows its Claude
         // session but not the model the process reported; the broker's logged
         // init handshake still does.
@@ -2535,6 +2648,6 @@ return {
     reapIdleBrokers().catch((error) => console.error('cc-mode: reap failed:', errorText(error)))
     ctx.interval(() => { reapIdleBrokers().catch(() => undefined) }, 30 * 60 * 1000)
 
-    console.log('cc-mode: host v67 ready — approval bridge', approval === undefined ? 'off' : 'on')
+    console.log('cc-mode: host v68 ready — approval bridge', approval === undefined ? 'off' : 'on')
   },
 }
