@@ -132,6 +132,9 @@ return {
       .ccmode-import-msg.user .ccmode-import-bubble { background:var(--dsw-alias-interactive-bg-selected, rgba(59,130,246,0.12));
         padding:8px 12px; border-radius:14px; }
       .ccmode-import-msg.assistant .ccmode-import-bubble { color:var(--dsw-alias-label-primary, inherit); }
+      .ccmode-images-chip { display:inline-flex; align-items:center; gap:6px; font-size:11px;
+        color:var(--dsw-alias-label-secondary, inherit); white-space:nowrap; }
+      .ccmode-images-clear { border:none; background:transparent; color:inherit; cursor:pointer; font-size:11px; padding:0 2px; }
       .ccmode-import-titlerow { display:flex; align-items:center; gap:2px; }
       .ccmode-import-back { border:none; background:transparent; color:inherit; cursor:pointer; font-size:15px;
         padding:2px 8px 2px 0; line-height:1; }
@@ -198,9 +201,18 @@ return {
     function load(sessionId) {
       if (sessionId.length === 0) return
       host.call('state.get', { sessionId: sessionId }).then((state) => put(sessionId, state)).catch(() => {})
+      // The host consumes pending images when a turn starts, so the chip's
+      // count comes from the host rather than from what this tab remembers.
+      host.call('image.pending', { sessionId: sessionId })
+        .then((answer) => setImageCount(sessionId, (answer && answer.count) || 0))
+        .catch(() => {})
     }
 
     host.call('catalog', {}).then((value) => { catalog = value; notify() }).catch(() => {})
+
+    // Which conversation the composer currently belongs to, for the paste
+    // handler (a document-level listener that gets no props).
+    let currentClaudeSessionId = ''
 
     function sessionIdOf(props) {
       return String(props.sessionId || (props.session && props.session.sessionId) || '')
@@ -333,6 +345,19 @@ return {
       const sessionId = sessionIdOf(props)
       const state = stateOf(sessionId)
       const claude = state.mode === 'claude'
+
+      // This seat is mounted in every conversation, so it is where the paste
+      // handler learns which session the composer belongs to. The pending-image
+      // chip cannot do that job: it only renders once images exist.
+      currentClaudeSessionId = claude ? sessionId : ''
+
+      // A started turn ate the pending images; refresh the chip against the host.
+      React.useEffect(() => {
+        if (state.running !== true) return
+        host.call('image.pending', { sessionId: sessionId })
+          .then((answer) => setImageCount(sessionId, (answer && answer.count) || 0))
+          .catch(() => {})
+      }, [sessionId, state.running])
 
       React.useEffect(() => { load(sessionId) }, [sessionId])
 
@@ -675,6 +700,72 @@ return {
         open && expandable
           ? h('div', { className: CARD.bodyWrap }, h('div', { className: CARD.ioCard }, parts))
           : null)
+    }
+
+    // ---------- pasted images (Claude conversations) ----------
+    //
+    // dsh's prompt RPC refuses images when the session's dsh model lacks
+    // vision — a gate that knows nothing about the Claude engine. So in a
+    // Claude conversation the paste is intercepted before dsh's attachment
+    // flow sees it: the image is stashed on the host, a chip under the
+    // composer shows what is waiting, and the next prompt carries the images
+    // to Claude as native stream-json image blocks (and into the transcript
+    // as dsh's own attachment blocks).
+    const imageCounts = new Map()
+    const imageWatchers = new Set()
+
+    function setImageCount(sessionId, count) {
+      imageCounts.set(sessionId, count)
+      for (const notify of imageWatchers) notify()
+    }
+
+    function handleImagePaste(event) {
+      if (document.body.getAttribute('data-ccmode') !== 'claude') return
+      const sessionId = currentClaudeSessionId
+      if (sessionId.length === 0) return
+      const target = event.target
+      if (target === null || target === undefined || String(target.tagName).toLowerCase() !== 'textarea') return
+      const items = event.clipboardData && event.clipboardData.items ? Array.from(event.clipboardData.items) : []
+      const images = items.filter((item) => item.kind === 'file' && item.type.indexOf('image/') === 0)
+      if (images.length === 0) return
+      event.preventDefault()
+      event.stopPropagation()
+      for (const item of images) {
+        const file = item.getAsFile()
+        if (file === null) continue
+        const mediaType = file.type || 'image/png'
+        const reader = new FileReader()
+        reader.onload = () => {
+          const data = String(reader.result).split(',')[1] || ''
+          if (data.length === 0) return
+          host.call('image.stash', { sessionId: sessionId, mediaType: mediaType, data: data })
+            .then((answer) => setImageCount(sessionId, (answer && answer.count) || 0))
+            .catch((error) => console.error('cc-mode: 图片暂存失败:', error))
+        }
+        reader.readAsDataURL(file)
+      }
+    }
+
+    function PendingImagesChip(props) {
+      const sessionId = String(props.sessionId || '')
+      const [, bump] = React.useState(0)
+      React.useEffect(() => {
+        const notify = () => bump((n) => n + 1)
+        imageWatchers.add(notify)
+        return () => imageWatchers.delete(notify)
+      }, [])
+      const count = imageCounts.get(sessionId) || 0
+      const state = stateOf(sessionId)
+      if (state.mode !== 'claude' || count === 0) return null
+      return h('span', { className: 'ccmode-images-chip' },
+        '📷 ' + count + ' 张图片将随下一条消息发送',
+        h('button', {
+          type: 'button',
+          className: 'ccmode-images-clear',
+          onClick: () => host.call('image.clear', { sessionId: sessionId })
+            .then(() => setImageCount(sessionId, 0))
+            .catch(() => {}),
+        }, '✕'))
     }
 
     // ---------- Claude subscription usage, under the composer ----------
@@ -1588,6 +1679,16 @@ return {
 
     // ---------- seats ----------
 
+    slots.inject('conversation.composer.dock', () => slots.register(
+      { name: 'conversation.composer.dock', id: 'ccmode-images', order: 5, label: '待发送图片' },
+      (props) => h(PendingImagesChip, { sessionId: props && props.sessionId }),
+    ))
+
+    ctx.effect(() => {
+      document.addEventListener('paste', handleImagePaste, true)
+      return () => document.removeEventListener('paste', handleImagePaste, true)
+    }, 'cc-mode: image paste interception')
+
     slots.inject('conversation.input.left', () => slots.register(
       { name: 'conversation.input.left', id: 'ccmode-engine', order: -100 },
       EngineChip,
@@ -1607,6 +1708,6 @@ return {
       document.body.removeAttribute('data-ccmode')
     }, 'cc-mode: release the shadowed seats')
 
-    console.log('cc-mode: client v66 ready — native chrome, ' + Object.keys(TOOL_SUMMARY).length + ' tool rows')
+    console.log('cc-mode: client v69 ready — native chrome, ' + Object.keys(TOOL_SUMMARY).length + ' tool rows')
   },
 }

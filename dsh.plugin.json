@@ -1,7 +1,7 @@
 {
   "name": "claude-in-dsh",
   "description": "在 dsh web 里用本机 Claude Code 驱动会话：转录/工具卡片/审批全部走 dsh 原生渲染",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "entry": {
     "name": "claude-in-dsh",
     "inject": [

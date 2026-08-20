@@ -32,6 +32,10 @@ return {
     // Optional: when present, Claude's permission questions render in dsh's own
     // approval UI instead of being auto-answered.
     const approval = ctx.get('approval')
+    // Image attachments: pasted images become the same durable attachment
+    // blocks dsh's own composer produces, so the transcript renders them
+    // natively; the raw bytes ride to Claude as stream-json image blocks.
+    const attachments = ctx.get('attachments')
     // Used only to reach a live session outside a turn (header repair).
     const agents = ctx.get('agents')
 
@@ -189,6 +193,7 @@ return {
         // would otherwise come back as DSH after a restart.
         if (saved.mode === 'claude' || saved.mode === 'dsh') state.mode = saved.mode
         if (typeof saved.route === 'string' && saved.route.length > 0) state.route = saved.route
+        if (typeof saved.jsonlOffset === 'number') state.jsonlOffset = saved.jsonlOffset
         if (typeof saved.permissionMode === 'string' && PERMISSION_MODES.some((entry) => entry.id === saved.permissionMode)) {
           state.permissionMode = saved.permissionMode
         }
@@ -215,6 +220,7 @@ return {
             permissionMode: state.permissionMode,
             model: state.model,
             ...(state.route === undefined ? {} : { route: state.route }),
+            ...(state.jsonlOffset === undefined ? {} : { jsonlOffset: state.jsonlOffset }),
             effort: state.effort,
             ...(claudeSessionId === '' ? {} : { claudeSessionId: claudeSessionId }),
           }
@@ -702,6 +708,18 @@ return {
 
     async function fileSize(path) {
       const answer = await runCapture(['/bin/sh', '-c', 'stat -c %s ' + shellQuote(path) + ' 2>/dev/null || echo 0'], 5000)
+      const size = parseInt(String(answer).trim(), 10)
+      return isNaN(size) ? 0 : size
+    }
+
+    /**
+     * Size of a path that is ALREADY a shell word (the transcript paths carry
+     * their own quoting because "$HOME" must expand). Quoting it again with
+     * shellQuote would stat a literal `"$HOME"/...` and silently answer 0 —
+     * which is how an import once recorded offset 0 and re-mirrored history.
+     */
+    async function fileSizeOfShellWord(word) {
+      const answer = await runCapture(['/bin/sh', '-c', 'stat -c %s ' + word + ' 2>/dev/null || echo 0'], 5000)
       const size = parseInt(String(answer).trim(), 10)
       return isNaN(size) ? 0 : size
     }
@@ -1239,6 +1257,25 @@ return {
       persistStates()
     }
 
+    // Images pasted into a Claude conversation's composer, waiting for the
+    // next prompt. dsh's own prompt RPC refuses images when the session's dsh
+    // model lacks vision — a gate that knows nothing about the Claude engine —
+    // so the client stashes pasted images here and the next turn carries them.
+    const pendingImages = new Map()
+
+    async function stashImage(sessionId, mediaType, data) {
+      if (attachments === undefined || typeof attachments.saveImage !== 'function') {
+        throw new Error('cc-mode: 附件服务不可用，无法暂存图片')
+      }
+      const bytes = Buffer.from(String(data), 'base64')
+      if (bytes.length === 0) throw new Error('cc-mode: 空图片')
+      const ref = await attachments.saveImage({ data: new Uint8Array(bytes), mediaType: String(mediaType || 'image/png') })
+      const list = pendingImages.get(sessionId) || []
+      list.push({ attachment: ref, mediaType: String(mediaType || 'image/png'), data: String(data) })
+      pendingImages.set(sessionId, list)
+      return list.length
+    }
+
     // Claude's own built-ins that answer immediately, with no model call: the
     // terminal renders these as a panel, not as something the assistant said.
     // Everything else — the `prompt` built-ins and the markdown/plugin commands
@@ -1476,6 +1513,80 @@ return {
     }
 
     /**
+     * Mirror the terminal side of an imported conversation. While the dsh side
+     * has not spoken yet, the import is a pure mirror: whatever the terminal
+     * appends to the Claude transcript is projected in as history. The moment
+     * the dsh side takes its own turn the Claude session tree forks — two
+     * branches cannot merge into one linear transcript — so from then on new
+     * terminal messages only produce a one-line notice, never a merge.
+     */
+    const syncInFlight = new Map()
+
+    function syncImportedTranscript(sessionId, session) {
+      if (session === undefined || syncInFlight.has(sessionId)) return Promise.resolve(0)
+      const state = stateOf(sessionId, session)
+      if (state.mode !== 'claude' || typeof state.jsonlOffset !== 'number') return Promise.resolve(0)
+      if (typeof state.claudeSessionId !== 'string' || state.claudeSessionId.length === 0) return Promise.resolve(0)
+      if (activeTurns.has(sessionId)) return Promise.resolve(0)
+      const cwd = session.header ? session.header.cwd : undefined
+      if (typeof cwd !== 'string' || cwd.length === 0) return Promise.resolve(0)
+
+      const work = (async () => {
+        const path = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd)) + '/' + shellQuote(state.claudeSessionId + '.jsonl')
+        const size = await fileSizeOfShellWord(path)
+        if (size <= state.jsonlOffset) return 0
+
+        const raw = await runCapture(['/bin/sh', '-c',
+          'tail -c +' + (state.jsonlOffset + 1) + ' ' + path + ' | head -c 3000000'], 20000)
+        const text = String(raw)
+        // Only whole lines advance the offset — a line the terminal is mid-way
+        // through writing stays for the next pass.
+        const lastNewline = text.lastIndexOf('\n')
+        if (lastNewline === -1) return 0
+        const consumed = text.slice(0, lastNewline + 1)
+        const newOffset = state.jsonlOffset + BYTES.encode(consumed).length
+
+        const rows = []
+        for (const line of consumed.split('\n')) {
+          if (line.trim().length === 0) continue
+          let event = null
+          try { event = JSON.parse(line) } catch (error) { continue }
+          if (event.type !== 'user' && event.type !== 'assistant') continue
+          if (event.isSidechain === true || event.isReplay === true) continue
+          if (event.message === null || event.message === undefined) continue
+          rows.push(event)
+        }
+        state.jsonlOffset = newOffset
+        persistStates()
+        if (rows.length === 0) return 0
+
+        // Has the dsh side lived its own turn? (Any turn below the import band.)
+        let forked = false
+        for (const event of session.events) {
+          if (event.type === 'turn/start' && typeof event.data.turn === 'number' && event.data.turn < 1000000) {
+            forked = true
+            break
+          }
+        }
+        if (forked) {
+          projectClaudeEvents(session, [],
+            '（终端侧这段 Claude 对话有 ' + rows.length + ' 条新消息，位于另一条分支；dsh 里已续聊，两条分支无法合并，故不自动同步。）')
+          console.log('cc-mode:', sessionId, 'terminal branch advanced by', rows.length, 'message(s) — forked, notice only')
+          return 0
+        }
+        const written = projectClaudeEvents(session, rows, '')
+        console.log('cc-mode:', sessionId, 'mirrored', written, 'terminal message(s) into the imported conversation')
+        return written
+      })()
+
+      syncInFlight.set(sessionId, work)
+      return work.catch((error) => {
+        console.error('cc-mode: transcript sync failed:', errorText(error))
+        return 0
+      }).finally(() => { syncInFlight.delete(sessionId) })
+    }
+
+    /**
      * Catch up a conversation whose Claude kept talking while nothing was
      * attached — the dsh-restart case: dsh's own crash recovery closes the
      * open turn (tool calls settle as TOOL_OUTCOME_UNKNOWN), but the broker
@@ -1696,7 +1807,7 @@ return {
      * turns at 1 (and, on a reload, resumes from the last `turn/start` in the
      * log), so the imported history can never collide with a lived turn.
      */
-    async function backfillClaudeTranscript(session, cwd, claudeSessionId) {
+    async function backfillClaudeTranscript(sessionId, session, cwd, claudeSessionId) {
       // Idempotent: importing into a conversation that already shows content
       // must not duplicate it.
       for (const event of session.events) {
@@ -1704,6 +1815,9 @@ return {
       }
 
       const path = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd)) + '/' + shellQuote(claudeSessionId + '.jsonl')
+      // Size BEFORE reading: whatever lands after this snapshot is the live
+      // sync's business, never lost between the two.
+      const sizeAtImport = await fileSizeOfShellWord(path)
       const raw = await runCapture(['/bin/sh', '-c',
         'grep -E \'"type":"(user|assistant)"\' ' + path + ' 2>/dev/null | tail -c 3000000'], 20000)
 
@@ -1723,6 +1837,9 @@ return {
       const written = projectClaudeEvents(session, kept, dropped > 0
         ? '（导入截断：更早的 ' + dropped + ' 条消息未回填；Claude 侧上下文完整，继续对话不受影响。）'
         : '')
+      const state = stateOf(sessionId, session)
+      state.jsonlOffset = sizeAtImport
+      persistStates()
 
       // The list row must carry the Claude conversation's OWN title — the same
       // name `claude --resume` and the terminal show (its custom-title, or the
@@ -2107,7 +2224,27 @@ return {
       const state = stateOf(sessionId)
 
       repairDanglingToolCalls(session)
-      for (const message of messages) session.append('user/message', message, { surfaceOp: 'append' })
+
+      // Pasted images ride the last human message of this turn. dsh's
+      // UserMessage objects are FROZEN, so the images go onto a copy — pushing
+      // into the original throws "object is not extensible" and kills the turn.
+      const images = pendingImages.get(sessionId) || []
+      pendingImages.delete(sessionId)
+      let imageTarget = -1
+      if (images.length > 0) {
+        for (let index = messages.length - 1; index >= 0; index -= 1) {
+          const source = messages[index].source
+          if (source === undefined || source.kind === 'user') { imageTarget = index; break }
+        }
+      }
+      messages.forEach((message, index) => {
+        const logged = index === imageTarget
+          ? Object.assign({}, message, {
+              content: (message.content || []).concat(images.map((image) => ({ type: 'image', attachment: image.attachment }))),
+            })
+          : message
+        session.append('user/message', logged, { surfaceOp: 'append' })
+      })
 
       // A turn dsh woke for plugin traffic alone is not a conversation: keep the
       // injections in the transcript, remember what they said, and leave Claude
@@ -2121,7 +2258,7 @@ return {
       const carried = takeCarriedContext(sessionId)
       const spoken = promptTextOf(messages)
       const prompt = carried.length > 0 && spoken.length > 0 ? carried + '\n\n' + spoken : (spoken || carried)
-      if (prompt.length === 0) return
+      if (prompt.length === 0 && images.length === 0) return
 
       const cwd = session.header ? session.header.cwd : undefined
       if (typeof cwd !== 'string' || cwd.length === 0) {
@@ -2129,6 +2266,12 @@ return {
       }
 
       claudeSeen.add(sessionId)
+      // Whatever Claude finished while nothing was attached belongs in the
+      // transcript BEFORE this turn's content. Opening the conversation
+      // usually does this through state.get, but a user who reopens and types
+      // immediately never gives it that chance — and the live attach below
+      // starts at EOF, silently skipping the tail forever.
+      await drainDetachedOutput(sessionId, session)
       // A one-shot command may be reading this session's stream right now.
       await waitForBorrow(sessionId)
       const run = await ensureRun(sessionId, cwd, signal)
@@ -2157,9 +2300,14 @@ return {
         // and that index is exactly what `claude --resume` lists.
         recordPromptHistory(cwd, run.claudeSessionId, typedTextOf(messages) || prompt)
 
+        const promptContent = []
+        if (prompt.length > 0) promptContent.push({ type: 'text', text: prompt })
+        for (const image of images) {
+          promptContent.push({ type: 'image', source: { type: 'base64', media_type: image.mediaType, data: image.data } })
+        }
         await run.write({
           type: 'user',
-          message: { role: 'user', content: [{ type: 'text', text: prompt }] },
+          message: { role: 'user', content: promptContent },
           parent_tool_use_id: null,
         })
         if (run.writeError !== undefined) throw new Error(run.writeError)
@@ -2385,6 +2533,8 @@ return {
         // Fire-and-forget: content Claude produced across a dsh restart lands
         // in the transcript as soon as it is read, without blocking the UI.
         drainDetachedOutput(sessionId, session)
+        // Likewise for an imported conversation's terminal side.
+        syncImportedTranscript(sessionId, session)
         // A conversation that ran before this plugin version knows its Claude
         // session but not the model the process reported; the broker's logged
         // init handshake still does.
@@ -2465,6 +2615,15 @@ return {
           applyModel(run, state)
         }
         return publicState(sessionId)
+      }),
+
+      // What a deploy must check before restarting dsh: restarting while a
+      // Claude turn is live interrupts it, and dsh's crash recovery then
+      // settles its open tool call as TOOL_OUTCOME_UNKNOWN.
+      harness.handle('busy', () => {
+        const live = []
+        for (const [sessionId, active] of activeTurns) live.push({ sessionId: sessionId, turn: active.turn })
+        return { busy: live.length > 0, turns: live }
       }),
 
       harness.handle('engines', () => ({ engines: engineIndex() })),
@@ -2560,7 +2719,7 @@ return {
           : (session !== undefined && session.header ? session.header.cwd : '')
         if (session !== undefined && typeof cwd === 'string' && cwd.length > 0) {
           try {
-            backfill = await backfillClaudeTranscript(session, cwd, claudeSessionId)
+            backfill = await backfillClaudeTranscript(sessionId, session, cwd, claudeSessionId)
           } catch (error) {
             backfill = { backfilled: 0, skipped: errorText(error) }
             console.error('cc-mode: transcript backfill failed:', errorText(error))
@@ -2569,6 +2728,23 @@ return {
         console.log('cc-mode:', sessionId, 'adopted Claude conversation', claudeSessionId,
           '— backfilled', backfill.backfilled, 'message(s)', backfill.skipped ? '(' + backfill.skipped + ')' : '')
         return { ok: true, state: publicState(sessionId), backfill: backfill }
+      }),
+
+      harness.handle('image.stash', async (args) => {
+        const sessionId = String(args.sessionId || '')
+        if (sessionId.length === 0) throw new Error('cc-mode: image.stash 需要 sessionId')
+        const count = await stashImage(sessionId, args.mediaType, args.data)
+        return { count: count }
+      }),
+
+      harness.handle('image.pending', (args) => {
+        const list = pendingImages.get(String(args.sessionId || '')) || []
+        return { count: list.length }
+      }),
+
+      harness.handle('image.clear', (args) => {
+        pendingImages.delete(String(args.sessionId || ''))
+        return { count: 0 }
       }),
 
       harness.handle('usage', (args) => usageSnapshot(args !== null && args !== undefined && args.force === true)),
@@ -2650,6 +2826,6 @@ return {
     reapIdleBrokers().catch((error) => console.error('cc-mode: reap failed:', errorText(error)))
     ctx.interval(() => { reapIdleBrokers().catch(() => undefined) }, 30 * 60 * 1000)
 
-    console.log('cc-mode: host v69 ready — approval bridge', approval === undefined ? 'off' : 'on')
+    console.log('cc-mode: host v73 ready — approval bridge', approval === undefined ? 'off' : 'on')
   },
 }

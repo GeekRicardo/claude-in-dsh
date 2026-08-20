@@ -14,6 +14,8 @@
 - **订阅用量**：官方订阅时输入框下方显示 5h/7d 用量与刷新倒计时（同 id 覆盖 dsh-balance 的座位，切回 DSH 自动还原）。
 - **导入对话**：工作区 ⋯ 菜单 →「导入 Claude Code 对话」，列出该目录下的本机 Claude 会话，预览（dsh 原生工具卡片样式）后一键接着聊。
 - **插话与排队**：跑轮次时 Ctrl/Cmd+Enter 插话直接折进 Claude 当前轮；普通 Enter 沿用 dsh 排队语义。
+- **粘贴图片**：Claude 会话里粘贴的图片存成 dsh 原生附件（转录里直接显示），并以 stream-json image block 随下一条消息送给 Claude —— 不再被「当前模型不支持图片」挡下。
+- **断档补播**：dsh 自己重启期间 Claude 完成的输出，会在下次打开或下一轮开始前补播进转录（不调用模型）。
 
 ## 前置
 
@@ -34,6 +36,12 @@ bash install.sh --link /path/to/claude-in-dsh --restart
 
 装完重启 dsh web（pm2：`pm2 restart dsh-web`）并硬刷新页面。
 
+## 维护
+
+改代码只改 `src/`，然后 `pnpm build`（或 `pnpm test`，会先 build 再跑 bundle 冒烟测试）。
+
+重启 dsh 用 `bash scripts/safe-restart.sh`：它先确认没有进行中的 Claude 轮次再重启。直接 `pm2 restart` 会打断正在跑的轮次，在那个对话里留下 `TOOL_OUTCOME_UNKNOWN` 红卡（内容随后会被补播，但轮次已断）。
+
 ## 结构
 
 ```
@@ -43,10 +51,9 @@ src/                开发与测试所用的动态包源码（dsh-cordis-mcp 沙
   broker.mjs        进程 broker（宿主运行时会把同一份源码写到 /tmp/ccmode）
   client-rig.mjs    离线渲染台架
 scripts/build.mjs   从 src 生成 lib（正式 bundle 容器包装，引擎体逐字节一致）
+scripts/safe-restart.sh  确认没有进行中的轮次后再重启 dsh-web
 lib/                生成产物：index.js（host, ESM）、client.js（ModuleLoader bundle）
 ```
-
-改代码只改 `src/`，然后 `pnpm build`（或 `pnpm test`，会先 build 再跑 bundle 冒烟测试）。
 
 ## 运行时落点
 
