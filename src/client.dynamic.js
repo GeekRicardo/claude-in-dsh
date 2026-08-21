@@ -724,6 +724,18 @@ return {
     // composer shows what is waiting, and the next prompt carries the images
     // to Claude as native stream-json image blocks (and into the transcript
     // as dsh's own attachment blocks).
+    // Called right after the composer submits, so the pending rail re-checks at
+    // once instead of on its next tick.
+    const submitWatchers = new Set()
+    const BURST_MS = [0, 120, 300, 700, 1400]
+
+    function noteComposerSubmit() {
+      if (submitWatchers.size === 0) return
+      for (const delay of BURST_MS) {
+        window.setTimeout(() => { for (const pull of submitWatchers) pull() }, delay)
+      }
+    }
+
     const imageCounts = new Map()
     // Data URLs of what is waiting, so the rail shows the picture itself the
     // way dsh's own composer does — a line of text is not a preview.
@@ -827,7 +839,7 @@ return {
       // keep showing an image that has already been sent.
       React.useEffect(() => {
         if (!claude || sessionId.length === 0 || count === 0) return undefined
-        const stop = ctx.interval(() => {
+        const pull = () => {
           host.call('image.pending', { sessionId: sessionId })
             .then((answer) => {
               const now = (answer && answer.count) || 0
@@ -836,8 +848,12 @@ return {
               setImageCount(sessionId, now)
             })
             .catch(() => {})
-        }, 1200)
-        return () => { stop() }
+        }
+        const stop = ctx.interval(pull, 1500)
+        // Polling alone made the rail linger a beat or two after the text had
+        // already flown — the send itself is the moment to ask.
+        submitWatchers.add(pull)
+        return () => { stop(); submitWatchers.delete(pull) }
       }, [sessionId, claude, count])
 
       const drafts = (props && props.attachments) || []
@@ -1954,6 +1970,26 @@ return {
       return () => document.removeEventListener('paste', handleImagePaste, true)
     }, 'cc-mode: image paste interception')
 
+    // Enter (or the send button) means the stash is about to change hands.
+    ctx.effect(() => {
+      const onKeyDown = (event) => {
+        if (event.key !== 'Enter' || event.shiftKey) return
+        noteComposerSubmit()
+      }
+      const onClick = (event) => {
+        const node = event.target
+        if (node === null || node === undefined || typeof node.closest !== 'function') return
+        if (node.closest('[data-composer-seat] button') === null) return
+        noteComposerSubmit()
+      }
+      document.addEventListener('keydown', onKeyDown, true)
+      document.addEventListener('click', onClick, true)
+      return () => {
+        document.removeEventListener('keydown', onKeyDown, true)
+        document.removeEventListener('click', onClick, true)
+      }
+    }, 'cc-mode: pending images follow the send')
+
     slots.inject('conversation.input.left', () => slots.register(
       { name: 'conversation.input.left', id: 'ccmode-engine', order: -100 },
       EngineChip,
@@ -1973,6 +2009,6 @@ return {
       document.body.removeAttribute('data-ccmode')
     }, 'cc-mode: release the shadowed seats')
 
-    console.log('cc-mode: client v73 ready — native chrome, ' + Object.keys(TOOL_SUMMARY).length + ' tool rows')
+    console.log('cc-mode: client v74 ready — native chrome, ' + Object.keys(TOOL_SUMMARY).length + ' tool rows')
   },
 }
