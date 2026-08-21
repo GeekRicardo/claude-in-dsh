@@ -32,6 +32,9 @@ return {
     // Optional: when present, Claude's permission questions render in dsh's own
     // approval UI instead of being auto-answered.
     const approval = ctx.get('approval')
+    // Optional: when present, Claude's AskUserQuestion is answered through dsh's
+    // own question card — same surface, same answer encoding as `ask_user_question`.
+    const userQuestions = ctx.get('userQuestions')
     // Image attachments: pasted images become the same durable attachment
     // blocks dsh's own composer produces, so the transcript renders them
     // natively; the raw bytes ride to Claude as stream-json image blocks.
@@ -2491,6 +2494,210 @@ return {
       return { claudeSessionId: claudeSessionId, items: items }
     }
 
+    // ---------- user questions ----------
+
+    /**
+     * Claude 的 AskUserQuestion 走的是权限通道（`can_use_tool` +
+     * `requires_user_interaction`），但它不是权限问题——它就是 dsh 的
+     * `ask_user_question`。识别它靠工具名加上「入参里有 questions 数组」两条，
+     * 单看工具名会把同名的 MCP 工具也吞掉。
+     * @param request 控制请求的 request 体。
+     * @returns 是不是一次该交给人回答的提问。
+     */
+    function isUserQuestion(request) {
+      return request.tool_name === 'AskUserQuestion'
+        && request.input !== null
+        && typeof request.input === 'object'
+        && Array.isArray(request.input.questions)
+        && request.input.questions.length > 0
+    }
+
+    /**
+     * Claude 的问题 → dsh 的 AskUserQuestionItem。dsh 要求每题有稳定 id 而
+     * Claude 不给，所以按下标造一个，回收答案时再按 id 映射回题面文本。
+     * @param input `can_use_tool` 的 input（含 questions）。
+     * @returns dsh 提问服务要的题目数组。
+     */
+    function dshQuestionsOf(input) {
+      const items = []
+      const questions = Array.isArray(input.questions) ? input.questions : []
+      for (let index = 0; index < questions.length; index += 1) {
+        const source = questions[index] || {}
+        const question = typeof source.question === 'string' ? source.question.trim() : ''
+        if (question === '') continue
+        const item = { id: 'q' + index, question: question }
+        if (typeof source.header === 'string' && source.header.trim() !== '') item.header = source.header.trim()
+        if (Array.isArray(source.options)) {
+          const options = []
+          for (const raw of source.options) {
+            const label = raw !== null && typeof raw === 'object' && typeof raw.label === 'string' ? raw.label : ''
+            if (label === '') continue
+            const option = { label: label }
+            if (typeof raw.description === 'string' && raw.description !== '') option.description = raw.description
+            options.push(option)
+          }
+          if (options.length > 0) item.options = options
+        }
+        if (source.multiSelect === true) item.multiSelect = true
+        items.push(item)
+      }
+      return items
+    }
+
+    /**
+     * dsh 的答案 → Claude 的 `updatedInput.answers`。Claude 按**题面文本**取键、
+     * 值是一个字符串，所以多选把选中的标签连起来，「其他」的自由文本也拼在后面
+     * ——实测自由文本能原样送达（CLI 会说 "The user answered ..."）。
+     * @param items 发出去的 dsh 题目（带 id 与题面）。
+     * @param answer `userQuestions.ask` 的返回值。
+     * @returns Claude 要的 answers 映射；没人答的题不出现在里面。
+     */
+    function ccAnswersOf(items, answer) {
+      const questionOf = new Map(items.map((item) => [item.id, item.question]))
+      const answers = {}
+      const list = answer !== null && typeof answer === 'object' && Array.isArray(answer.answers) ? answer.answers : []
+      for (const entry of list) {
+        const question = questionOf.get(entry && entry.id)
+        if (question === undefined) continue
+        const parts = []
+        for (const label of Array.isArray(entry.selected) ? entry.selected : []) {
+          if (typeof label === 'string' && label.trim() !== '') parts.push(label.trim())
+        }
+        if (typeof entry.custom === 'string' && entry.custom.trim() !== '') parts.push(entry.custom.trim())
+        if (parts.length > 0) answers[question] = parts.join(', ')
+      }
+      return answers
+    }
+
+    /**
+     * 把一次 AskUserQuestion 交给 dsh 的提问服务，用 dsh 自己的提问卡片问、
+     * 自己的答案编码收，再翻译回 Claude 的控制响应。
+     *
+     * 一律问人，不看 permissionMode：权限姿态说的是「工具要不要拦」，
+     * 而提问在 dsh 里从来不是可以替人代答的东西——完全放行模式下自动允许，
+     * 换来的只是 CLI 回一句 "The user did not answer the questions."。
+     * @param respond 控制响应写回函数。
+     * @param request 控制请求的 request 体。
+     * @param agent 发起这次调用的 dsh agent。
+     * @param signal 本轮的中断信号。
+     */
+    async function answerUserQuestion(respond, request, agent, signal) {
+      const items = dshQuestionsOf(request.input)
+      if (items.length === 0) { respond('allow'); return }
+      console.log('cc-mode: asking dsh to answer', items.length, 'question(s)')
+      let answers = {}
+      try {
+        const answer = await userQuestions.ask({
+          questions: items,
+          agent: agent,
+          ...(signal === undefined ? {} : { signal: signal }),
+        })
+        answers = ccAnswersOf(items, answer)
+      } catch (error) {
+        // 中断、没有应答者、被委派的子 agent……都归到同一个结果：没人回答。
+        // 这正是 Claude 自己在没人回答时的语义（"The user did not answer the
+        // questions."），模型会照常继续，而不是把这一轮吊死在这里。
+        console.error('cc-mode: user question failed:', errorText(error))
+      }
+      // answers 留空也要带上 updatedInput：CLI 用它区分「答了」和「没答」。
+      respond('allow', undefined, { ...request.input, answers: answers })
+    }
+
+    // ---------- plan review ----------
+
+    // dsh 自己的 exit_plan_mode 用的就是这三个常量（@deepseek-ai/dsh-plan-mode）。
+    // 逐字沿用是有意的：题目 id、选项标签、intent 一模一样，客户端才会渲染成
+    // 同一张计划审核卡片，而不是一张长得像的普通提问卡。
+    const PLAN_REVIEW_ID = 'plan-review'
+    const PLAN_APPROVE_LABEL = 'Approve'
+    const PLAN_KEEP_LABEL = 'Keep planning'
+
+    /**
+     * Claude 的 ExitPlanMode 同样从权限通道来（`input.plan` 是计划正文，
+     * `input.planFilePath` 是 CLI 自己存的副本）。它对应 dsh 的计划审核，
+     * 不是"要不要放行一个工具"。
+     * @param request 控制请求的 request 体。
+     * @returns 是不是一次计划审核。
+     */
+    function isPlanReview(request) {
+      return request.tool_name === 'ExitPlanMode'
+        && request.input !== null
+        && typeof request.input === 'object'
+        && typeof request.input.plan === 'string'
+        && request.input.plan.trim() !== ''
+    }
+
+    /**
+     * 把一次 ExitPlanMode 交给 dsh 的计划审核卡片。
+     *
+     * 批准的判定逐字照抄 dsh 的 exit_plan_mode：**只有**恰好选中 Approve 且没有
+     * 附带自由文本才算批准；用户但凡写了字，那就是反馈，等于「继续规划」。
+     *
+     * 两端的落点也对得上：批准 → `allow`，CLI 自己退出计划模式并回一句
+     * "User has approved your plan."（实测之后的 Write 就走普通权限通道了）；
+     * 继续规划 → `deny` 带上反馈，反馈会成为工具结果送进模型，而 CLI 因为工具
+     * 没放行仍留在计划模式里——正是 dsh 那边「反馈回模型、留在计划模式」的语义。
+     * @param respond 控制响应写回函数。
+     * @param request 控制请求的 request 体。
+     * @param run 这次运行（用来取 sessionId）。
+     * @param agent 发起调用的 dsh agent。
+     * @param state 该会话的插件状态。
+     * @param signal 本轮的中断信号。
+     */
+    async function answerPlanReview(respond, request, run, agent, state, signal) {
+      console.log('cc-mode: asking dsh to review the plan')
+      let answer
+      try {
+        answer = await userQuestions.ask({
+          questions: [{
+            id: PLAN_REVIEW_ID,
+            header: 'Plan review',
+            question: 'Approve this plan and leave plan mode?',
+            detail: String(request.input.plan),
+            options: [
+              { label: PLAN_APPROVE_LABEL, description: 'Leave plan mode; the plan is carried out from the next step.' },
+              { label: PLAN_KEEP_LABEL, description: 'Stay in plan mode; feedback goes back to the model.' },
+            ],
+            intent: { kind: 'plan-review', approve: PLAN_APPROVE_LABEL },
+          }],
+          agent: agent,
+          ...(signal === undefined ? {} : { signal: signal }),
+        })
+      } catch (error) {
+        // 用户把卡片撤掉改成直接说话，或是没有应答者：留在计划模式、停在这里，
+        // 别自作主张替他批准。dsh 的 exit_plan_mode 在 ASK_CANCELLED 上说的就是这句。
+        console.error('cc-mode: plan review failed:', errorText(error))
+        respond('deny', 'The user dismissed the plan review to speak instead; stay in plan mode, stop here, and wait for their message.')
+        return
+      }
+      const entries = (answer !== null && typeof answer === 'object' && Array.isArray(answer.answers) ? answer.answers : [])
+        .filter((entry) => entry && entry.id === PLAN_REVIEW_ID)
+      const item = entries.length === 1 ? entries[0] : undefined
+      const feedback = item !== undefined && typeof item.custom === 'string' ? item.custom.trim() : ''
+      const approved = item !== undefined
+        && Array.isArray(item.selected)
+        && item.selected.length === 1
+        && item.selected[0] === PLAN_APPROVE_LABEL
+        && feedback === ''
+      if (!approved) {
+        respond('deny', feedback === ''
+          ? 'The user chose to keep planning; revise the plan and present it again.'
+          : 'The user chose to keep planning; their feedback: ' + feedback)
+        return
+      }
+      // CLI 在本进程里已经退出计划模式，但姿态在这边是**启动参数**：不落到状态里，
+      // broker 换进程（dsh 重启、进程被回收）后 `--permission-mode plan` 会把这个
+      // 已经批准过的会话又按回计划模式。落到监督档，等于 dsh 那边「退出计划模式、
+      // 工具照常逐个审批」。
+      if (state.permissionMode === 'plan') {
+        state.permissionMode = 'manual'
+        applySupervision(run.sessionId, state)
+        persistStates()
+        console.log('cc-mode: plan approved — posture plan -> manual')
+      }
+      respond('allow')
+    }
+
     // ---------- permission questions ----------
 
     async function answerPermission(run, agent, state, value, signal) {
@@ -2499,7 +2706,7 @@ return {
       const toolName = dshToolName(request.tool_name || request.display_name || 'tool')
       const callId = request.tool_use_id
 
-      function respond(behavior, message) {
+      function respond(behavior, message, updatedInput) {
         try {
           run.write({
             type: 'control_response',
@@ -2508,12 +2715,24 @@ return {
               request_id: String(requestId),
               response: behavior === 'deny'
                 ? { behavior: 'deny', message: message || 'The user denied this tool call.' }
-                : { behavior: 'allow' },
+                : (updatedInput === undefined ? { behavior: 'allow' } : { behavior: 'allow', updatedInput: updatedInput }),
             },
           })
         } catch (error) {
           console.error('cc-mode: answering a permission request failed:', errorText(error))
         }
+      }
+
+      // 提问与计划审核先于权限判定：它们不是「要不要放行这个工具」，而是
+      // 「人怎么答」「人批不批」。没有提问服务时退回原路（当权限问题问一下），
+      // 至少不会静默吞掉。
+      if (userQuestions !== undefined && isUserQuestion(request)) {
+        await answerUserQuestion(respond, request, agent, signal)
+        return
+      }
+      if (userQuestions !== undefined && isPlanReview(request)) {
+        await answerPlanReview(respond, request, run, agent, state, signal)
+        return
       }
 
       // Only the supervised posture asks a human; every other mode is a
