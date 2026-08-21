@@ -18,6 +18,12 @@
 - **Claude 的计划模式审批走 dsh 原生计划审核卡片**。ExitPlanMode 同样从权限通道来，此前也只是被问成"要不要放行 ExitPlanMode"。现在它交给 `userQuestions`，用的是和 dsh 自己的 `exit_plan_mode` **逐字相同**的题目 id、选项标签（Approve / Keep planning）与 `intent: {kind:'plan-review'}`——客户端据此渲染的就是同一张计划审核卡片，计划正文走 `detail`。批准判定也照抄：只有恰好选中 Approve 且没有附带自由文本才算批准，写了字就是反馈、等于继续规划，反馈原样成为工具结果送回模型（实测模型收到的就是那句话，且仍留在计划模式）。
   批准时顺带把该会话的权限档从「计划模式」落回「监督」：姿态在这边是启动参数，不改的话 broker 换进程后 `--permission-mode plan` 会把一个已经批准过计划的会话又按回只读。（输入框里的档位选择器要等下次轮询/重挂才会跟着变。）
 
+## 1.3.6 — 2026-08-20
+
+### 修复
+
+- **稍大一点的图片粘贴不进去**（`500 · Image exceeds the configured per-side pixel limit`）。dsh 的附件库默认拒绝任何一边超过 **2000px**、或超过 3.5MB 的图片，而一张 Retina 截图轻松就越过这两条线；dsh 自己的输入框只会弹个 toast，等于截图根本发不出去。现在粘贴时先按 dsh 实际配置的上限（宿主新增 `image.limits` 读取 `attachments.imageLimits`）等比缩到能过，必要时转成 JPEG 再逐级降尺寸直到满足字节上限。缩小对 Claude 没有损失——它本来就会把长边超过 ~1568px 的图再缩一遍。
+
 ## 1.3.5 — 2026-08-20
 
 ### 变更

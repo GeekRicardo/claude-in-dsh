@@ -747,6 +747,58 @@ return {
       for (const notify of imageWatchers) notify()
     }
 
+    // dsh's attachment store refuses an image over its per-side pixel limit
+    // (2000px by default) or its byte limit, and a retina screenshot clears
+    // both without trying. dsh's own composer only surfaces that as a toast, so
+    // a pasted screenshot simply cannot be sent. Shrinking it here is the
+    // difference between "cannot paste screenshots" and "screenshots work" —
+    // and a smaller raster is what Claude wants anyway (it downscales past
+    // ~1568px on the long edge regardless).
+    let imageLimits = { maxImageBytes: 3670016, maxImageDimension: 2000, maxImagePixels: 40000000 }
+    host.call('image.limits', {}).then((value) => {
+      if (value !== null && value !== undefined) imageLimits = value
+    }).catch(() => {})
+
+    function decodeImage(url) {
+      return new Promise((resolve, reject) => {
+        const image = new Image()
+        image.onload = () => resolve(image)
+        image.onerror = () => reject(new Error('cc-mode: 这张图片解不开'))
+        image.src = url
+      })
+    }
+
+    /**
+     * Return a data URL that dsh's store will accept: the original when it
+     * already fits, otherwise the smallest faithful reduction that does.
+     */
+    function fitImage(url, mediaType) {
+      const maxSide = Number(imageLimits.maxImageDimension) || 2000
+      const maxBytes = Number(imageLimits.maxImageBytes) || 3670016
+      const roughBytes = Math.floor((url.length - (url.indexOf(',') + 1)) * 3 / 4)
+      return decodeImage(url).then((image) => {
+        const side = Math.max(image.naturalWidth, image.naturalHeight)
+        if (side <= maxSide && roughBytes <= maxBytes) return { url: url, mediaType: mediaType }
+        // PNG screenshots re-encode badly under a byte budget; JPEG at a high
+        // quality is both smaller and visually equivalent for this purpose.
+        const encodeAs = roughBytes > maxBytes || mediaType === 'image/png' ? 'image/jpeg' : mediaType
+        let scale = Math.min(1, maxSide / side)
+        for (let attempt = 0; attempt < 5; attempt += 1) {
+          const canvas = document.createElement('canvas')
+          canvas.width = Math.max(1, Math.round(image.naturalWidth * scale))
+          canvas.height = Math.max(1, Math.round(image.naturalHeight * scale))
+          const context = canvas.getContext('2d')
+          if (context === null) return { url: url, mediaType: mediaType }
+          context.drawImage(image, 0, 0, canvas.width, canvas.height)
+          const out = canvas.toDataURL(encodeAs, 0.9)
+          const bytes = Math.floor((out.length - (out.indexOf(',') + 1)) * 3 / 4)
+          if (bytes <= maxBytes) return { url: out, mediaType: encodeAs }
+          scale *= 0.75
+        }
+        return { url: url, mediaType: mediaType }
+      })
+    }
+
     function handleImagePaste(event) {
       if (document.body.getAttribute('data-ccmode') !== 'claude') return
       const sessionId = currentClaudeSessionId
@@ -764,17 +816,17 @@ return {
         const mediaType = file.type || 'image/png'
         const reader = new FileReader()
         reader.onload = () => {
-          const url = String(reader.result)
-          const data = url.split(',')[1] || ''
-          if (data.length === 0) return
-          host.call('image.stash', { sessionId: sessionId, mediaType: mediaType, data: data })
-            .then((answer) => {
-              const thumbs = imageThumbs.get(sessionId) || []
-              thumbs.push(url)
-              imageThumbs.set(sessionId, thumbs)
-              setImageCount(sessionId, (answer && answer.count) || 0)
-            })
-            .catch((error) => console.error('cc-mode: 图片暂存失败:', error))
+          fitImage(String(reader.result), mediaType).then((fitted) => {
+            const data = fitted.url.split(',')[1] || ''
+            if (data.length === 0) return undefined
+            return host.call('image.stash', { sessionId: sessionId, mediaType: fitted.mediaType, data: data })
+              .then((answer) => {
+                const thumbs = imageThumbs.get(sessionId) || []
+                thumbs.push(fitted.url)
+                imageThumbs.set(sessionId, thumbs)
+                setImageCount(sessionId, (answer && answer.count) || 0)
+              })
+          }).catch((error) => console.error('cc-mode: 图片暂存失败:', error))
         }
         reader.readAsDataURL(file)
       }
@@ -2009,6 +2061,6 @@ return {
       document.body.removeAttribute('data-ccmode')
     }, 'cc-mode: release the shadowed seats')
 
-    console.log('cc-mode: client v74 ready — native chrome, ' + Object.keys(TOOL_SUMMARY).length + ' tool rows')
+    console.log('cc-mode: client v75 ready — native chrome, ' + Object.keys(TOOL_SUMMARY).length + ' tool rows')
   },
 }
