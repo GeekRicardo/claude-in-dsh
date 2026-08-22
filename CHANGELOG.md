@@ -2,6 +2,23 @@
 
 本文件记录 claude-in-dsh 的版本变化。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 1.5.1 — 2026-08-22
+
+### 修复
+
+- **macOS 上第一条消息就死于「写入 Claude 的输入管道超时（10 秒）」**。broker 的启动命令用了 `setsid nohup node …`，而 `setsid(1)` 是 util-linux 独有的，macOS 根本没有——broker 从未启动，fifo 没有读端，`cat > in` 卡在 open 上直到超时。现在改用 node 自己的 `spawn(..., {detached: true})`（在所有 POSIX 平台上就是 setsid(2)）把 broker 脱进独立会话，并且用 dsh 自己的 node（`process.execPath`）而不是 PATH 上碰运气找的那个——pm2/GUI 环境的 PATH 里常常没有 node。启动失败也不再沉默：5 秒内 broker 没就位就直接报错并提示看 `cc-mode [launch]` 日志，而不是十秒后一条不知所云的管道超时。
+- **所有 `stat -c` 换成 GNU/BSD 双兼容**（`stat -c … || stat -f …`）。BSD stat 不认 `-c`，此前在 macOS 上文件大小恒为 0（崩溃恢复的 offset 兜底会从头重放整段 broker 日志）、「导入 Claude Code 对话」列表恒为空、闲置 broker 永不回收。bundle 测试新增回归防线：出现无兜底的 `stat -c` 或 setsid 启动命令即失败。
+- **detach/checkpoint 记录的字节偏移可能含半行，重连丢一整行**。tail 的 chunk 边界可以落在行中间，而 `run.offset` 按 chunk 累加；把它写进 attach.json 后，下次 attach 从行中间续读，开头的残片解析失败被丢弃——那一整行（可能是一条 assistant 消息或 result）就没了。现在另记一个「最后完整行」偏移，checkpoint 与 detach 都用它。
+- **一次性命令与轮次抢同一条流的竞态**。`activeTurns` 和 borrow 标记都在 await 之后才落位：上一轮 finally 里踢出的 `/context` 探测和用户紧接着发的下一条消息能互相穿过对方的检查，然后两个消费者平分同一个消息队列——命令循环还会吞掉它不该看见的 `control_request`（权限请求就此无人应答）。现在两边都走同一把**同步占位**的会话锁，排队顺序在任何 yield 之前就定死。
+- **steering 路径漏了 carrier 守卫**。窄竞态下投影唤醒用的 NUL 标记文本会被当成插话发给 Claude，且 `carriersInFlight` 永不清除——之后所有断档补播/导入镜像都不再被唤醒。现在 claim 到 carrier 直接跳过并清标记，内容照常在下一轮渲染。
+- **管道写超时后残留的半行不再污染下一条消息**。超时被 terminate 的 `cat` 可能已写入半条 JSON（带图片的消息有几 MB）；下一次写入先补一个换行，把残片变成 CLI 直接丢弃的一条坏行，而不是让它粘在新消息前面把两条都毁掉。
+- **面板里跑 `/clear` 后 resume 映射指向旧会话**。一次性命令循环收到 `init` 握手时此前不更新 `claudeSessionId`；`/clear` 给进程换了新会话 id，持久化的续聊映射却还指着清空前的那段。
+
+### 新增
+
+- **后台任务在转录里可见**。Agent 工具现在默认后台跑，detached Bash / Monitor 同理——它们的 `system` 流事件（`task_started` / `task_notification`）此前被整族丢弃，模型稍后「凭空」接话在 dsh 里毫无来由。现在任务启动与完成通知（含子 agent 的最终报告）作为插件注记进入转录。
+- **可选服务晚到时补绑定**。`approval` / `userQuestions` / `attachments` / `agents` 此前只在插件加载时一次性 `ctx.get`，加载顺序靠后就静默降级（提问退化回权限卡片、图片存不了）。现在启动后约 20 秒内重试解析，绑上为止。
+
 ## 1.5.0 — 2026-08-21
 
 ### 新增

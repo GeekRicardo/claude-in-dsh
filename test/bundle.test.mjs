@@ -65,3 +65,19 @@ test('client half registers through the module loader', () => {
   exports.apply({ get: () => undefined, effect: () => () => {}, interval: () => () => {}, timeout: () => () => {} })
   assert.equal(styleTags.length, 0)
 })
+
+test('每条 shell 命令都是 GNU/BSD 双兼容（macOS 回归防线）', () => {
+  const source = fs.readFileSync(path.join(root, 'lib/index.js'), 'utf8')
+
+  // setsid(1) 是 util-linux 独有的，macOS 没有 —— broker 在 mac 上因此起不来，
+  // 每条消息都死于 10 秒管道写超时。脱离会话必须走 node 自己的 detached:true。
+  assert.ok(!/['"]setsid /.test(source), 'setsid 启动命令回来了 —— macOS 上 broker 会再次起不来')
+  assert.ok(source.includes('{detached:true,stdio:"ignore"}'), 'broker 必须以 detached:true 脱离会话')
+
+  // stat -c 是 GNU 语法；每一处都必须带 BSD 的 stat -f 兜底，否则 mac 上
+  // 文件大小恒为 0（offset 兜底重放整段日志）、导入列表恒为空、broker 永不回收。
+  for (const line of source.split('\n')) {
+    if (!/['"$(]stat -c /.test(line)) continue
+    assert.ok(line.includes('stat -f'), 'GNU-only 的 stat 调用（缺 BSD 兜底）: ' + line.trim())
+  }
+})
