@@ -1229,9 +1229,24 @@ return {
 
       // Resuming is what makes an older conversation continue where it left
       // off: prefer the id the dead broker recorded, else the durable one.
-      const resume = meta !== null && typeof meta.claudeSessionId === 'string' && meta.claudeSessionId.length > 0
+      let resume = meta !== null && typeof meta.claudeSessionId === 'string' && meta.claudeSessionId.length > 0
         ? meta.claudeSessionId
         : (typeof state.claudeSessionId === 'string' && state.claudeSessionId.length > 0 ? state.claudeSessionId : null)
+      // `--resume` is fatal when that transcript is not on disk: the CLI says
+      // "No conversation found with session ID …" and exits, which surfaces
+      // as error_during_execution on the first turn — forever, since the id
+      // stays recorded. And a recorded id without a transcript is a real
+      // state: pre-1.5.1 macOS launches persisted the id before the broker
+      // ever ran. Resume only what exists; otherwise start FRESH under a new
+      // id (re-using the dead id with --session-id could collide with a
+      // same-id transcript under some other project directory).
+      if (resume !== null) {
+        const transcript = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd)) + '/' + shellQuote(resume + '.jsonl')
+        if (await fileSizeOfShellWord(transcript) <= 0) {
+          console.log('cc-mode: recorded Claude session', resume, 'has no transcript on disk — starting a fresh one')
+          resume = null
+        }
+      }
       const claudeSessionId = resume === null ? uuid() : resume
       const argv = [
         executable, '-p',

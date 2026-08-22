@@ -2,6 +2,12 @@
 
 本文件记录 claude-in-dsh 的版本变化。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 1.5.2 — 2026-08-22
+
+### 修复
+
+- **记录在案的 Claude 会话 id 没有对应 transcript 时，第一轮永远死于 `error_during_execution`**。启动命令无条件 `--resume <id>`，而 CLI 对不存在的会话直接报 `No conversation found with session ID: …` 然后退出；id 又是持久化的，于是每一轮都撞死在同一处。这种「幽灵 id」是真实存在的状态：1.5.1 之前的 macOS 启动把 id 先持久化了，broker 却从未跑起来、transcript 从未写过。现在 resume 之前先确认 `~/.claude/projects/<slug>/<id>.jsonl` 真在磁盘上，不在（或为空）就换一个**新 id** 全新开始——不复用死 id，避免与其他项目目录下的同名 transcript 相撞。旧的中毒会话由此自愈，无需手动清理。
+
 ## 1.5.1 — 2026-08-22
 
 ### 修复
