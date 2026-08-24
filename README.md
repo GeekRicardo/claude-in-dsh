@@ -6,7 +6,7 @@
 
 - **引擎选择器**：输入框里一个和模型选择器同款的下拉（`DSH | Claude Code`），按会话切换。dsh 会话与 Claude 会话严格互斥 —— 一个会话跑过谁，就永远属于谁（从会话日志推断，重启不丢）。
 - **原生渲染**：Claude 的流被写成 dsh 自己的持久会话事件（`assistant/chunk`、`assistant/message`、`tool/call`、`tool/result`…），所以持久化、投影、主题、其他插件（如 dsh-better-tool-ui 的工具行）全部照常工作。子 agent（Agent 工具）渲染为嵌套子调用。
-- **权限档替换**：切到 Claude 后，dsh 的访问模式选择器被 Claude 的权限档（manual / acceptEdits / auto / bypassPermissions / dontAsk / plan）替换；权限请求（`can_use_tool`）桥接到 dsh 原生审批 UI（若你配置了 Claude 的 PermissionRequest hook，则完全遵循你的 hook）。
+- **权限档替换**：切到 Claude 后，dsh 的访问模式选择器被 Claude 的权限档（manual / acceptEdits / auto / bypassPermissions / plan）替换；权限请求（`can_use_tool`）桥接到 dsh 原生审批 UI（若你配置了 Claude 的 PermissionRequest hook，则完全遵循你的 hook）。
 - **提问桥接**：Claude 的 `AskUserQuestion` 不当权限问题处理，而是交给 dsh 的提问服务——你看到的是 dsh 自己那张提问卡片（选项 / 多选 / "其他"自由文本），答案原样回到 Claude。提问一律问人，不受权限档影响。
 - **计划审核桥接**：Claude 的 `ExitPlanMode` 用 dsh 自己的计划审核卡片审（和 dsh 的 `exit_plan_mode` 同一套 id/标签/intent）；批准即退出计划模式并把权限档落回监督档，选择继续规划则把你的反馈原样送回模型。
 - **模型 / effort**：模型座换成 Claude 的模型清单 + reasoning effort；运行中切模型走 `set_model` 控制请求（不重启进程），重连后自动补发。
