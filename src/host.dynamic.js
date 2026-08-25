@@ -2407,11 +2407,39 @@ return {
     // round is coming, so this only has to outlast that gap — it is not a
     // guess at how long Claude might think.
     const IDLE_QUIET_MS = 10000
+    // With background work outstanding, silence is expected — a backgrounded
+    // `sleep` says nothing until it finishes. Stay through it, but not
+    // indefinitely: this stops short of the reaper's 45 minutes, so a
+    // conversation everyone has forgotten still becomes collectable.
+    const IDLE_TASK_QUIET_MS = 30 * 60 * 1000
     // One stretch of out.log per projection, matching the drain path's cap.
     const IDLE_STRETCH_MAX = 3000000
     // A permission asked between turns has no turn to be cancelled with; it
     // stands until answered, or until the reader lets go of the run.
     const idleSignal = new AbortController().signal
+
+    /**
+     * How many background tasks the log last reported outstanding.
+     *
+     * The reader cannot start this at zero and wait to be told. It attaches
+     * either after a turn — when a backgrounded `sleep` is typically already
+     * running, and its `background_tasks_changed` scrolled by while the turn
+     * owned the stream — or after a restart, where that event is simply
+     * history. Starting blind means picking the ten-second window in exactly
+     * the case the long one exists for, and letting go minutes before the task
+     * wakes Claude up.
+     */
+    async function lastBackgroundTaskCount(dir) {
+      const raw = await runCapture(['/bin/sh', '-c',
+        'tail -c 2000000 ' + shellQuote(dir + '/out.log')
+        + ' | grep -F \'"background_tasks_changed"\' | tail -1'], 10000)
+      const line = String(raw).trim()
+      if (line.length === 0) return 0
+      try {
+        const value = JSON.parse(line)
+        return Array.isArray(value.tasks) ? value.tasks.length : 0
+      } catch (error) { return 0 }
+    }
 
     /** `run.next`, plus the stop check that lets the idle reader be relieved. */
     async function idleNext(run) {
@@ -2501,9 +2529,15 @@ return {
         : (typeof run.consumed === 'number' ? run.consumed : run.offset)
 
       run.idleTask = (async () => {
-        // The last count `background_tasks_changed` reported. Empty means
-        // nothing is left that could wake Claude, so this reader can go.
+        // The last count `background_tasks_changed` reported. It does not
+        // decide whether to stay — silence does — it decides how long silence
+        // has to last: a `sleep 600` in the background is minutes of nothing
+        // followed by a whole round, and letting go at ten seconds would miss
+        // exactly the round this reader exists for. Seeded from the log,
+        // because the event that set it usually scrolled by before this
+        // reader existed.
         let tasksOpen = 0
+        try { tasksOpen = await lastBackgroundTaskCount(run.dir) } catch (error) { tasksOpen = 0 }
         let notice = ''
         let quiet = null
         let relieved = false
@@ -2512,59 +2546,70 @@ return {
           try { quiet() } catch (error) { /* already fired */ }
           quiet = null
         }
+        // Silence is the only exit. Arming this up front matters as much as
+        // re-arming it: this reader starts AFTER the turn consumed the round's
+        // `result`, so an ordinary conversation with no background work leaves
+        // it facing an empty queue — waiting for a message that is never coming
+        // would pin the run in `runs`, where the reaper skips it forever.
+        const armQuiet = () => {
+          disarm()
+          quiet = armTimeout(() => {
+            quiet = null
+            run.idleExpired = true
+            run.idleStop = true
+            const waiter = run.waiter
+            run.waiter = null
+            if (waiter !== null && waiter !== undefined) waiter()
+          }, tasksOpen > 0 ? IDLE_TASK_QUIET_MS : IDLE_QUIET_MS)
+        }
+
+        const handle = async (message) => {
+          const parent = typeof message.parent_tool_use_id === 'string' ? message.parent_tool_use_id : null
+
+          if (message.type === 'system') {
+            if (message.subtype === 'background_tasks_changed') {
+              tasksOpen = Array.isArray(message.tasks) ? message.tasks.length : 0
+            } else if (message.subtype === 'task_notification' && parent === null) {
+              // Same note the live loop writes, so the reply this round is
+              // about to give does not read as an answer to nothing.
+              const what = typeof message.description === 'string' && message.description.length > 0
+                ? message.description
+                : String(message.task_id || 'task')
+              const summary = typeof message.summary === 'string' ? message.summary.trim() : ''
+              notice += (notice.length > 0 ? '\n\n' : '') + '⚙ 后台任务通知：' + what
+                + (summary.length > 0 ? '\n\n' + summary.slice(0, 4000) : '')
+            }
+            return
+          }
+          // A round nobody asked for can still need a human. Left unanswered
+          // it hangs Claude on a question no one can see, holding the
+          // process (and its RAM) for as long as the conversation lives.
+          if (message.type === 'control_request') {
+            const request = message.request || {}
+            if (request.subtype === 'can_use_tool') {
+              let agent
+              try { agent = agents === undefined ? undefined : agents.get(sessionId) } catch (error) { agent = undefined }
+              if (agent !== undefined) {
+                answerPermission(run, agent, stateOf(sessionId), message, idleSignal)
+              }
+            }
+            return
+          }
+          if (message.type !== 'result') return
+          await projectIdleStretch(sessionId, run, notice, message.ccmodeOffset)
+          notice = ''
+        }
+
         try {
+          armQuiet()
           while (true) {
             const message = await idleNext(run)
             if (message === undefined) break
             if (message === IDLE_STOPPED) { relieved = true; break }
-            // Anything arriving means the conversation is not quiet after all.
-            disarm()
-            if (message === null || typeof message !== 'object') continue
-            const parent = typeof message.parent_tool_use_id === 'string' ? message.parent_tool_use_id : null
-
-            if (message.type === 'system') {
-              if (message.subtype === 'background_tasks_changed') {
-                tasksOpen = Array.isArray(message.tasks) ? message.tasks.length : 0
-              } else if (message.subtype === 'task_notification' && parent === null) {
-                // Same note the live loop writes, so the reply this round is
-                // about to give does not read as an answer to nothing.
-                const what = typeof message.description === 'string' && message.description.length > 0
-                  ? message.description
-                  : String(message.task_id || 'task')
-                const summary = typeof message.summary === 'string' ? message.summary.trim() : ''
-                notice += (notice.length > 0 ? '\n\n' : '') + '⚙ 后台任务通知：' + what
-                  + (summary.length > 0 ? '\n\n' + summary.slice(0, 4000) : '')
-              }
-              continue
-            }
-            // A round nobody asked for can still need a human. Left unanswered
-            // it hangs Claude on a question no one can see, holding the
-            // process (and its RAM) for as long as the conversation lives.
-            if (message.type === 'control_request') {
-              const request = message.request || {}
-              if (request.subtype === 'can_use_tool') {
-                let agent
-                try { agent = agents === undefined ? undefined : agents.get(sessionId) } catch (error) { agent = undefined }
-                if (agent !== undefined) {
-                  answerPermission(run, agent, stateOf(sessionId), message, idleSignal)
-                }
-              }
-              continue
-            }
-            if (message.type !== 'result') continue
-
-            await projectIdleStretch(sessionId, run, notice, message.ccmodeOffset)
-            notice = ''
-            // Still a task running: it will wake Claude again, so stay.
-            if (tasksOpen > 0) continue
-            quiet = armTimeout(() => {
-              quiet = null
-              run.idleExpired = true
-              run.idleStop = true
-              const waiter = run.waiter
-              run.waiter = null
-              if (waiter !== null && waiter !== undefined) waiter()
-            }, IDLE_QUIET_MS)
+            if (message !== null && typeof message === 'object') await handle(message)
+            // Something arrived, so the conversation is not quiet after all —
+            // and `tasksOpen` may have just changed what quiet is worth.
+            armQuiet()
           }
         } catch (error) {
           console.error('cc-mode: idle reader stopped:', errorText(error))
@@ -2588,11 +2633,73 @@ return {
           // any session this plugin is still attached to, and drainDetachedOutput
           // picks up from the offset recorded here if Claude does speak again.
           if (run.idleExpired === true) {
-            console.log('cc-mode:', sessionId, 'has no background task left — releasing the stream')
+            console.log('cc-mode:', sessionId, 'went quiet — releasing the stream')
             detach(sessionId)
           }
         }
       })()
+    }
+
+    /**
+     * Pick a conversation back up when it is opened: if its Claude is still
+     * running and nothing here is listening, attach and follow it again.
+     *
+     * The reader above only survives as long as this plugin does. A dsh
+     * restart, a plugin update, or its own quiet timeout all leave the broker
+     * holding a live Claude that no one is reading — and `drainDetachedOutput`
+     * alone is not enough, because it projects the rounds that have already
+     * finished and then stops. Anything Claude says *after* that moment needs
+     * someone attached to hear it, and opening the conversation is exactly when
+     * a person is there to see it.
+     *
+     * It never starts a process: no broker alive, nothing to follow. And it
+     * costs nothing to be wrong — with no traffic the reader times out and
+     * detaches on its own.
+     */
+    const followInFlight = new Set()
+
+    function resumeIdleFollow(sessionId, session) {
+      if (session === undefined || shuttingDown) return Promise.resolve(false)
+      if (runs.has(sessionId) || activeTurns.has(sessionId)) return Promise.resolve(false)
+      if (followInFlight.has(sessionId)) return Promise.resolve(false)
+      const state = stateOf(sessionId, session)
+      if (state.mode !== 'claude') return Promise.resolve(false)
+
+      followInFlight.add(sessionId)
+      const work = (async () => {
+        const dir = sessionDir(sessionId)
+        const meta = await readJsonFile(dir + '/meta.json')
+        if (meta === null) return false
+        const exited = await readJsonFile(dir + '/exit.json')
+        if (exited !== null) return false
+        if (!(await isAlive(meta.brokerPid))) return false
+        // Launched under different settings: leave it to the next turn's
+        // ensureRun, which knows how to retire and replace a process.
+        const snapshot = launchSnapshot(state)
+        if (meta.snapshot !== snapshot) return false
+        // Re-checked after the awaits above — a turn may have started while
+        // this was reading files, and two readers on one queue lose messages.
+        if (runs.has(sessionId) || activeTurns.has(sessionId)) return false
+
+        const attachState = await readJsonFile(dir + '/attach.json')
+        const offset = attachState !== null && typeof attachState.offset === 'number'
+          ? attachState.offset
+          : await fileSize(dir + '/out.log')
+        const run = createRun(sessionId, dir, snapshot, meta.claudeSessionId)
+        run.brokerPid = meta.brokerPid
+        run.cwd = meta.cwd || (session.header ? session.header.cwd : '')
+        run.offset = offset
+        runs.set(sessionId, run)
+        await attach(run)
+        startIdleDrain(sessionId, run, offset)
+        console.log('cc-mode: following', sessionId, 'again from', offset, '— its Claude is still running')
+        return true
+      })()
+
+      return work.catch((error) => {
+        console.error('cc-mode: could not follow the live Claude again:', errorText(error))
+        return false
+      }).finally(() => { followInFlight.delete(sessionId) })
     }
 
     /** Relieve the idle reader and wait until it has actually let go. */
@@ -3980,7 +4087,13 @@ return {
         const state = stateOf(sessionId, session)
         // Fire-and-forget: content Claude produced across a dsh restart lands
         // in the transcript as soon as it is read, without blocking the UI.
+        // Then follow it live, so whatever it says NEXT arrives too — the drain
+        // only covers rounds that already finished. Ordered, not parallel: both
+        // read the same offset, and following from a pre-drain one would replay
+        // what the drain just projected.
         drainDetachedOutput(sessionId, session)
+          .then(() => resumeIdleFollow(sessionId, session))
+          .catch(() => undefined)
         // Likewise for an imported conversation's terminal side.
         syncImportedTranscript(sessionId, session)
         // And recover anything the old high-band numbering stranded.
