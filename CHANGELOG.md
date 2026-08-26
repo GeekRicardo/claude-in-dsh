@@ -2,6 +2,22 @@
 
 本文件记录 claude-in-dsh 的版本变化。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 1.7.0 — 2026-08-25
+
+### 新增
+
+- **「在新对话中分支」现在真的把 Claude 一起分支了**。dsh 的 fork 只做一件事：把源会话的事件切片当种子建一个新会话，并在 header 里记下 `parentSession`。它不认识这个插件，而 `claudeSessionId` 存在插件自己的 state 里、以 dsh 的 sessionId 为键，于是不会跟过去。更麻烦的是引擎归属是从**会话日志**判定的（`committedEngine` 扫到 provider 为 Claude 的 assistant 消息就算数），而那些事件被复制过去了——所以 fork 出来的会话仍然显示成 Claude 引擎、屏幕上留着一整段历史，第一次发消息时却起了一个全新的 Claude。实测：父会话里问「你回答 A」「你回答B」都答了，fork 出来的会话第一句「你回答c」，Claude 自己说「我这边没有任何上下文——没有前面的提问，也没有 A/B/C 选项列表」。
+
+  现在没有可 resume 的 id 时，会先看 `session.header.parentSession`：父会话若由 Claude 驱动且它的 transcript 还在磁盘上，就用 `--resume <父> --fork-session --session-id <新 id>` 启动。三个开关可以同用（对着 CLI 实测过：子会话用的正是我们指定的 id，并且答得出父会话里存的暗号），所以新 id 由插件分配，`meta.json` 和持久状态不必等 init 握手才知道自己是谁。父会话不是 Claude 会话、没有记录 id、或者 transcript 已经不在了，都退回今天的行为（起一个全新的 Claude）——而不是让 `--resume` 指向一个不存在的会话，那会让 CLI 直接退出，而且 id 是持久化的，那一轮会永远死在同一处。
+
+- **会话标题不再是一句被截断的开场白**。这件事有两层，都修了。
+
+  其一，Claude 自己起的名字写在它的 transcript 里（`ai-title` 行），**不在流里**——三个 broker 的 `out.log` 里一个 `ai-title` 事件都没有，只能读文件。读的时候每一行都要真正解析并核对 `type`，不能只靠 grep：一个正在讨论标题同步的会话，会把 `{"type":"ai-title"…}` 原样写进自己的工具输出和正文，只匹配字符串就会把它自己的聊天当成标题（查这件事时先被这样骗过一次）。
+
+  其二，更要紧的是 Claude 多数时候根本不起名——44 个由本插件驱动的 Claude 会话里只有 3 个有 `ai-title`，那是交互式 UI 的行为。而 dsh 自己的标题生成对 Claude 会话是**结构性失效**的：`SessionTitleService` 在用户消息上把任务标成 pending，真正启动却要靠 `request/header`（Claude 会话从不写）或 dsh 自己那次 loop 请求（Claude 会话不走 dsh 的模型）——两个触发源都不会来，于是标题永远停在 fallback。所以每轮之后：Claude 起过名就用它的（经 `rename`，顺带取消 dsh 那次多余的标题生成），没起过而标题还是 fallback 就调一次 `sessionTitle.refresh`，请 dsh 用自己的模型起个正经名字，每个会话只请一次。
+
+  人手改过的标题一概不动，永久：插件记得自己上次写进去的是什么，座位上换了别的内容就说明是人改的，从此收手（`refresh` 的文档明说它会覆盖用户标题，所以这道闸必须在它前面）。
+
 ## 1.6.2 — 2026-08-25
 
 ### 修复

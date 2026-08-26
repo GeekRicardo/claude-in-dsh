@@ -41,6 +41,11 @@ return {
     let attachments = ctx.get('attachments')
     // Used only to reach a live session outside a turn (header repair).
     let agents = ctx.get('agents')
+    // Claude names the conversation itself once a round lands. dsh's own title
+    // provider seat is single-occupancy and already taken by
+    // dsh-session-title-llm, so this cannot register as a provider — it hands
+    // the finished name to the same service instead.
+    let sessionTitle = ctx.get('sessionTitle')
 
     // These live in other packages and apply-order is not guaranteed: a
     // one-shot ctx.get left the approval/question bridges silently off
@@ -52,11 +57,13 @@ return {
       if (userQuestions === undefined) userQuestions = ctx.get('userQuestions')
       if (attachments === undefined) attachments = ctx.get('attachments')
       if (agents === undefined) agents = ctx.get('agents')
+      if (sessionTitle === undefined) sessionTitle = ctx.get('sessionTitle')
       const missing = [
         approval === undefined ? 'approval' : '',
         userQuestions === undefined ? 'userQuestions' : '',
         attachments === undefined ? 'attachments' : '',
         agents === undefined ? 'agents' : '',
+        sessionTitle === undefined ? 'sessionTitle' : '',
       ].filter((name) => name.length > 0)
       if (missing.length === 0) {
         if (serviceRebinds > 0) console.log('cc-mode: late-bound optional services after', serviceRebinds, 'retry/-ies')
@@ -454,6 +461,7 @@ return {
         if (saved.mode === 'claude' || saved.mode === 'dsh') state.mode = saved.mode
         if (typeof saved.route === 'string' && saved.route.length > 0) state.route = saved.route
         if (typeof saved.jsonlOffset === 'number') state.jsonlOffset = saved.jsonlOffset
+        if (typeof saved.titleWritten === 'string') state.titleWritten = saved.titleWritten
         if (typeof saved.contextWindow === 'number') state.contextWindow = saved.contextWindow
         if (typeof saved.contextWindowKey === 'string') state.contextWindowKey = saved.contextWindowKey
         if (saved.bandRepaired === true) state.bandRepaired = true
@@ -489,6 +497,7 @@ return {
             model: state.model,
             ...(state.route === undefined ? {} : { route: state.route }),
             ...(state.jsonlOffset === undefined ? {} : { jsonlOffset: state.jsonlOffset }),
+            ...(state.titleWritten === undefined ? {} : { titleWritten: state.titleWritten }),
             ...(state.contextWindow === undefined ? {} : { contextWindow: state.contextWindow }),
             ...(state.contextWindowKey === undefined ? {} : { contextWindowKey: state.contextWindowKey }),
             ...(state.bandRepaired === true ? { bandRepaired: true } : {}),
@@ -1308,6 +1317,39 @@ return {
       return true
     }
 
+    /**
+     * The Claude session this conversation was forked from, if any.
+     *
+     * dsh's fork copies the transcript events and records `parentSession` in
+     * the header — it knows nothing about this plugin, so the Claude behind
+     * the conversation is not branched with it. Left alone, the new
+     * conversation displays a complete history to a model that has never seen
+     * a line of it; asked about the conversation above it, the fork answers
+     * 「我这边没有任何上下文」 while the screen says otherwise.
+     *
+     * Returns null whenever branching is not possible, which always degrades
+     * to today's behaviour (a fresh Claude) rather than a broken launch.
+     */
+    async function parentClaudeSession(sessionId, cwd) {
+      const session = sessionOf(sessionId)
+      const header = session === undefined ? undefined : session.header
+      const parent = header === undefined ? undefined : header.parentSession
+      if (typeof parent !== 'string' || parent.length === 0) return null
+      const parentState = states.get(parent)
+      const parentId = parentState === undefined ? undefined : parentState.claudeSessionId
+      if (typeof parentId !== 'string' || parentId.length === 0) return null
+      // `--resume` is fatal against a transcript that is not on disk, and this
+      // one belongs to another conversation — it may have been cleaned up.
+      const transcript = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd))
+        + '/' + shellQuote(parentId + '.jsonl')
+      if (await fileSizeOfShellWord(transcript) <= 0) {
+        console.log('cc-mode:', sessionId, 'was forked from', parent,
+          'but that Claude transcript is gone — starting fresh')
+        return null
+      }
+      return parentId
+    }
+
     async function ensureRun(sessionId, cwd, signal) {
       const state = stateOf(sessionId)
       const snapshot = launchSnapshot(state)
@@ -1389,6 +1431,10 @@ return {
           resume = null
         }
       }
+      // Nothing to resume, but dsh may have forked this conversation out of
+      // one that does have a Claude behind it. Branch that instead of opening
+      // a blank one under a transcript full of someone else's history.
+      const forkFrom = resume === null ? await parentClaudeSession(sessionId, cwd) : null
       const claudeSessionId = resume === null ? uuid() : resume
       const argv = [
         executable, '-p',
@@ -1403,7 +1449,16 @@ return {
       ]
       if (state.model.length > 0) argv.push('--model', state.model)
       if (state.effort.length > 0) argv.push('--effort', state.effort)
-      argv.push(resume === null ? '--session-id' : '--resume', claudeSessionId)
+      if (forkFrom !== null) {
+        // The three compose, verified against the CLI: it resumes the parent,
+        // branches instead of writing back into it, and takes the id we hand
+        // it — so meta.json and the durable state can record the child up
+        // front rather than waiting for the init handshake to reveal it.
+        argv.push('--resume', forkFrom, '--fork-session', '--session-id', claudeSessionId)
+        console.log('cc-mode:', sessionId, 'branches Claude session', forkFrom, 'into', claudeSessionId)
+      } else {
+        argv.push(resume === null ? '--session-id' : '--resume', claudeSessionId)
+      }
 
       const env = state.permissionMode === 'bypassPermissions' ? { IS_SANDBOX: '1' } : undefined
       const metaSeed = JSON.stringify({
@@ -2439,6 +2494,115 @@ return {
         const value = JSON.parse(line)
         return Array.isArray(value.tasks) ? value.tasks.length : 0
       } catch (error) { return 0 }
+    }
+
+    /**
+     * The name Claude gave this conversation, if it has gotten around to it.
+     *
+     * Claude records it in its OWN transcript as an `ai-title` row. It is not
+     * in the stream — verified across the brokers' logs, which hold zero
+     * `ai-title` events — so reading the file is the only way to see it. The
+     * rows are appended and never rewritten, so the last one wins.
+     *
+     * Every candidate is parsed and type-checked rather than trusted from the
+     * grep: a conversation that merely discusses `ai-title` puts that text in
+     * its own transcript, inside tool output and assistant prose. Matching on
+     * the string alone reads a conversation's chatter as its title.
+     */
+    async function lastAiTitle(cwd, claudeSessionId) {
+      if (typeof cwd !== 'string' || cwd.length === 0) return ''
+      if (typeof claudeSessionId !== 'string' || claudeSessionId.length === 0) return ''
+      const path = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd))
+        + '/' + shellQuote(claudeSessionId + '.jsonl')
+      const raw = await runCapture(['/bin/sh', '-c',
+        'tail -c 2000000 ' + path + ' 2>/dev/null | grep -F ' + shellQuote('{"type":"ai-title"') + ' | tail -5'], 10000)
+      const lines = String(raw).split('\n')
+      for (let index = lines.length - 1; index >= 0; index -= 1) {
+        const line = lines[index].trim()
+        if (line.length === 0) continue
+        let value = null
+        try { value = JSON.parse(line) } catch (error) { continue }
+        if (value === null || value.type !== 'ai-title') continue
+        if (typeof value.aiTitle !== 'string') continue
+        const title = value.aiTitle.trim()
+        if (title.length > 0) return title
+      }
+      return ''
+    }
+
+    /**
+     * Carry Claude's own name for the conversation over to dsh.
+     *
+     * dsh's title-provider seat is single-occupancy and dsh-session-title-llm
+     * already holds it ("provider … is already registered"), with no priority
+     * to shadow it by — so this cannot be a provider. `rename` is the way in.
+     * It records the title as user-set, which also calls off dsh's own title
+     * generation: right, since Claude has already named the thing and a second
+     * model call would spend money to say it again.
+     *
+     * A title a person typed is never overwritten. Whatever this last wrote is
+     * remembered, so anything else sitting in the seat means someone else put
+     * it there — and from then on this keeps its hands off.
+     */
+    // Conversations already asked to name themselves. In-process only: a
+    // restart may ask once more, which is one short call, while persisting it
+    // would silence the ask for good if the first one failed.
+    const titleRefreshed = new Set()
+
+    async function syncClaudeTitle(sessionId, session) {
+      if (sessionTitle === undefined || session === undefined) return false
+      const state = stateOf(sessionId, session)
+      if (state.mode !== 'claude') return false
+      const run = runs.get(sessionId)
+      const cwd = run !== undefined && typeof run.cwd === 'string' && run.cwd.length > 0
+        ? run.cwd
+        : (session.header ? session.header.cwd : '')
+      const title = await lastAiTitle(cwd, state.claudeSessionId)
+
+      let snapshot
+      try { snapshot = sessionTitle.get(session) } catch (error) { return false }
+      const current = snapshot === undefined ? '' : String(snapshot.title || '')
+      const source = snapshot === undefined ? undefined : snapshot.source
+      // Renamed since this last spoke, so a human chose it. Theirs, for good.
+      if (source !== undefined && source.kind === 'user' && current !== state.titleWritten) {
+        state.titleWritten = current
+        persistStates()
+        return false
+      }
+
+      // Claude did not name it — which is the common case, since it only
+      // writes `ai-title` from its interactive UI. Left alone the conversation
+      // keeps dsh's fallback, a truncated first sentence, forever: dsh's own
+      // title provider marks the work pending on a user message but starts it
+      // from `request/header` or its own loop request, and a Claude-driven
+      // conversation produces neither. `refresh` is the service's deliberate
+      // entry point for exactly this — ask, and dsh names it with its own
+      // model. Once a provider title lands the seat is no longer `fallback`,
+      // so this asks once and stops.
+      if (title.length === 0) {
+        if (source !== undefined && source.kind !== 'fallback') return false
+        if (titleRefreshed.has(sessionId)) return false
+        titleRefreshed.add(sessionId)
+        try {
+          await sessionTitle.refresh(session)
+          console.log('cc-mode:', sessionId, 'asked dsh to name itself — Claude had not')
+        } catch (error) {
+          console.error('cc-mode: title refresh failed:', errorText(error))
+        }
+        return false
+      }
+
+      if (title === state.titleWritten) return false
+      if (current === title) { state.titleWritten = title; persistStates(); return false }
+
+      try { sessionTitle.rename(session, title) } catch (error) {
+        console.error('cc-mode: could not carry Claude\'s title over:', errorText(error))
+        return false
+      }
+      state.titleWritten = title
+      persistStates()
+      console.log('cc-mode:', sessionId, 'took its title from Claude:', title)
+      return true
     }
 
     /** `run.next`, plus the stop check that lets the idle reader be relieved. */
@@ -3882,6 +4046,11 @@ return {
         // Claude's turn is over; Claude may not be. A finished background task
         // opens a round of its own, and from here on this is what reads it.
         startIdleDrain(sessionId, run, roundEndsAt)
+        // Claude names the conversation a beat AFTER the round lands — the
+        // title costs it a model call of its own, so it is not on disk when
+        // `result` arrives. Look once the dust has settled; `state.get` picks
+        // up anything still unnamed when this looked.
+        armTimeout(() => { syncClaudeTitle(sessionId, session).catch(() => undefined) }, 5000)
         // `force`: the window is cached per model choice, but the composition
         // moved with this very turn — the panel should not open on last turn's.
         if (run.cwd) probeContextWindow(sessionId, run.cwd, true).catch(() => undefined)
@@ -4094,6 +4263,8 @@ return {
         drainDetachedOutput(sessionId, session)
           .then(() => resumeIdleFollow(sessionId, session))
           .catch(() => undefined)
+        // A round whose title was not on disk yet when the turn looked.
+        syncClaudeTitle(sessionId, session).catch(() => undefined)
         // Likewise for an imported conversation's terminal side.
         syncImportedTranscript(sessionId, session)
         // And recover anything the old high-band numbering stranded.
