@@ -42,11 +42,20 @@ test('默认模型是清单里的一个具体模型', () => {
     defaultModel + ' 不在清单里')
 })
 
-test('新会话就落在那个默认模型上', () => {
+test('什么都没选过时，开局落在那个默认模型上', () => {
   const { defaultModel } = catalog()
-  // stateOf 的初值决定新会话开局显示什么、以及用什么启动进程。
-  assert.match(host, /state = \{ mode: 'dsh', permissionMode: 'manual', model: DEFAULT_MODEL,/)
+  // 新会话的初值来自 defaults，而 defaults 自己的出厂值是这一行。
+  assert.match(host, /const defaults = \{ mode: 'dsh', permissionMode: 'manual', model: DEFAULT_MODEL, effort: '' \}/)
   assert.ok(defaultModel.length > 0)
+})
+
+test('新会话开在上一次选定的那套配置上', () => {
+  // 在一个会话里选了 Claude、权限档和模型，下一个新会话就该这么开——
+  // 而不是每次都退回 DSH 再手动切一遍。
+  assert.match(host, /state = \{\s*mode: defaults\.mode,\s*permissionMode: defaults\.permissionMode,\s*model: defaults\.model,\s*effort: defaults\.effort,/)
+  // 只有三个选择器写这份默认：记的是「有人选了什么」，不是「某个会话恰好继承了什么」。
+  assert.equal((host.match(/^\s+rememberDefaults\(state\)$/gm) || []).length, 3,
+    '引擎、权限档、模型三个选择器各一次；多出来的话就是某处把继承来的值当成了选择')
 })
 
 test('老会话存下来的空选择仍然保留', () => {
