@@ -47,6 +47,7 @@ function build(overrides) {
     QUOTA_WAIT_HORIZON_MS: 24 * 60 * 60 * 1000,
     // 真实时钟，只是把窗口压到毫秒级：等待逻辑本身不看具体数值。
     QUOTA_POLL_MS: 1000000,
+    QUOTA_UNREADABLE_GIVE_UP: 3,
     QUOTA_SETTLE_MS: 0,
     QUOTA_TICK_MS: 1,
     quotaWaits: new Map(),
@@ -57,7 +58,7 @@ function build(overrides) {
     console: { log: (...args) => calls.logs.push(args.join(' ')), error: () => {} },
     ...overrides,
   }
-  const names = ['spentWindow', 'quotaWaitOf', 'cancelQuotaWait', 'clockText', 'waitOutQuota']
+  const names = ['spentWindow', 'usageAuthFailure', 'quotaWaitOf', 'cancelQuotaWait', 'clockText', 'waitOutQuota']
   const made = new Function('deps', `
     const { ${Object.keys(deps).join(', ')} } = deps
     ${names.map(sliceFunction).join('\n')}
@@ -133,10 +134,17 @@ test('用量提前回来就提前继续，用的是另一句提示', async () =>
   assert.equal(textOf(rig.calls.writes[0]), EARLY, '提前恢复和窗口重置是两回事，提示词也不一样')
 })
 
-test('读不到用量不算恢复', async () => {
+test('一次抖动不算恢复，读数回来后照常走完', async () => {
+  let polls = 0
   const rig = build({
     QUOTA_POLL_MS: 1,
-    usageSnapshot: async () => ({ official: true, error: 'usage endpoint unavailable' }),
+    // 第一次读不到，之后恢复正常但额度仍然用满——等待应该继续到重置。
+    usageSnapshot: async () => {
+      polls += 1
+      return polls === 1
+        ? { official: true, error: 'usage endpoint unavailable' }
+        : { official: true, windows: [window('five_hour', '5h', 100, Date.now() + 30)] }
+    },
   })
   const at = Date.now() + 30
   const kept = await rig.waitOutQuota('s', transcriptOf(rig.calls), runOf(rig.calls),
@@ -145,6 +153,39 @@ test('读不到用量不算恢复', async () => {
   assert.equal(kept, true)
   assert.ok(Date.now() >= at, '一次网络抖动不该被当成额度回来了')
   assert.equal(textOf(rig.calls.writes[0]), RESUME)
+})
+
+// 扣住一轮的前提是「确知额度用完了」。读数一直读不到就不满足这个前提——
+// 真实事故里一次瞬时认证失败让一轮被干等了三个半小时，而账号其实只用了 2%。
+test('一直读不到用量就不再扣人', async () => {
+  const rig = build({
+    QUOTA_POLL_MS: 1,
+    usageSnapshot: async () => ({ official: true, error: 'usage endpoint unavailable' }),
+  })
+  const at = Date.now() + 60 * 60e3          // 一小时后才重置
+  const kept = await rig.waitOutQuota('s', transcriptOf(rig.calls), runOf(rig.calls),
+    { id: 'five_hour', label: '5h', at: at }, new AbortController().signal)
+
+  assert.equal(kept, false, '读不到就不该继续替用户扣着这一轮')
+  assert.ok(Date.now() < at, '更不该干等到重置时间')
+  assert.deepEqual(rig.calls.writes, [], '没有续跑，就不该替用户发续跑提示')
+  assert.match(rig.calls.notes.join('\n'), /读不到.*用量/)
+})
+
+test('token 被拒就立刻放手，不必等满三次', async () => {
+  let polls = 0
+  const rig = build({
+    QUOTA_POLL_MS: 1,
+    usageSnapshot: async () => {
+      polls += 1
+      return { official: true, error: 'OAuth access token has been revoked.' }
+    },
+  })
+  const kept = await rig.waitOutQuota('s', transcriptOf(rig.calls), runOf(rig.calls),
+    { id: 'five_hour', label: '5h', at: Date.now() + 60 * 60e3 }, new AbortController().signal)
+
+  assert.equal(kept, false)
+  assert.equal(polls, 1, '等待解决不了被拒的凭据，多轮询一次都是白扣一轮')
 })
 
 test('重置在 24 小时以后就不等了', async () => {
