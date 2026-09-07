@@ -61,6 +61,9 @@ function build() {
     DEFAULT_MODEL: 'claude-opus-5',
     states: new Map(),
     defaults: factoryDefaults(),
+    // 目录是按目标记的：新会话继承「那个目标上次在哪工作」，
+    // 而不是「上一个会话在哪」——上一个可能在另一台机器上。
+    lastDirs: new Map(),
     persistStates: () => { calls.persisted += 1 },
     // 会话日志说了算的那条路单独测；这里只看「什么都不知道」时的开局。
     committedEngine: () => undefined,

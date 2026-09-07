@@ -46,6 +46,13 @@ return {
     // dsh-session-title-llm, so this cannot register as a provider — it hands
     // the finished name to the same service instead.
     let sessionTitle = ctx.get('sessionTitle')
+    // Background work is mirrored into dsh's native surfaces: every Claude task
+    // becomes a `ctx.jobs` row (the 后台任务 section), and every Agent/Task tool
+    // call becomes a real subagent child session under this conversation (the
+    // subagent cards). Both services are optional — a deployment without them
+    // simply does not surface background work; the conversation carries none.
+    let jobs = ctx.get('jobs')
+    let sessionsStore = ctx.get('sessions')
 
     // These live in other packages and apply-order is not guaranteed: a
     // one-shot ctx.get left the approval/question bridges silently off
@@ -58,12 +65,16 @@ return {
       if (attachments === undefined) attachments = ctx.get('attachments')
       if (agents === undefined) agents = ctx.get('agents')
       if (sessionTitle === undefined) sessionTitle = ctx.get('sessionTitle')
+      if (jobs === undefined) jobs = ctx.get('jobs')
+      if (sessionsStore === undefined) sessionsStore = ctx.get('sessions')
       const missing = [
         approval === undefined ? 'approval' : '',
         userQuestions === undefined ? 'userQuestions' : '',
         attachments === undefined ? 'attachments' : '',
         agents === undefined ? 'agents' : '',
         sessionTitle === undefined ? 'sessionTitle' : '',
+        jobs === undefined ? 'jobs' : '',
+        sessionsStore === undefined ? 'sessions' : '',
       ].filter((name) => name.length > 0)
       if (missing.length === 0) {
         if (serviceRebinds > 0) console.log('cc-mode: late-bound optional services after', serviceRebinds, 'retry/-ies')
@@ -79,6 +90,11 @@ return {
     // They are not product output, so they must not commit a session to the
     // Claude engine — a failed first attempt has to stay switchable.
     const NOTICE_MODEL = 'cc-mode/notice'
+
+    // dsh's model-visible surface. `Session.append` REQUIRES a `surfaceOp`
+    // marker on exactly these three types and REJECTS one on any other — an
+    // event appended with the wrong side of that rule throws and never lands.
+    const SURFACE_EVENT_TYPES = new Set(['user/message', 'assistant/message', 'tool/result'])
 
     // Claude Code exposes no model-inventory command, so the catalog is
     // maintained here the same way waku maintains its own (model_catalog.rs).
@@ -151,8 +167,8 @@ return {
     async function recoverRoute(run, state) {
       if (typeof state.route === 'string' && /\[/.test(state.route)) return
       try {
-        const line = await runCapture(['/bin/sh', '-c',
-          'grep -a \'"subtype":"init"\' ' + shellQuote(run.dir + '/out.log') + ' | tail -1 | head -c 4000'], 8000)
+        const line = await runCapture(shArgv(
+          'grep -a \'"subtype":"init"\' ' + shellQuote(run.dir + '/out.log') + ' | tail -1 | head -c 4000', run.remote), 8000)
         const init = JSON.parse(String(line || '').trim())
         if (typeof init.model === 'string' && init.model.length > 0 && state.route !== init.model) {
           state.route = init.model
@@ -354,15 +370,18 @@ return {
      * A conversation that already has content is unaffected: `committedEngine`
      * reads the engine out of the log and always wins over this.
      */
-    const defaults = { mode: 'dsh', permissionMode: 'manual', model: DEFAULT_MODEL, effort: '' }
+    const defaults = { mode: 'dsh', permissionMode: 'manual', model: DEFAULT_MODEL, effort: '', remote: '' }
 
     function rememberDefaults(state) {
+      const remote = typeof state.remote === 'string' ? state.remote : ''
       if (defaults.mode === state.mode && defaults.permissionMode === state.permissionMode
-        && defaults.model === state.model && defaults.effort === state.effort) return
+        && defaults.model === state.model && defaults.effort === state.effort
+        && defaults.remote === remote) return
       defaults.mode = state.mode
       defaults.permissionMode = state.permissionMode
       defaults.model = state.model
       defaults.effort = state.effort
+      defaults.remote = remote
       persistStates()
     }
     // Posture, model and effort are the user's choices about a conversation, so
@@ -373,6 +392,269 @@ return {
     // up again — posture, model, and above all the Claude session id to resume.
     const STATE_DIR = '"$HOME"/.cache/ccmode'
     const STATE_PATH = STATE_DIR + '/state.json'
+
+    // ---- where Claude runs -------------------------------------------------
+    //
+    // A conversation drives Claude either on this machine or on a configured
+    // SSH target. Everything this plugin does to the Claude side of the world
+    // is already a shell command string, and the broker speaks through files
+    // and a fifo rather than through its own stdio — so ONE indirection moves
+    // the whole model to another host: shArgv() decides which shell runs the
+    // command. The broker, its fifo, its append-only log, and the tail that
+    // attaches to it then all live on the machine that actually runs `claude`.
+    //
+    // "Where" is a shell that is not this one, and ssh is only one way to
+    // reach it: `docker exec -i <c> /bin/sh -c <cmd>` is the same contract —
+    // one command string handed to one shell — so a target declares a
+    // transport rather than assuming SSH.
+    //
+    // Targets are declared under `#remotes` in this same state file, and the
+    // plugin preserves that block verbatim across its own writes:
+    //
+    //   "#remotes": {
+    //     "devbox": { "label": "Devbox", "ssh": "devbox", "dir": "/srv/work" },
+    //     "app":    { "label": "App", "docker": "myapp-1", "dir": "/workspace" },
+    //     "prod":   { "docker": "api", "ssh": "prod" }
+    //   }
+    //
+    // `ssh` is normally an ssh_config Host alias, so identity, port and jump
+    // hosts stay in ~/.ssh/config where the rest of the system already reads
+    // them. The explicit form (`user@host` plus `port` / `identityFile` /
+    // `sshOptions`) is for a deployment with no ssh_config to speak of.
+    // Declaring BOTH runs `docker exec` on the far host, which is how a
+    // container on another machine is reached.
+    const REMOTES = new Map()
+    let remotesRaw = null
+
+    /**
+     * The directory each target was last worked in, so a new conversation on
+     * it opens where the last one did — the same courtesy the engine, posture
+     * and model already get.
+     *
+     * Per target rather than one global value, because a path is only
+     * meaningful on the machine that has it: carrying `/srv/work` from one
+     * container to another would open a conversation somewhere that does not
+     * exist, or worse, somewhere that does and is wrong.
+     */
+    const lastDirs = new Map()
+
+    /** Record where a target was last worked in; empty values never overwrite. */
+    function rememberDir(remote, cwd) {
+      if (remote === null || remote === undefined) return
+      if (typeof cwd !== 'string' || cwd.length === 0) return
+      if (lastDirs.get(remote.id) === cwd) return
+      lastDirs.set(remote.id, cwd)
+      persistStates()
+    }
+
+    /**
+     * One SSH target, or null when the declaration is unusable.
+     *
+     * Validated field by field like every other stored choice: a half-written
+     * target must not take the rest of the registry down with it, and a
+     * conversation pointing at a target that no longer parses falls back to
+     * this machine rather than refusing to open.
+     */
+    function normalizeRemote(id, raw) {
+      if (raw === null || typeof raw !== 'object') return null
+      const host = typeof raw.ssh === 'string' ? raw.ssh.trim() : ''
+      const container = typeof raw.docker === 'string' ? raw.docker.trim() : ''
+      // One transport is the minimum; both together mean a container over there.
+      if (host.length === 0 && container.length === 0) return null
+      return {
+        id: id,
+        label: typeof raw.label === 'string' && raw.label.length > 0 ? raw.label : id,
+        host: host,
+        container: container,
+        // `docker exec -u`: a container whose default user is not the one
+        // Claude is installed for.
+        containerUser: typeof raw.dockerUser === 'string' ? raw.dockerUser.trim() : '',
+        port: typeof raw.port === 'number' && raw.port > 0 ? String(raw.port) : '',
+        identityFile: typeof raw.identityFile === 'string' ? raw.identityFile.trim() : '',
+        options: Array.isArray(raw.sshOptions)
+          ? raw.sshOptions.filter((entry) => typeof entry === 'string' && entry.length > 0)
+          : [],
+        // The working directory conversations on this target open in. Empty
+        // means the remote account's home, resolved on first use — a dsh
+        // workspace path is a path on THIS machine and means nothing there.
+        dir: typeof raw.dir === 'string' ? raw.dir.trim() : '',
+        // The target's own binaries. `node` cannot be inherited from
+        // process.execPath the way the local launch does — that is a path on
+        // THIS machine, and the broker is a node script that has to run over
+        // there.
+        claudeBin: typeof raw.claude === 'string' && raw.claude.length > 0 ? raw.claude : 'claude',
+        nodeBin: typeof raw.node === 'string' && raw.node.length > 0 ? raw.node : 'node',
+        // THIS machine's docker, by contrast, is resolved here — and a bare
+        // name is not enough. dsh is typically started by a launcher (pm2,
+        // launchd) whose PATH is not a login shell's: on macOS `docker` lives
+        // in /usr/local/bin or an OrbStack/Docker Desktop directory that such
+        // a PATH routinely lacks, and the spawn then fails with no output at
+        // all. Resolved once at load; `dockerBin` overrides.
+        dockerBin: typeof raw.dockerBin === 'string' && raw.dockerBin.length > 0 ? raw.dockerBin : '',
+      }
+    }
+
+    /**
+     * Where a Docker CLI is actually installed when PATH does not say.
+     *
+     * Not a guess list for its own sake: these are the locations the macOS
+     * installers use, and a launcher-started dsh sees none of them.
+     */
+    const DOCKER_FALLBACKS = [
+      '/usr/local/bin/docker',
+      '/opt/homebrew/bin/docker',
+      '/Applications/Docker.app/Contents/Resources/bin/docker',
+    ]
+
+    /**
+     * Pin down this machine's docker binary for every container target.
+     * @returns nothing; each target keeps whatever it could resolve.
+     */
+    async function resolveDockerBinaries() {
+      const targets = [...REMOTES.values()].filter((remote) => remote.container !== '' && remote.dockerBin === '')
+      if (targets.length === 0) return
+      let resolved = ''
+      try {
+        resolved = await subprocess.resolveExecutable('docker')
+      } catch (error) {
+        for (const candidate of DOCKER_FALLBACKS) {
+          const answer = await runCapture(['/bin/sh', '-c',
+            '[ -x ' + shellQuote(candidate) + ' ] && echo yes'], 5000)
+          if (String(answer).indexOf('yes') === 0) { resolved = candidate; break }
+        }
+      }
+      if (resolved === '') {
+        console.error('cc-mode: no docker binary on this machine\'s PATH — container targets ('
+          + targets.map((remote) => remote.id).join(', ')
+          + ') cannot start. Set "dockerBin" on the target to its full path.')
+        return
+      }
+      for (const remote of targets) remote.dockerBin = resolved
+      console.log('cc-mode: container targets use', resolved)
+    }
+
+    /**
+     * The ssh command prefix for one target.
+     *
+     * ControlMaster is not an optimization here, it is what makes the design
+     * viable: one turn issues dozens of small commands (stat the transcript,
+     * poll meta.json, `kill -0` the broker), and without a shared connection
+     * each would pay a fresh TCP and auth handshake. Measured against a box
+     * one continent away that is 2.6s per command versus 0.47s — the master
+     * turns every call after the first into a single round-trip, so what is
+     * left is the network itself. BatchMode is what keeps a target that wants
+     * a passphrase from hanging the plugin on a prompt nobody can see.
+     */
+    function sshArgvPrefix(remote) {
+      const argv = ['ssh', '-T',
+        '-o', 'BatchMode=yes',
+        '-o', 'ConnectTimeout=10',
+        '-o', 'ServerAliveInterval=15',
+        '-o', 'ControlMaster=auto',
+        '-o', 'ControlPath=/tmp/ccmode-cm-' + String(remote.id).replace(/[^A-Za-z0-9_.-]/g, '_'),
+        '-o', 'ControlPersist=10m']
+      if (remote.port !== '') argv.push('-p', remote.port)
+      if (remote.identityFile !== '') argv.push('-o', 'IdentitiesOnly=yes', '-i', remote.identityFile)
+      for (const option of remote.options) argv.push('-o', option)
+      argv.push(remote.host)
+      return argv
+    }
+
+    /**
+     * `docker exec` for one target, as an argv.
+     *
+     * `-i` is not optional: the broker's stdin, and every `cat > fifo`, need
+     * the channel open. No `-t` — the stream is JSON lines, and a pty would
+     * mangle it exactly as it would over ssh.
+     */
+    function dockerArgv(remote, command) {
+      const argv = [remote.dockerBin === '' ? 'docker' : remote.dockerBin, 'exec', '-i']
+      if (remote.containerUser !== '') argv.push('-u', remote.containerUser)
+      argv.push(remote.container, '/bin/sh', '-c', command)
+      return argv
+    }
+
+    /**
+     * Run one shell command where this conversation's Claude lives.
+     *
+     * Every transport ends at the same place: `/bin/sh -c <command>`. That is
+     * not incidental — ssh hands its argument to the account's LOGIN shell,
+     * which is whatever the user chose. A zsh login shell aborts the whole
+     * command on a glob that matches nothing (a hidden-directory glob in a
+     * directory that has none), and a fish one cannot read a POSIX for-loop at
+     * all. Naming the shell explicitly is what makes one command string mean
+     * one thing everywhere, so the cost is one quoting pass for the ssh hop.
+     */
+    function shArgv(command, remote) {
+      if (remote === null || remote === undefined) return ['/bin/sh', '-c', command]
+      const local = remote.container !== ''
+        ? dockerArgv(remote, command)
+        : ['/bin/sh', '-c', command]
+      if (remote.host === '') return local
+      return sshArgvPrefix(remote).concat([local.map(shellQuote).join(' ')])
+    }
+
+    /**
+     * The remote account's home, asked once per target and remembered.
+     *
+     * Resolved eagerly rather than left as a literal `$HOME` in the launch
+     * because the transcript path (`projectSlug`) needs a real absolute
+     * directory — a slug built from an unexpanded word would never match the
+     * one Claude itself writes under.
+     */
+    async function remoteHome(remote) {
+      if (typeof remote.home !== 'string') {
+        const answer = await runCapture(shArgv('printf %s "$HOME"', remote), 8000)
+        remote.home = String(answer).trim() || '/'
+      }
+      return remote.home
+    }
+
+    /** Where a conversation on `remote` opens: its own choice, the target's, else home. */
+    async function remoteCwdOf(state, remote) {
+      const own = typeof state.remoteCwd === 'string' ? state.remoteCwd.trim() : ''
+      if (own.length > 0) return own
+      if (remote.dir.length > 0) return remote.dir
+      return remoteHome(remote)
+    }
+
+    /**
+     * The target a browsing surface addresses. Import lists conversations for
+     * a DIRECTORY, with no conversation to read a choice from, so an explicit
+     * id wins and otherwise the last deliberate choice applies — the same rule
+     * that already decides which engine a new conversation opens on.
+     */
+    function browsingRemote(args) {
+      const id = args !== null && args !== undefined && typeof args.remote === 'string'
+        ? args.remote
+        : defaults.remote
+      if (typeof id !== 'string' || id === '') return null
+      const remote = REMOTES.get(id)
+      return remote === undefined ? null : remote
+    }
+
+    /**
+     * One level up from an absolute path, or null at the root.
+     *
+     * Computed from what the remote shell's own `pwd` answered, never from a
+     * path the client assembled: the client cannot see that filesystem and
+     * must not be the one deciding what "up" means on it.
+     */
+    function parentDir(path) {
+      if (typeof path !== 'string' || path.indexOf('/') !== 0 || path === '/') return null
+      const cut = path.replace(/\/+$/, '')
+      if (cut === '') return null
+      return cut.slice(0, cut.lastIndexOf('/')) || '/'
+    }
+
+    /** The target a conversation runs on, or null for this machine. */
+    function remoteOf(state) {
+      if (state === null || state === undefined) return null
+      const id = typeof state.remote === 'string' ? state.remote : ''
+      if (id === '') return null
+      const remote = REMOTES.get(id)
+      return remote === undefined ? null : remote
+    }
     let statePersistScheduled = false
     const runs = new Map()    // dsh sessionId -> resident claude run
     const activeTurns = new Map()  // dsh sessionId -> { turn, run } while a turn is open
@@ -418,6 +700,11 @@ return {
           permissionMode: defaults.permissionMode,
           model: defaults.model,
           effort: defaults.effort,
+          remote: defaults.remote,
+          // The directory belongs to the target, so it is inherited from what
+          // that target was last worked in rather than from the last
+          // conversation, which may have been on another machine entirely.
+          remoteCwd: lastDirs.get(defaults.remote) || '',
           route: undefined,
         }
         states.set(sessionId, state)
@@ -483,7 +770,15 @@ return {
       let stored = null
       try { stored = JSON.parse(raw) } catch (error) { stored = null }
       if (stored === null || typeof stored !== 'object') return
-      if (Array.isArray(stored['#commands'])) commandCache = stored['#commands']
+      // Written as a bare array before targets existed — that roster is this
+      // machine's, so it loads under the empty key rather than being dropped.
+      const savedCommands = stored['#commands']
+      if (Array.isArray(savedCommands)) commandCache.set('', savedCommands)
+      else if (savedCommands !== null && typeof savedCommands === 'object') {
+        for (const key of Object.keys(savedCommands)) {
+          if (Array.isArray(savedCommands[key])) commandCache.set(key, savedCommands[key])
+        }
+      }
       const savedDefaults = stored['#defaults']
       if (savedDefaults !== null && typeof savedDefaults === 'object') {
         // Validated one field at a time: a menu that dropped an option must
@@ -497,9 +792,34 @@ return {
           defaults.model = savedDefaults.model
         }
         if (EFFORTS.some((entry) => entry.id === savedDefaults.effort)) defaults.effort = savedDefaults.effort
+        if (typeof savedDefaults.remote === 'string') defaults.remote = savedDefaults.remote
+      }
+      const savedDirs = stored['#lastDirs']
+      if (savedDirs !== null && typeof savedDirs === 'object' && !Array.isArray(savedDirs)) {
+        for (const id of Object.keys(savedDirs)) {
+          if (typeof savedDirs[id] === 'string' && savedDirs[id].length > 0) lastDirs.set(id, savedDirs[id])
+        }
+      }
+      // Declared by hand, rewritten by nobody: keep the raw block so our own
+      // writes cannot erase the user's targets, and register what parses.
+      const savedRemotes = stored['#remotes']
+      if (savedRemotes !== null && typeof savedRemotes === 'object' && !Array.isArray(savedRemotes)) {
+        remotesRaw = savedRemotes
+        REMOTES.clear()
+        for (const id of Object.keys(savedRemotes)) {
+          const remote = normalizeRemote(id, savedRemotes[id])
+          if (remote === null) {
+            console.error('cc-mode: ignoring unusable remote "' + id + '" — it needs at least an "ssh" host')
+            continue
+          }
+          REMOTES.set(id, remote)
+        }
+        if (REMOTES.size > 0) console.log('cc-mode: ' + REMOTES.size + ' target(s):', [...REMOTES.keys()].join(', '))
+        await resolveDockerBinaries()
       }
       for (const sessionId of Object.keys(stored)) {
-        if (sessionId === '#commands' || sessionId === '#defaults') continue
+        if (sessionId === '#commands' || sessionId === '#defaults' || sessionId === '#remotes'
+          || sessionId === '#lastDirs') continue
         const saved = stored[sessionId]
         if (saved === null || typeof saved !== 'object') continue
         const state = stateOf(sessionId)
@@ -521,6 +841,13 @@ return {
         if (typeof saved.model === 'string'
           && (saved.model === '' || MODELS.some((entry) => entry.id === saved.model))) state.model = saved.model
         if (typeof saved.effort === 'string' && EFFORTS.some((entry) => entry.id === saved.effort)) state.effort = saved.effort
+        // Not validated against the registry: a conversation that ran on a
+        // target keeps naming it even while that declaration is temporarily
+        // gone, so restoring the block puts the conversation back where it
+        // was instead of silently re-homing it onto this machine.
+        if (typeof saved.remote === 'string') state.remote = saved.remote
+        if (typeof saved.remoteCwd === 'string') state.remoteCwd = saved.remoteCwd
+        if (typeof saved.launchCwd === 'string') state.launchCwd = saved.launchCwd
         if (typeof saved.claudeSessionId === 'string' && saved.claudeSessionId.length > 0) state.claudeSessionId = saved.claudeSessionId
       }
       console.log('cc-mode: restored settings for', Object.keys(stored).length, 'conversations')
@@ -533,17 +860,24 @@ return {
       armTimeout(() => {
         statePersistScheduled = false
         const out = {}
-        if (commandCache.length > 0) out['#commands'] = commandCache
+        if (commandCache.size > 0) out['#commands'] = Object.fromEntries(commandCache)
         out['#defaults'] = {
           mode: defaults.mode,
           permissionMode: defaults.permissionMode,
           model: defaults.model,
           effort: defaults.effort,
+          remote: defaults.remote,
         }
+        // Hand-authored config living in a file we rewrite: without this the
+        // first persist after boot would delete every target the user declared.
+        if (remotesRaw !== null) out['#remotes'] = remotesRaw
+        if (lastDirs.size > 0) out['#lastDirs'] = Object.fromEntries(lastDirs)
         for (const [sessionId, state] of states) {
           const claudeSessionId = state.claudeSessionId === undefined ? '' : state.claudeSessionId
+          const remote = typeof state.remote === 'string' ? state.remote : ''
           if (state.mode === 'dsh' && state.permissionMode === 'manual' && state.model === DEFAULT_MODEL
-            && state.effort === '' && claudeSessionId === '') continue
+            && state.effort === '' && claudeSessionId === '' && remote === ''
+            && (typeof state.remoteCwd !== 'string' || state.remoteCwd === '')) continue
           out[sessionId] = {
             mode: state.mode,
             permissionMode: state.permissionMode,
@@ -555,6 +889,9 @@ return {
             ...(state.contextWindowKey === undefined ? {} : { contextWindowKey: state.contextWindowKey }),
             ...(state.bandRepaired === true ? { bandRepaired: true } : {}),
             effort: state.effort,
+            ...(remote === '' ? {} : { remote: remote }),
+            ...(typeof state.remoteCwd !== 'string' || state.remoteCwd === '' ? {} : { remoteCwd: state.remoteCwd }),
+            ...(typeof state.launchCwd !== 'string' || state.launchCwd === '' ? {} : { launchCwd: state.launchCwd }),
             ...(claudeSessionId === '' ? {} : { claudeSessionId: claudeSessionId }),
           }
         }
@@ -1023,6 +1360,28 @@ return {
       }
     }
 
+    /**
+     * The `--mcp-config` value that gives one conversation the `agent_*` tools,
+     * or null when the multi-agent half is not composed. Added, never strict:
+     * the user's own MCP servers must keep working.
+     */
+    async function multiagentMcpConfig(sessionId) {
+      const control = ctx.get('multiagentControl')
+      if (control === undefined || typeof control.endpoint !== 'function') return null
+      let endpoint
+      try { endpoint = await control.endpoint(sessionId) } catch (error) { return null }
+      if (endpoint === null || endpoint === undefined || typeof endpoint.url !== 'string') return null
+      return JSON.stringify({
+        mcpServers: {
+          'dsh-agents': {
+            type: 'http',
+            url: endpoint.url,
+            headers: { Authorization: 'Bearer ' + endpoint.token },
+          },
+        },
+      })
+    }
+
     // ---------- the Claude process, owned by a detached broker ----------
     //
     // The plugin never owns the Claude process. A broker does: started
@@ -1056,26 +1415,85 @@ return {
       return proc
     }
 
+    /**
+     * A row the CLI logged as its own bookkeeping rather than as conversation.
+     *
+     * Two flags because the two sources spell it differently: a transcript row
+     * carries `isMeta`, the same message on the stream carries `isSynthetic`.
+     * Both are checked everywhere, since a real conversation row carries
+     * neither and getting the pairing wrong would be silent.
+     *
+     * What makes this worth a check of its own: after a turn that printed no
+     * text, the CLI injects "[Your previous response had no visible output…]"
+     * as a USER message. Projected like any other, it shows up in dsh as
+     * something the person said — and it fires precisely when they asked for
+     * no output, so it contradicts them in their own voice.
+     */
+    function machineryRow(event) {
+      return event !== null && event !== undefined
+        && (event.isMeta === true || event.isSynthetic === true)
+    }
+
     function shellQuote(value) {
       return "'" + String(value).replace(/'/g, "'\\''") + "'"
     }
 
     /** What forces a fresh Claude process: posture and effort are launch flags. */
+    /**
+     * What a running process was launched WITH — a live broker is reused only
+     * while this still matches, and relaunched (resuming the same Claude
+     * conversation) when it does not.
+     *
+     * The multi-agent wiring belongs here because it is a launch flag: a
+     * process started before that half was composed has no `agent_*` tools and
+     * can never gain them, so without this an upgrade would leave every
+     * already-running conversation silently without them.
+     */
     function launchSnapshot(state) {
       return state.permissionMode + '|' + state.effort
+        + (ctx.get('multiagentControl') === undefined ? '' : '|agents')
+    }
+
+    /**
+     * The directory this conversation's Claude actually runs in.
+     *
+     * For a local conversation that is the dsh workspace. For one on a target
+     * it is a directory over THERE, and the difference decides every
+     * `~/.claude/projects/<slug>` path: Claude files its transcript — and the
+     * `claude --resume` index row — under the directory the process opened,
+     * not under the workspace path dsh happens to display. Getting this wrong
+     * writes a well-formed index row that `--resume` can never match.
+     *
+     * Read from the live run first, then the launch directory recorded on the
+     * conversation (a cold one has no run), then the dsh workspace.
+     */
+    function projectCwd(sessionId, session) {
+      const run = runs.get(sessionId)
+      if (run !== undefined && typeof run.cwd === 'string' && run.cwd.length > 0) return run.cwd
+      const state = states.get(sessionId)
+      if (state !== undefined && typeof state.launchCwd === 'string' && state.launchCwd.length > 0) {
+        return state.launchCwd
+      }
+      return session !== undefined && session !== null && session.header ? session.header.cwd : undefined
     }
 
     function sessionDir(sessionId) {
       return BROKER_ROOT + '/' + String(sessionId).replace(/[^A-Za-z0-9_.-]/g, '_')
     }
 
-    /** Write the broker to disk once per process; it is tiny and idempotent. */
-    let brokerReady = null
-    function ensureBroker() {
-      if (brokerReady !== null) return brokerReady
-      brokerReady = (async () => {
+    /**
+     * Write the broker once per machine we drive — it is tiny and idempotent.
+     * Keyed by target because a remote needs its own copy over there, and the
+     * empty key is this machine.
+     */
+    const brokerReady = new Map()
+    function ensureBroker(remote) {
+      const key = remote === null || remote === undefined ? '' : remote.id
+      const done = brokerReady.get(key)
+      if (done !== undefined) return done
+      const started = (async () => {
         const proc = silenceStdin(subprocess.spawn({
-          argv: ['/bin/sh', '-c', 'mkdir -p ' + shellQuote(BROKER_ROOT) + ' && cat > ' + shellQuote(BROKER_PATH)],
+          argv: shArgv('mkdir -p ' + shellQuote(BROKER_ROOT) + ' && cat > ' + shellQuote(BROKER_PATH), remote),
           cwd: '/',
           stdio: { stdin: 'pipe', stdout: 'ignore', stderr: 'ignore' },
           graceMs: 2000,
@@ -1086,25 +1504,26 @@ return {
         }
         try { await proc.done } catch (error) { /* reported by the first attach */ }
       })()
-      return brokerReady
+      brokerReady.set(key, started)
+      return started
     }
 
-    async function readJsonFile(path) {
-      const raw = await runCapture(['/bin/sh', '-c', 'cat ' + shellQuote(path) + ' 2>/dev/null'], 5000)
+    async function readJsonFile(path, remote) {
+      const raw = await runCapture(shArgv('cat ' + shellQuote(path) + ' 2>/dev/null', remote), 5000)
       try { return JSON.parse(raw) } catch (error) { return null }
     }
 
-    async function isAlive(pid) {
+    async function isAlive(pid, remote) {
       if (typeof pid !== 'number' || pid <= 0) return false
-      const answer = await runCapture(['/bin/sh', '-c', 'kill -0 ' + pid + ' 2>/dev/null && echo yes || echo no'], 5000)
+      const answer = await runCapture(shArgv('kill -0 ' + pid + ' 2>/dev/null && echo yes || echo no', remote), 5000)
       return answer.indexOf('yes') === 0
     }
 
     // `stat -c` is GNU; macOS ships BSD stat (`-f`). Every stat goes through
     // the pair, first flavour that answers wins.
-    async function fileSize(path) {
-      const answer = await runCapture(['/bin/sh', '-c',
-        'stat -c %s ' + shellQuote(path) + ' 2>/dev/null || stat -f %z ' + shellQuote(path) + ' 2>/dev/null || echo 0'], 5000)
+    async function fileSize(path, remote) {
+      const answer = await runCapture(shArgv(
+        'stat -c %s ' + shellQuote(path) + ' 2>/dev/null || stat -f %z ' + shellQuote(path) + ' 2>/dev/null || echo 0', remote), 5000)
       const size = parseInt(String(answer).trim(), 10)
       return isNaN(size) ? 0 : size
     }
@@ -1115,17 +1534,20 @@ return {
      * shellQuote would stat a literal `"$HOME"/...` and silently answer 0 —
      * which is how an import once recorded offset 0 and re-mirrored history.
      */
-    async function fileSizeOfShellWord(word) {
-      const answer = await runCapture(['/bin/sh', '-c',
-        'stat -c %s ' + word + ' 2>/dev/null || stat -f %z ' + word + ' 2>/dev/null || echo 0'], 5000)
+    async function fileSizeOfShellWord(word, remote) {
+      const answer = await runCapture(shArgv(
+        'stat -c %s ' + word + ' 2>/dev/null || stat -f %z ' + word + ' 2>/dev/null || echo 0', remote), 5000)
       const size = parseInt(String(answer).trim(), 10)
       return isNaN(size) ? 0 : size
     }
 
-    function createRun(sessionId, dir, snapshot, claudeSessionId) {
+    function createRun(sessionId, dir, snapshot, claudeSessionId, remote) {
       const run = {
         sessionId: sessionId,
         dir: dir,
+        // Where this conversation's Claude lives; null is this machine. Every
+        // command the run issues is routed through it.
+        remote: remote === undefined ? null : remote,
         snapshot: snapshot,
         claudeSessionId: claudeSessionId,
         cwd: null,
@@ -1139,6 +1561,13 @@ return {
         subCallParent: new Map(),
         subCallInfo: new Map(),
         mainCalls: new Set(),
+        // The dsh-native mirror of Claude Code background work for THIS run:
+        //   ccSubagents  parent_tool_use_id (the Agent/Task tool call id) → the
+        //                child-session record mirroring that subagent;
+        //   ccTasks      task_id → { job, settle, label } for plain background
+        //                tasks, or { child } when the task is an Agent child.
+        ccSubagents: new Map(),
+        ccTasks: new Map(),
       }
 
       run.push = (value) => {
@@ -1278,7 +1707,7 @@ return {
       run.checkpointing = true
       const offset = typeof run.consumed === 'number' ? run.consumed : run.offset
       const writer = silenceStdin(subprocess.spawn({
-        argv: ['/bin/sh', '-c', 'cat > ' + shellQuote(run.dir + '/attach.json')],
+        argv: shArgv('cat > ' + shellQuote(run.dir + '/attach.json'), run.remote),
         cwd: '/',
         stdio: { stdin: 'pipe', stdout: 'ignore', stderr: 'ignore' },
         graceMs: 1000,
@@ -1297,7 +1726,7 @@ return {
     /** Put one line into a run's fifo and wait until it is actually in. */
     async function deliverLine(run, line) {
       const writer = silenceStdin(subprocess.spawn({
-        argv: ['/bin/sh', '-c', 'cat > ' + shellQuote(run.dir + '/in')],
+        argv: shArgv('cat > ' + shellQuote(run.dir + '/in'), run.remote),
         cwd: '/',
         stdio: { stdin: 'pipe', stdout: 'ignore', stderr: 'ignore' },
         graceMs: 1000,
@@ -1327,7 +1756,8 @@ return {
     async function attach(run) {
       run.consumed = run.offset
       run.reader = subprocess.spawn({
-        argv: ['/usr/bin/env', 'tail', '-c', '+' + (run.offset + 1), '-f', run.dir + '/out.log'],
+        // `exec` so no shell lingers around the tail for the life of the run.
+        argv: shArgv('exec tail -c +' + (run.offset + 1) + ' -f ' + shellQuote(run.dir + '/out.log'), run.remote),
         cwd: '/',
         stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'ignore' },
         graceMs: 1000,
@@ -1358,7 +1788,7 @@ return {
         const patch = JSON.stringify({ offset: typeof run.consumed === 'number' ? run.consumed : run.offset })
         try {
           const proc = silenceStdin(subprocess.spawn({
-            argv: ['/bin/sh', '-c', 'cat > ' + shellQuote(run.dir + '/attach.json')],
+            argv: shArgv('cat > ' + shellQuote(run.dir + '/attach.json'), run.remote),
             cwd: '/',
             stdio: { stdin: 'pipe', stdout: 'ignore', stderr: 'ignore' },
             graceMs: 1000,
@@ -1367,6 +1797,10 @@ return {
           proc.done.catch(() => undefined)
         } catch (error) { /* the offset falls back to EOF */ }
       }
+      // The mirror follows the run: pending subagent children are persisted as
+      // settled (their partial log stands), open job rows are left to the jobs
+      // registry's owner cleanup.
+      cleanupCcMirror(run)
       return true
     }
 
@@ -1383,7 +1817,7 @@ return {
      * Returns null whenever branching is not possible, which always degrades
      * to today's behaviour (a fresh Claude) rather than a broken launch.
      */
-    async function parentClaudeSession(sessionId, cwd) {
+    async function parentClaudeSession(sessionId, cwd, remote) {
       const session = sessionOf(sessionId)
       const header = session === undefined ? undefined : session.header
       const parent = header === undefined ? undefined : header.parentSession
@@ -1395,7 +1829,7 @@ return {
       // one belongs to another conversation — it may have been cleaned up.
       const transcript = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd))
         + '/' + shellQuote(parentId + '.jsonl')
-      if (await fileSizeOfShellWord(transcript) <= 0) {
+      if (await fileSizeOfShellWord(transcript, remote) <= 0) {
         console.log('cc-mode:', sessionId, 'was forked from', parent,
           'but that Claude transcript is gone — starting fresh')
         return null
@@ -1405,6 +1839,11 @@ return {
 
     async function ensureRun(sessionId, cwd, signal) {
       const state = stateOf(sessionId)
+      const remote = remoteOf(state)
+      // The dsh workspace path names a directory on THIS machine, so a remote
+      // conversation cannot open in it. Everything downstream — the transcript
+      // slug, the launch's `cd`, run.cwd — follows from this one substitution.
+      if (remote !== null) cwd = await remoteCwdOf(state, remote)
       const snapshot = launchSnapshot(state)
       const live = runs.get(sessionId)
       if (live !== undefined && !live.closed && live.snapshot === snapshot) {
@@ -1414,26 +1853,26 @@ return {
         // silently recreates the fifo path as an ordinary file — the prompt
         // then goes nowhere and the turn waits forever. One `kill -0` per turn
         // is cheap insurance.
-        if (await isAlive(live.brokerPid)) return live
+        if (await isAlive(live.brokerPid, remote)) return live
         console.log('cc-mode: the broker for', sessionId, 'is gone — starting a fresh Claude and resuming')
         detach(sessionId)
       }
 
       const dir = sessionDir(sessionId)
-      await ensureBroker()
+      await ensureBroker(remote)
 
       // Is a broker for this session already running, from before an update or
       // a restart? Then attach instead of starting a second Claude.
-      const meta = await readJsonFile(dir + '/meta.json')
-      const exited = await readJsonFile(dir + '/exit.json')
-      const brokerLives = meta !== null && exited === null && await isAlive(meta.brokerPid)
+      const meta = await readJsonFile(dir + '/meta.json', remote)
+      const exited = await readJsonFile(dir + '/exit.json', remote)
+      const brokerLives = meta !== null && exited === null && await isAlive(meta.brokerPid, remote)
       const sameLaunch = meta !== null && meta.snapshot === snapshot
 
       if (live !== undefined) detach(sessionId)
 
       if (brokerLives && sameLaunch) {
-        const attachState = await readJsonFile(dir + '/attach.json')
-        const run = createRun(sessionId, dir, snapshot, meta.claudeSessionId)
+        const attachState = await readJsonFile(dir + '/attach.json', remote)
+        const run = createRun(sessionId, dir, snapshot, meta.claudeSessionId, remote)
         run.brokerPid = meta.brokerPid
         run.cwd = meta.cwd || cwd
         // A clean detach recorded where it stopped; a crash did not, and then
@@ -1441,7 +1880,7 @@ return {
         // dsh transcript.
         run.offset = attachState !== null && typeof attachState.offset === 'number'
           ? attachState.offset
-          : await fileSize(dir + '/out.log')
+          : await fileSize(dir + '/out.log', remote)
         runs.set(sessionId, run)
         await attach(run)
         // The broker's process launched under some earlier model choice; the
@@ -1457,11 +1896,13 @@ return {
       }
 
       // Nothing usable is running: retire whatever is left and start fresh.
-      if (meta !== null) await runCapture(['/bin/sh', '-c',
+      if (meta !== null) await runCapture(shArgv(
         'kill ' + (typeof meta.brokerPid === 'number' ? meta.brokerPid : 0) + ' 2>/dev/null; '
-        + 'kill ' + (typeof meta.childPid === 'number' ? meta.childPid : 0) + ' 2>/dev/null; true'], 5000)
+        + 'kill ' + (typeof meta.childPid === 'number' ? meta.childPid : 0) + ' 2>/dev/null; true', remote), 5000)
 
-      const executable = await subprocess.resolveExecutable('claude')
+      // A remote's `claude` is resolved by ITS login shell, not by our PATH —
+      // resolveExecutable would answer with a path on this machine.
+      const executable = remote === null ? await subprocess.resolveExecutable('claude') : remote.claudeBin
       if (signal !== undefined) signal.throwIfAborted()
 
       // Resuming is what makes an older conversation continue where it left
@@ -1479,7 +1920,7 @@ return {
       // same-id transcript under some other project directory).
       if (resume !== null) {
         const transcript = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd)) + '/' + shellQuote(resume + '.jsonl')
-        if (await fileSizeOfShellWord(transcript) <= 0) {
+        if (await fileSizeOfShellWord(transcript, remote) <= 0) {
           console.log('cc-mode: recorded Claude session', resume, 'has no transcript on disk — starting a fresh one')
           resume = null
         }
@@ -1487,7 +1928,7 @@ return {
       // Nothing to resume, but dsh may have forked this conversation out of
       // one that does have a Claude behind it. Branch that instead of opening
       // a blank one under a transcript full of someone else's history.
-      const forkFrom = resume === null ? await parentClaudeSession(sessionId, cwd) : null
+      const forkFrom = resume === null ? await parentClaudeSession(sessionId, cwd, remote) : null
       const claudeSessionId = resume === null ? uuid() : resume
       const argv = [
         executable, '-p',
@@ -1502,6 +1943,15 @@ return {
       ]
       if (state.model.length > 0) argv.push('--model', state.model)
       if (state.effort.length > 0) argv.push('--effort', state.effort)
+      // Multi-agent: hand this conversation the tools that open and drive OTHER
+      // dsh conversations. The endpoint is addressed per conversation, so the
+      // process cannot act as anyone but itself — which is why this is wired at
+      // launch rather than left to the user's global MCP config.
+      // `--mcp-config` is VARIADIC: it keeps eating arguments until the next
+      // flag, so it must never sit immediately before a positional. Here it is
+      // followed by `--session-id`/`--resume`, which stops it.
+      const agentsMcp = await multiagentMcpConfig(sessionId)
+      if (agentsMcp !== null) argv.push('--mcp-config', agentsMcp)
       if (forkFrom !== null) {
         // The three compose, verified against the CLI: it resumes the parent,
         // branches instead of writing back into it, and takes the id we hand
@@ -1528,9 +1978,11 @@ return {
       // one-line launcher puts the broker in its own session portably. The
       // node binary is dsh's own (`process.execPath`), not whatever PATH has —
       // a pm2/GUI environment on macOS often has no `node` on PATH at all.
-      const nodeBin = typeof process !== 'undefined' && typeof process.execPath === 'string' && process.execPath.length > 0
-        ? process.execPath
-        : 'node'
+      const nodeBin = remote !== null
+        ? remote.nodeBin
+        : (typeof process !== 'undefined' && typeof process.execPath === 'string' && process.execPath.length > 0
+          ? process.execPath
+          : 'node')
       const detachLauncher = 'const cp=require("child_process");'
         + 'cp.spawn(process.execPath,process.argv.slice(1),{detached:true,stdio:"ignore"}).unref()'
       const launch = 'set -e; '
@@ -1539,27 +1991,50 @@ return {
         + '[ -p ' + shellQuote(dir + '/in') + ' ] || mkfifo ' + shellQuote(dir + '/in') + '; '
         + 'touch ' + shellQuote(dir + '/out.log') + '; '
         + 'printf %s ' + shellQuote(metaSeed) + ' > ' + shellQuote(dir + '/meta.json') + '; '
-        + 'cd ' + shellQuote(cwd) + '; '
+        + 'mkdir -p ' + shellQuote(cwd) + '; cd ' + shellQuote(cwd) + '; '
         + shellQuote(nodeBin) + ' -e ' + shellQuote(detachLauncher) + ' ' + shellQuote(BROKER_PATH) + ' ' + shellQuote(dir) + ' '
         + argv.map(shellQuote).join(' ')
         + '; echo started'
 
+      // A remote launch cannot carry `env` through the local spawn (that would
+      // set it on the ssh client) and cannot start in `cwd` (that directory is
+      // over there) — the script already cd's, so the assignment rides in it.
+      // Where THIS process's output will begin. `out.log` is append-only and
+      // survives a relaunch, so a fresh run that started reading at 0 would
+      // re-project the previous process's whole conversation. Measured BEFORE
+      // the spawn on purpose: taking it afterwards races the child's own
+      // `init` line, and losing that line loses the model and session binding.
+      const priorLog = await fileSize(dir + '/out.log', remote)
       const started = subprocess.spawn({
-        argv: ['/bin/sh', '-c', launch],
-        cwd: cwd,
+        argv: shArgv(remote === null || env === undefined
+          ? launch
+          : Object.keys(env).map((name) => name + '=' + shellQuote(env[name])).join(' ') + ' ' + launch, remote),
+        cwd: remote === null ? cwd : '/',
         stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
         graceMs: 3000,
-        ...(env === undefined ? {} : { env: env }),
+        ...(env === undefined || remote !== null ? {} : { env: env }),
       })
       ;(async () => {
         try { for await (const chunk of started.stderr) console.error('cc-mode [launch]', String(chunk).trim()) } catch (error) { /* closed */ }
       })()
-      try { await started.done } catch (error) { /* the meta poll below decides */ }
+      // A launch that never started at all — argv[0] missing, most often —
+      // fails HERE, asynchronously and with nothing on stderr. Swallowing it
+      // left the operator with only "the broker never showed up", which names
+      // the symptom and hides the cause.
+      try {
+        await started.done
+      } catch (error) {
+        console.error('cc-mode [launch] could not start ' + shArgv('…', remote)[0] + ':', errorText(error))
+      }
 
-      const run = createRun(sessionId, dir, snapshot, claudeSessionId)
+      const run = createRun(sessionId, dir, snapshot, claudeSessionId, remote)
       run.cwd = cwd
-      run.offset = 0
-      const spawned = await readJsonFile(dir + '/meta.json')
+      // Durable, because a cold conversation has no run to ask and still needs
+      // to find its own transcript.
+      state.launchCwd = cwd
+      rememberDir(remote, cwd)
+      run.offset = priorLog
+      const spawned = await readJsonFile(dir + '/meta.json', remote)
       run.brokerPid = spawned === null ? undefined : spawned.brokerPid
       // The launch flags already carry this model; only later changes need a
       // live set_model.
@@ -1577,7 +2052,7 @@ return {
       let waited = 0
       let seeded = null
       while (waited < 5000) {
-        seeded = await readJsonFile(dir + '/meta.json')
+        seeded = await readJsonFile(dir + '/meta.json', remote)
         if (seeded !== null && typeof seeded.childPid === 'number') break
         await sleep(200)
         waited += 200
@@ -1609,10 +2084,22 @@ return {
     const IDLE_REAP_MS = 45 * 60 * 1000
 
     async function reapIdleBrokers() {
-      const listing = await runCapture(['/bin/sh', '-c',
+      // Brokers accumulate on every machine this deployment drives, so the
+      // sweep visits each target as well as this one. A target that is
+      // unreachable right now simply reports nothing and is retried next time.
+      for (const remote of [null, ...REMOTES.values()]) {
+        try { await reapIdleBrokersOn(remote) } catch (error) {
+          console.error('cc-mode: broker sweep failed on '
+            + (remote === null ? 'this machine' : remote.id) + ':', errorText(error))
+        }
+      }
+    }
+
+    async function reapIdleBrokersOn(remote) {
+      const listing = await runCapture(shArgv(
         'for d in ' + shellQuote(BROKER_ROOT) + '/session-*; do '
         + '[ -d "$d" ] || continue; '
-        + 'echo "$d|$(stat -c %Y "$d/out.log" 2>/dev/null || stat -f %m "$d/out.log" 2>/dev/null || echo 0)"; done'], 8000)
+        + 'echo "$d|$(stat -c %Y "$d/out.log" 2>/dev/null || stat -f %m "$d/out.log" 2>/dev/null || echo 0)"; done', remote), 8000)
       const now = Date.now()
       // Sessions dsh still knows about. A broker for a conversation that no
       // longer exists (deleted, or from an older dsh state) is pure waste and
@@ -1633,28 +2120,30 @@ return {
         const sessionId = dir.slice(BROKER_ROOT.length + 1)
         if (runs.has(sessionId)) continue
         if (activeTurns.has(sessionId)) continue
-        const meta = await readJsonFile(dir + '/meta.json')
+        const meta = await readJsonFile(dir + '/meta.json', remote)
         if (meta !== null) {
-          await runCapture(['/bin/sh', '-c',
+          await runCapture(shArgv(
             'kill ' + (typeof meta.childPid === 'number' ? meta.childPid : 0) + ' 2>/dev/null; '
-            + 'kill ' + (typeof meta.brokerPid === 'number' ? meta.brokerPid : 0) + ' 2>/dev/null; true'], 5000)
+            + 'kill ' + (typeof meta.brokerPid === 'number' ? meta.brokerPid : 0) + ' 2>/dev/null; true', remote), 5000)
         }
-        await runCapture(['/bin/sh', '-c', 'rm -rf ' + shellQuote(dir)], 5000)
+        await runCapture(shArgv('rm -rf ' + shellQuote(dir), remote), 5000)
         console.log('cc-mode: reaped a Claude broker for', sessionId,
-          '— idle', Math.round(idleMs / 60000), 'min' + (orphaned ? ', no live dsh session' : ''))
+          '— idle', Math.round(idleMs / 60000), 'min'
+          + (orphaned ? ', no live dsh session' : '') + (remote === null ? '' : ' @ ' + remote.id))
       }
     }
 
     /** End the Claude process for good — an explicit act, never a side effect. */
     async function stopRun(sessionId) {
       const dir = sessionDir(sessionId)
+      const remote = remoteOf(stateOf(sessionId))
       detach(sessionId, false)
-      const meta = await readJsonFile(dir + '/meta.json')
+      const meta = await readJsonFile(dir + '/meta.json', remote)
       if (meta === null) return false
-      await runCapture(['/bin/sh', '-c',
+      await runCapture(shArgv(
         'kill ' + (typeof meta.childPid === 'number' ? meta.childPid : 0) + ' 2>/dev/null; '
         + 'kill ' + (typeof meta.brokerPid === 'number' ? meta.brokerPid : 0) + ' 2>/dev/null; '
-        + 'rm -f ' + shellQuote(dir + '/meta.json') + '; true'], 5000)
+        + 'rm -f ' + shellQuote(dir + '/meta.json') + '; true', remote), 5000)
       console.log('cc-mode: stopped Claude for', sessionId)
       return true
     }
@@ -1694,7 +2183,7 @@ return {
      * through O_APPEND cannot interleave, while a read-modify-write would drop
      * their rows.
      */
-    function recordPromptHistory(cwd, claudeSessionId, prompt) {
+    function recordPromptHistory(cwd, claudeSessionId, prompt, remote) {
       if (typeof claudeSessionId !== 'string' || claudeSessionId.length === 0) return
       const row = JSON.stringify({
         display: prompt,
@@ -1705,8 +2194,10 @@ return {
       })
       try {
         const proc = silenceStdin(subprocess.spawn({
-          argv: ['/bin/sh', '-c', 'mkdir -p "$HOME/.claude" && cat >> "$HOME/.claude/history.jsonl"'],
-          cwd: cwd,
+          argv: shArgv('mkdir -p "$HOME/.claude" && cat >> "$HOME/.claude/history.jsonl"', remote),
+          // The cwd is a directory over there when this is a remote target;
+          // the append does not need it, so only a local spawn takes it.
+          cwd: remote === null || remote === undefined ? cwd : '/',
           stdio: { stdin: 'pipe', stdout: 'ignore', stderr: 'ignore' },
           graceMs: 2000,
         }))
@@ -1728,20 +2219,60 @@ return {
       { id: 'seven_day_sonnet', label: '7d Sonnet' },
     ]
 
-    const usage = { at: 0, value: null, inflight: null }
+    // One reading per machine: the subscription belongs to the account that
+    // machine is logged into, so a conversation on a target must not be shown
+    // this host's windows — nor wait out this host's reset.
+    const usageByTarget = new Map()
+    function usageCellOf(remote) {
+      const key = remote === null || remote === undefined ? '' : remote.id
+      let cell = usageByTarget.get(key)
+      if (cell === undefined) {
+        cell = { at: 0, value: null, inflight: null }
+        usageByTarget.set(key, cell)
+      }
+      return cell
+    }
 
-    async function loadUsage() {
+    /**
+     * The probe that runs ON a target.
+     *
+     * Deliberately the whole thing — credentials, gateway check, and the HTTP
+     * call — rather than reading the credential file back and calling from
+     * here: the access token then never leaves the machine it belongs to. Node
+     * is already a requirement over there (the broker is a node script), so
+     * this costs no new dependency and one round trip instead of three.
+     */
+    const REMOTE_USAGE_PROBE = '(async()=>{const fs=require("fs");const out=(v)=>process.stdout.write(JSON.stringify(v));let c=null;try{c=JSON.parse(fs.readFileSync(process.env.HOME+"/.claude/.credentials.json","utf8"))}catch(e){}const o=c&&c.claudeAiOauth;if(!o||typeof o.accessToken!=="string"||typeof o.subscriptionType!=="string")return out({skip:"no-oauth-subscription"});if(((process.env.ANTHROPIC_BASE_URL||"")+(process.env.ANTHROPIC_AUTH_TOKEN||"")+(process.env.ANTHROPIC_API_KEY||"")).length>0)return out({skip:"gateway-override"});try{const r=await fetch("https://api.anthropic.com/api/oauth/usage",{headers:{Authorization:"Bearer "+o.accessToken,"anthropic-beta":"oauth-2025-04-20",Accept:"application/json"}});out({subscription:o.subscriptionType,tier:typeof o.rateLimitTier==="string"?o.rateLimitTier:null,body:await r.text()})}catch(e){out({subscription:o.subscriptionType,tier:null,error:String((e&&e.message)||e)})}})()'
+
+    async function remoteUsageSource(remote) {
+      const raw = await runCapture(shArgv(
+        shellQuote(remote.nodeBin) + ' -e ' + shellQuote(REMOTE_USAGE_PROBE), remote), 25000)
+      let answer = null
+      try { answer = JSON.parse(String(raw).trim()) } catch (error) { answer = null }
+      if (answer === null) {
+        return { done: { official: true, error: '在 ' + remote.id + ' 上读用量没有返回结果' } }
+      }
+      if (typeof answer.skip === 'string') return { done: { official: false, reason: answer.skip } }
+      if (typeof answer.error === 'string') {
+        return { done: { official: true, subscription: answer.subscription, error: answer.error } }
+      }
+      let parsed = null
+      try { parsed = JSON.parse(answer.body) } catch (error) { parsed = null }
+      return { oauth: { subscriptionType: answer.subscription, rateLimitTier: answer.tier }, parsed: parsed }
+    }
+
+    async function localUsageSource() {
       const credentialsRaw = await runCapture(['/bin/sh', '-c', 'cat "$HOME/.claude/.credentials.json" 2>/dev/null'], 8000)
       let credentials = null
       try { credentials = JSON.parse(credentialsRaw) } catch (error) { credentials = null }
       const oauth = credentials === null ? undefined : credentials.claudeAiOauth
       if (oauth === undefined || typeof oauth.accessToken !== 'string' || typeof oauth.subscriptionType !== 'string') {
         // API key, third-party gateway, or no login: nothing subscription-shaped to show.
-        return { official: false, reason: 'no-oauth-subscription' }
+        return { done: { official: false, reason: 'no-oauth-subscription' } }
       }
       const overrides = (await runCapture(['/bin/sh', '-c', 'echo "$ANTHROPIC_BASE_URL|$ANTHROPIC_AUTH_TOKEN|$ANTHROPIC_API_KEY"'], 5000)).trim()
       if (overrides.replace(/\|/g, '').length > 0) {
-        return { official: false, reason: 'gateway-override' }
+        return { done: { official: false, reason: 'gateway-override' } }
       }
       const body = await runCapture([
         '/usr/bin/env', 'curl', '-s', '--max-time', '15',
@@ -1752,8 +2283,25 @@ return {
       ], 20000)
       let parsed = null
       try { parsed = JSON.parse(body) } catch (error) { parsed = null }
-      if (parsed === null || typeof parsed !== 'object') {
-        return { official: true, subscription: oauth.subscriptionType, error: 'usage endpoint unavailable' }
+      return { oauth: oauth, parsed: parsed }
+    }
+
+    async function loadUsage(remote) {
+      const source = remote === null || remote === undefined
+        ? await localUsageSource()
+        : await remoteUsageSource(remote)
+      if (source.done !== undefined) return source.done
+      const oauth = source.oauth
+      const parsed = source.parsed
+      // A refusal is JSON too: `{"error":{"type":"rate_limit_error",...}}` parses
+      // fine and then yields zero windows, which downstream reads as "this
+      // account has no windows" rather than "ask again later". Say which it is.
+      if (parsed === null || typeof parsed !== 'object' || parsed.error !== undefined) {
+        const message = parsed !== null && typeof parsed === 'object' && parsed.error !== null
+          && typeof parsed.error === 'object' && typeof parsed.error.message === 'string'
+          ? parsed.error.message
+          : 'usage endpoint unavailable'
+        return { official: true, subscription: oauth.subscriptionType, error: message }
       }
       const windows = []
       for (const window of USAGE_WINDOWS) {
@@ -1765,6 +2313,11 @@ return {
           utilization: entry.utilization,
           resetsAt: typeof entry.resets_at === 'string' ? entry.resets_at : null,
         })
+      }
+      // An official subscription always reports at least the 5h window; none at
+      // all means the response was not a usage reading, whatever its shape.
+      if (windows.length === 0) {
+        return { official: true, subscription: oauth.subscriptionType, error: 'usage endpoint returned no windows' }
       }
       const extra = parsed.extra_usage
       return {
@@ -1779,11 +2332,28 @@ return {
       }
     }
 
-    function usageSnapshot(force) {
-      const fresh = Date.now() - usage.at < 60000
+    /** A reading, as opposed to "ask again later". */
+    function usageReadable(value) {
+      return value !== null && typeof value === 'object' && value.error === undefined
+    }
+
+    function usageSnapshot(force, remote) {
+      const usage = usageCellOf(remote)
+      // The endpoint rate-limits, and Claude Code's own TUI is hitting it from
+      // the same account. Backing off for five minutes after a refusal keeps a
+      // 20s client poll from turning one 429 into a stream of them; a good
+      // reading still ages out in a minute.
+      const ttl = usageReadable(usage.value) ? 60000 : 5 * 60000
+      const fresh = Date.now() - usage.at < ttl
       if (!force && fresh && usage.value !== null) return Promise.resolve(usage.value)
+      // Even a forced refetch honours a recent refusal: a model calling
+      // `claude_usage(refresh: true)` in a loop must not become the reason the
+      // endpoint keeps refusing.
+      if (force && usage.value !== null && !usageReadable(usage.value) && Date.now() - usage.at < 60000) {
+        return Promise.resolve(usage.value)
+      }
       if (usage.inflight !== null) return usage.inflight
-      usage.inflight = loadUsage().then((value) => {
+      usage.inflight = loadUsage(remote).then((value) => {
         usage.at = Date.now()
         usage.value = value
         usage.inflight = null
@@ -1796,6 +2366,191 @@ return {
         return value
       })
       return usage.inflight
+    }
+
+    // ---------- the usage limit, waited out instead of reported ----------
+    //
+    // Claude Code's own TUI holds a turn that ran out of subscription quota and
+    // picks the task back up by itself once the window resets — the
+    // `autoContinueAtUsageLimit` setting, "Usage limit reached · continuing
+    // automatically". That behaviour lives entirely in its interactive app
+    // layer: the `-p --output-format stream-json` process this plugin drives
+    // has no dialog to show, so the turn simply ended with an error result and
+    // the work sat there until someone noticed and retyped.
+    //
+    // The same behaviour, rebuilt on the seam this plugin already owns: the dsh
+    // turn stays open (so cancel, the composer's running state and the broker's
+    // idle reaper all keep meaning exactly what they mean), the wait is a state
+    // the composer reports, and what resumes the work is the very prompt
+    // Claude's TUI hands itself.
+
+    /** Claude Code's own continuation prompts, verbatim. */
+    const QUOTA_RESUME_PROMPT = 'Your claude.ai usage limit has reset. Continue the task you were working on when the limit was reached; do not repeat work that is already complete.'
+    const QUOTA_EARLY_PROMPT = 'Your claude.ai usage is available again before the usage-limit reset. Continue the task you were working on when the limit was reached; do not repeat work that is already complete.'
+    // Past a day out a wait stops being a wait; the TUI refuses that one too.
+    const QUOTA_WAIT_HORIZON_MS = 24 * 60 * 60 * 1000
+    // Quota can come back before the window resets. Cheap to look: the reading
+    // is one HTTP call every few minutes against a wait measured in hours.
+    const QUOTA_POLL_MS = 5 * 60 * 1000
+    // Resume a beat AFTER the stated reset — the window is not always free on
+    // the exact second, and a resume that fails re-enters this wait for nothing.
+    const QUOTA_SETTLE_MS = 20 * 1000
+    // Cancel has to feel like a button, not like a poll.
+    const QUOTA_TICK_MS = 2000
+    // A turn that keeps landing on the limit is not making progress; stop
+    // rather than ping-pong against the window for a day.
+    const QUOTA_MAX_CONTINUES = 3
+
+    // sessionId -> the wait the composer is showing.
+    const quotaWaits = new Map()
+
+    /**
+     * The window to wait on: spent, and with a reset still ahead of us. When
+     * several are spent the nearest reset wins — it is the one that decides
+     * when work can start again.
+     */
+    function spentWindow(snapshot) {
+      if (snapshot === null || snapshot === undefined) return null
+      if (snapshot.official !== true || !Array.isArray(snapshot.windows)) return null
+      const now = Date.now()
+      let found = null
+      for (const window of snapshot.windows) {
+        if (typeof window.utilization !== 'number' || window.utilization < 99) continue
+        const at = typeof window.resetsAt === 'string' ? Date.parse(window.resetsAt) : NaN
+        if (!isFinite(at) || at <= now) continue
+        if (found === null || at < found.at) found = { id: window.id, label: window.label, at: at }
+      }
+      return found
+    }
+
+    /**
+     * Did this failed turn fail for want of quota?
+     *
+     * The account's own usage windows answer that — not the wording of the
+     * error. A window at the line with a reset time is the one failure worth
+     * sitting out, and it stays a fact when a future CLI release phrases its
+     * error differently. Forced, because the cached reading is precisely the
+     * one taken before the turn spent the window.
+     */
+    async function quotaLimitHit(remote) {
+      let snapshot
+      try { snapshot = await usageSnapshot(true, remote) } catch (error) { return null }
+      return spentWindow(snapshot)
+    }
+
+    /** What the composer shows while a turn is held. */
+    function quotaWaitOf(sessionId) {
+      const wait = quotaWaits.get(sessionId)
+      if (wait === undefined) return null
+      return { label: wait.label, resetsAt: new Date(wait.at).toISOString(), since: wait.since }
+    }
+
+    /** Let go of a wait — the user asked, or spoke for themselves instead. */
+    function cancelQuotaWait(sessionId, reason) {
+      const wait = quotaWaits.get(sessionId)
+      if (wait === undefined) return false
+      wait.settle(reason)
+      console.log('cc-mode: quota wait on', sessionId, 'cancelled —', reason)
+      return true
+    }
+
+    /** A reset time as it is actually read: local wall clock. */
+    function clockText(at) {
+      const date = new Date(at)
+      try { return date.toLocaleString(undefined, { hour: '2-digit', minute: '2-digit' }) }
+      catch (error) { return date.toISOString() }
+    }
+
+    /**
+     * Hold this turn until the quota is back, then hand Claude the prompt its
+     * own TUI would have handed it.
+     *
+     * Returns true when the turn should keep reading the stream — a
+     * continuation went in, or the user interjected one of their own. The turn
+     * is never re-opened later and never started on the plugin's own account:
+     * this is the turn the person started, still running, still cancellable.
+     */
+    async function waitOutQuota(sessionId, transcript, run, hit, signal) {
+      if (hit.at - Date.now() > QUOTA_WAIT_HORIZON_MS) {
+        transcript.note('⚠ 已达 Claude 用量上限（' + hit.label + '）· 重置在 ' + clockText(hit.at)
+          + '，超过 24 小时 —— 这一轮不会自动继续')
+        return false
+      }
+
+      let settled = null
+      const wait = {
+        label: hit.label,
+        at: hit.at,
+        since: Date.now(),
+        // What the user typed while the turn was held. Speaking is NOT a
+        // cancel: the task was already given, and a message added while
+        // waiting is more of the same task — it rides the continuation
+        // instead of racing Claude into the limit a second time.
+        held: [],
+        note: transcript.note,
+        settle: (reason) => { if (settled === null) settled = reason },
+      }
+      quotaWaits.set(sessionId, wait)
+      const onAbort = () => wait.settle('cancelled')
+      signal.addEventListener('abort', onAbort)
+      transcript.note('⏳ 已达 Claude 用量上限（' + hit.label + '）· 将在 ' + clockText(hit.at)
+        + ' 自动继续（按停止可取消）')
+
+      try {
+        let polledAt = Date.now()
+        while (settled === null) {
+          if (signal.aborted || shuttingDown) { wait.settle('cancelled'); break }
+          const now = Date.now()
+          if (now >= wait.at + QUOTA_SETTLE_MS) { wait.settle('reset'); break }
+          if (now - polledAt >= QUOTA_POLL_MS) {
+            polledAt = now
+            const snapshot = await usageSnapshot(true, run.remote)
+            // An unreachable usage endpoint is not quota coming back: only a
+            // reading that actually carries windows may end the wait early.
+            if (snapshot !== null && snapshot.official === true
+              && Array.isArray(snapshot.windows) && snapshot.windows.length > 0) {
+              const still = spentWindow(snapshot)
+              if (still === null) { wait.settle('early'); break }
+              // The nearest reset can move to another window (7d behind 5h).
+              wait.at = still.at
+              wait.label = still.label
+            }
+          }
+          await sleep(QUOTA_TICK_MS)
+        }
+      } finally {
+        signal.removeEventListener('abort', onAbort)
+        quotaWaits.delete(sessionId)
+      }
+
+      if (settled !== 'reset' && settled !== 'early') {
+        if (!signal.aborted && !shuttingDown) {
+          transcript.note('■ 已取消等待用量恢复'
+            + (wait.held.length > 0 ? '（等待期间的 ' + wait.held.length + ' 条消息没有发出）' : ''))
+        }
+        return false
+      }
+
+      transcript.note((settled === 'early' ? '▶ 用量提前恢复 · 自动继续' : '▶ 用量已恢复 · 自动继续')
+        + (wait.held.length > 0 ? '（带上等待期间你说的 ' + wait.held.length + ' 条）' : ''))
+      // Claude's own prompt first — it is what tells the model not to redo
+      // finished work — then whatever the user added while waiting.
+      let content = [{ type: 'text', text: settled === 'early' ? QUOTA_EARLY_PROMPT : QUOTA_RESUME_PROMPT }]
+      for (const blocks of wait.held) content = content.concat(blocks)
+      try {
+        await run.write({
+          type: 'user',
+          message: { role: 'user', content: content },
+          parent_tool_use_id: null,
+        })
+        if (run.writeError !== undefined) throw new Error(run.writeError)
+      } catch (error) {
+        transcript.note('⚠ 用量恢复了，但这一轮没能续上：' + errorText(error))
+        return false
+      }
+      console.log('cc-mode: quota back on', sessionId, '— continued the held turn with',
+        wait.held.length, 'message(s) typed during the wait')
+      return true
     }
 
     // ---------- Claude's own slash commands ----------
@@ -1813,13 +2568,19 @@ return {
       'agents', 'clear', 'compact', 'config', 'context', 'doctor', 'effort',
       'init', 'mcp', 'model', 'usage',
     ]
-    let commandCache = []
+    // Slash commands are whatever the CLI on THAT machine reports in its init
+    // handshake, and a machine can have custom ones the others do not — so the
+    // roster is remembered per machine instead of the last handshake winning.
+    // The empty key is this machine, which is also the shape the pre-target
+    // state file stored.
+    let commandCache = new Map()
 
-    function rememberCommands(list) {
+    function rememberCommands(list, remote) {
       if (!Array.isArray(list) || list.length === 0) return
       const names = list.filter((name) => typeof name === 'string' && name.length > 0)
-      if (names.length === 0 || names.join(',') === commandCache.join(',')) return
-      commandCache = names
+      const key = remote === null || remote === undefined ? '' : remote.id
+      if (names.length === 0 || names.join(',') === (commandCache.get(key) || []).join(',')) return
+      commandCache.set(key, names)
       persistStates()
     }
 
@@ -1876,8 +2637,8 @@ return {
       const run = runs.get(sessionId)
       if (run !== undefined && run.init !== undefined) return run.init
       const path = sessionDir(sessionId) + '/out.log'
-      const raw = await runCapture(['/bin/sh', '-c',
-        'grep -a \'"subtype":"init"\' ' + shellQuote(path) + ' 2>/dev/null | tail -1'], 8000)
+      const raw = await runCapture(shArgv(
+        'grep -a \'"subtype":"init"\' ' + shellQuote(path) + ' 2>/dev/null | tail -1', remoteOf(stateOf(sessionId))), 8000)
       const line = String(raw).trim()
       if (line.length === 0) return undefined
       try { return JSON.parse(line) } catch (error) { return undefined }
@@ -1887,8 +2648,8 @@ return {
      * Where each MCP server is configured, the way the terminal groups them:
      * the project's own entry in ~/.claude.json versus the user-wide one.
      */
-    async function mcpScopes(cwd) {
-      const raw = await runCapture(['/bin/sh', '-c', 'cat "$HOME"/.claude.json 2>/dev/null'], 8000)
+    async function mcpScopes(cwd, remote) {
+      const raw = await runCapture(shArgv('cat "$HOME"/.claude.json 2>/dev/null', remote), 8000)
       let config = null
       try { config = JSON.parse(raw) } catch (error) { config = null }
       const scopes = {}
@@ -1973,7 +2734,7 @@ return {
           if (message === undefined) throw new Error('cc-mode: 与 Claude 的连接在命令返回前断开了')
           if (message.type === 'system' && message.subtype === 'init') {
             run.init = message
-            rememberCommands(message.slash_commands)
+            rememberCommands(message.slash_commands, run.remote)
             // `/clear` hands the process a NEW session id; without recording
             // it here the durable resume mapping keeps pointing at the
             // pre-clear conversation.
@@ -2082,13 +2843,15 @@ return {
       if (typeof state.claudeSessionId !== 'string' || state.claudeSessionId.length === 0) return
       const transcript = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd)) + '/'
         + shellQuote(state.claudeSessionId + '.jsonl')
-      fileSizeOfShellWord(transcript).then((size) => {
+      fileSizeOfShellWord(transcript, remoteOf(state)).then((size) => {
         if (size > state.jsonlOffset) { state.jsonlOffset = size; persistStates() }
       }).catch(() => undefined)
     }
 
-    function claudeCommands() {
-      return commandCache.length > 0 ? commandCache : FALLBACK_COMMANDS
+    function claudeCommands(remote) {
+      const key = remote === null || remote === undefined ? '' : remote.id
+      const names = commandCache.get(key)
+      return names !== undefined && names.length > 0 ? names : FALLBACK_COMMANDS
     }
 
     // ---------- adopting an existing Claude conversation ----------
@@ -2109,18 +2872,18 @@ return {
      * around the first hit so the row can show WHY it matched. Fixed-string,
      * case-insensitive, done by grep — the transcripts are plain UTF-8 jsonl.
      */
-    async function searchClaudeConversations(cwd, query) {
+    async function searchClaudeConversations(cwd, query, remote) {
       const dir = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd))
       const needle = String(query || '').trim()
       if (needle.length === 0) return { hits: [] }
-      const matched = await runCapture(['/bin/sh', '-c',
-        'cd ' + dir + ' 2>/dev/null && grep -liF -- ' + shellQuote(needle) + ' *.jsonl 2>/dev/null | head -20'], 15000)
+      const matched = await runCapture(shArgv(
+        'cd ' + dir + ' 2>/dev/null && grep -liF -- ' + shellQuote(needle) + ' *.jsonl 2>/dev/null | head -20', remote), 15000)
       const hits = []
       for (const name of String(matched).split('\n')) {
         const file = name.trim()
         if (file.length === 0 || !file.endsWith('.jsonl')) continue
-        const line = await runCapture(['/bin/sh', '-c',
-          'grep -iF -m1 -- ' + shellQuote(needle) + ' ' + dir + '/' + shellQuote(file) + ' 2>/dev/null | head -c 200000'], 10000)
+        const line = await runCapture(shArgv(
+          'grep -iF -m1 -- ' + shellQuote(needle) + ' ' + dir + '/' + shellQuote(file) + ' 2>/dev/null | head -c 200000', remote), 10000)
         hits.push({
           claudeSessionId: file.replace(/\.jsonl$/, ''),
           snippet: snippetAround(String(line), needle),
@@ -2143,11 +2906,11 @@ return {
         .slice(0, 140)
     }
 
-    async function listClaudeConversations(cwd) {
+    async function listClaudeConversations(cwd, remote) {
       const dir = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd))
-      const listing = await runCapture(['/bin/sh', '-c',
+      const listing = await runCapture(shArgv(
         'for f in ' + dir + '/*.jsonl; do [ -f "$f" ] || continue; '
-        + 'echo "$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f")|$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f")|$f"; done | sort -rn | head -40'], 10000)
+        + 'echo "$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f")|$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f")|$f"; done | sort -rn | head -40', remote), 10000)
       const rows = []
       for (const line of String(listing).split('\n')) {
         const parts = line.trim().split('|')
@@ -2163,9 +2926,9 @@ return {
       }
       // One pass per file for the title and the opening prompt.
       for (const row of rows) {
-        const head = await runCapture(['/bin/sh', '-c',
+        const head = await runCapture(shArgv(
           'grep -m 3 -E \'"type":"(ai-title|custom-title)"\' ' + shellQuote(row.path) + ' 2>/dev/null; '
-          + 'grep -m 1 -F \'"type":"user"\' ' + shellQuote(row.path) + ' 2>/dev/null'], 8000)
+          + 'grep -m 1 -F \'"type":"user"\' ' + shellQuote(row.path) + ' 2>/dev/null', remote), 8000)
         row.title = ''
         row.firstPrompt = ''
         for (const line of String(head).split('\n')) {
@@ -2232,16 +2995,16 @@ return {
       if (state.mode !== 'claude' || typeof state.jsonlOffset !== 'number') return Promise.resolve(0)
       if (typeof state.claudeSessionId !== 'string' || state.claudeSessionId.length === 0) return Promise.resolve(0)
       if (activeTurns.has(sessionId)) return Promise.resolve(0)
-      const cwd = session.header ? session.header.cwd : undefined
+      const cwd = projectCwd(sessionId, session)
       if (typeof cwd !== 'string' || cwd.length === 0) return Promise.resolve(0)
 
       const work = (async () => {
         const path = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd)) + '/' + shellQuote(state.claudeSessionId + '.jsonl')
-        const size = await fileSizeOfShellWord(path)
+        const size = await fileSizeOfShellWord(path, remoteOf(state))
         if (size <= state.jsonlOffset) return 0
 
-        const raw = await runCapture(['/bin/sh', '-c',
-          'tail -c +' + (state.jsonlOffset + 1) + ' ' + path + ' | head -c 3000000'], 20000)
+        const raw = await runCapture(shArgv(
+          'tail -c +' + (state.jsonlOffset + 1) + ' ' + path + ' | head -c 3000000', remoteOf(state)), 20000)
         const text = String(raw)
         // Only whole lines advance the offset — a line the terminal is mid-way
         // through writing stays for the next pass.
@@ -2256,7 +3019,7 @@ return {
           let event = null
           try { event = JSON.parse(line) } catch (error) { continue }
           if (event.type !== 'user' && event.type !== 'assistant') continue
-          if (event.isSidechain === true || event.isReplay === true) continue
+          if (event.isSidechain === true || event.isReplay === true || machineryRow(event)) continue
           if (event.message === null || event.message === undefined) continue
           rows.push(event)
         }
@@ -2388,10 +3151,11 @@ return {
       if (state.mode !== 'claude') return Promise.resolve(0)
 
       const dir = sessionDir(sessionId)
+      const remote = remoteOf(state)
       const work = (async () => {
-        const meta = await readJsonFile(dir + '/meta.json')
+        const meta = await readJsonFile(dir + '/meta.json', remote)
         if (meta === null) return 0
-        const attachState = await readJsonFile(dir + '/attach.json')
+        const attachState = await readJsonFile(dir + '/attach.json', remote)
         let offset = attachState !== null && typeof attachState.offset === 'number' ? attachState.offset : null
         if (offset === null) {
           // No recorded offset (the watchdog clears it on a stalled detach).
@@ -2407,20 +3171,20 @@ return {
             }
           }
           if (callId.length === 0) return 0
-          const lineNoRaw = await runCapture(['/bin/sh', '-c',
-            'grep -n -m1 -F ' + shellQuote('"tool_use_id":"' + callId + '"') + ' ' + shellQuote(dir + '/out.log') + ' | cut -d: -f1'], 15000)
+          const lineNoRaw = await runCapture(shArgv(
+            'grep -n -m1 -F ' + shellQuote('"tool_use_id":"' + callId + '"') + ' ' + shellQuote(dir + '/out.log') + ' | cut -d: -f1', remote), 15000)
           const lineNo = parseInt(String(lineNoRaw).trim(), 10)
           if (isNaN(lineNo) || lineNo < 1) return 0
-          const offsetRaw = await runCapture(['/bin/sh', '-c',
-            'head -n ' + (lineNo - 1) + ' ' + shellQuote(dir + '/out.log') + ' | wc -c'], 15000)
+          const offsetRaw = await runCapture(shArgv(
+            'head -n ' + (lineNo - 1) + ' ' + shellQuote(dir + '/out.log') + ' | wc -c', remote), 15000)
           offset = parseInt(String(offsetRaw).trim(), 10)
           if (isNaN(offset)) return 0
         }
-        const size = await fileSize(dir + '/out.log')
+        const size = await fileSize(dir + '/out.log', remote)
         if (size <= offset) return 0
 
-        const raw = await runCapture(['/bin/sh', '-c',
-          'tail -c +' + (offset + 1) + ' ' + shellQuote(dir + '/out.log') + ' | head -c 3000000'], 20000)
+        const raw = await runCapture(shArgv(
+          'tail -c +' + (offset + 1) + ' ' + shellQuote(dir + '/out.log') + ' | head -c 3000000', remote), 20000)
         const rows = []
         let sawResult = false
         for (const line of String(raw).split('\n')) {
@@ -2429,7 +3193,7 @@ return {
           try { event = JSON.parse(line) } catch (error) { continue }
           if (event.type === 'result') { sawResult = true; continue }
           if (event.type !== 'user' && event.type !== 'assistant') continue
-          if (event.isSidechain === true || event.isReplay === true) continue
+          if (event.isSidechain === true || event.isReplay === true || machineryRow(event)) continue
           if (typeof event.parent_tool_use_id === 'string' && event.parent_tool_use_id.length > 0) continue
           if (event.message === null || event.message === undefined) continue
           rows.push(event)
@@ -2467,7 +3231,7 @@ return {
           '（dsh 重启期间 Claude 继续完成了这一轮，以下是断档期间的内容。）')
         await new Promise((resolve) => {
           const writer = silenceStdin(subprocess.spawn({
-            argv: ['/bin/sh', '-c', 'cat > ' + shellQuote(dir + '/attach.json')],
+            argv: shArgv('cat > ' + shellQuote(dir + '/attach.json'), remote),
             cwd: '/',
             stdio: { stdin: 'pipe', stdout: 'ignore', stderr: 'ignore' },
             graceMs: 1000,
@@ -2537,10 +3301,10 @@ return {
      * the case the long one exists for, and letting go minutes before the task
      * wakes Claude up.
      */
-    async function lastBackgroundTaskCount(dir) {
-      const raw = await runCapture(['/bin/sh', '-c',
+    async function lastBackgroundTaskCount(dir, remote) {
+      const raw = await runCapture(shArgv(
         'tail -c 2000000 ' + shellQuote(dir + '/out.log')
-        + ' | grep -F \'"background_tasks_changed"\' | tail -1'], 10000)
+        + ' | grep -F \'"background_tasks_changed"\' | tail -1', remote), 10000)
       const line = String(raw).trim()
       if (line.length === 0) return 0
       try {
@@ -2562,13 +3326,13 @@ return {
      * its own transcript, inside tool output and assistant prose. Matching on
      * the string alone reads a conversation's chatter as its title.
      */
-    async function lastAiTitle(cwd, claudeSessionId) {
+    async function lastAiTitle(cwd, claudeSessionId, remote) {
       if (typeof cwd !== 'string' || cwd.length === 0) return ''
       if (typeof claudeSessionId !== 'string' || claudeSessionId.length === 0) return ''
       const path = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd))
         + '/' + shellQuote(claudeSessionId + '.jsonl')
-      const raw = await runCapture(['/bin/sh', '-c',
-        'tail -c 2000000 ' + path + ' 2>/dev/null | grep -F ' + shellQuote('{"type":"ai-title"') + ' | tail -5'], 10000)
+      const raw = await runCapture(shArgv(
+        'tail -c 2000000 ' + path + ' 2>/dev/null | grep -F ' + shellQuote('{"type":"ai-title"') + ' | tail -5', remote), 10000)
       const lines = String(raw).split('\n')
       for (let index = lines.length - 1; index >= 0; index -= 1) {
         const line = lines[index].trim()
@@ -2610,7 +3374,7 @@ return {
       const cwd = run !== undefined && typeof run.cwd === 'string' && run.cwd.length > 0
         ? run.cwd
         : (session.header ? session.header.cwd : '')
-      const title = await lastAiTitle(cwd, state.claudeSessionId)
+      const title = await lastAiTitle(cwd, state.claudeSessionId, remoteOf(state))
 
       let snapshot
       try { snapshot = sessionTitle.get(session) } catch (error) { return false }
@@ -2677,7 +3441,7 @@ return {
      * disk already, and reading them back costs nothing until a round actually
      * completes.
      */
-    async function projectIdleStretch(sessionId, run, notice, endsAt) {
+    async function projectIdleStretch(sessionId, run, endsAt) {
       const from = typeof run.idleFrom === 'number' ? run.idleFrom : 0
       const to = typeof endsAt === 'number' ? endsAt
         : (typeof run.consumed === 'number' ? run.consumed : run.offset)
@@ -2691,9 +3455,9 @@ return {
         console.error('cc-mode:', sessionId, 'idle stretch is', Math.round(span / 1024),
           'KB — projecting the first', Math.round(IDLE_STRETCH_MAX / 1024), 'KB of it')
       }
-      const raw = await runCapture(['/bin/sh', '-c',
+      const raw = await runCapture(shArgv(
         'tail -c +' + (from + 1) + ' ' + shellQuote(run.dir + '/out.log')
-        + ' | head -c ' + Math.min(span, IDLE_STRETCH_MAX)], 20000)
+        + ' | head -c ' + Math.min(span, IDLE_STRETCH_MAX), run.remote), 20000)
 
       const rows = []
       for (const line of String(raw).split('\n')) {
@@ -2701,7 +3465,7 @@ return {
         let event = null
         try { event = JSON.parse(line) } catch (error) { continue }
         if (event.type !== 'user' && event.type !== 'assistant') continue
-        if (event.isSidechain === true || event.isReplay === true) continue
+        if (event.isSidechain === true || event.isReplay === true || machineryRow(event)) continue
         if (typeof event.parent_tool_use_id === 'string' && event.parent_tool_use_id.length > 0) continue
         if (event.message === null || event.message === undefined) continue
         rows.push(event)
@@ -2727,7 +3491,7 @@ return {
       })
       if (fresh.length === 0) return 0
 
-      const written = queueProjection(sessionId, fresh, notice)
+      const written = queueProjection(sessionId, fresh, '')
       console.log('cc-mode:', sessionId, 'projected', written, 'message(s) from a round Claude opened on its own')
       return written
     }
@@ -2754,8 +3518,7 @@ return {
         // because the event that set it usually scrolled by before this
         // reader existed.
         let tasksOpen = 0
-        try { tasksOpen = await lastBackgroundTaskCount(run.dir) } catch (error) { tasksOpen = 0 }
-        let notice = ''
+        try { tasksOpen = await lastBackgroundTaskCount(run.dir, run.remote) } catch (error) { tasksOpen = 0 }
         let quiet = null
         let relieved = false
         const disarm = () => {
@@ -2780,21 +3543,24 @@ return {
           }, tasksOpen > 0 ? IDLE_TASK_QUIET_MS : IDLE_QUIET_MS)
         }
 
+        // The live agent for this session, when one is still registered (jobs
+        // rows need it as their owner).
+        const idleAgent = () => {
+          try { return agents === undefined ? undefined : agents.get(sessionId) } catch (error) { return undefined }
+        }
+
         const handle = async (message) => {
           const parent = typeof message.parent_tool_use_id === 'string' ? message.parent_tool_use_id : null
 
           if (message.type === 'system') {
             if (message.subtype === 'background_tasks_changed') {
               tasksOpen = Array.isArray(message.tasks) ? message.tasks.length : 0
+            } else if (message.subtype === 'task_started' && parent === null) {
+              // Booked into dsh's own surfaces only — same as the live loop,
+              // and for the same reason: no ⚙ note in the conversation.
+              ccTaskStarted(run, idleAgent(), message)
             } else if (message.subtype === 'task_notification' && parent === null) {
-              // Same note the live loop writes, so the reply this round is
-              // about to give does not read as an answer to nothing.
-              const what = typeof message.description === 'string' && message.description.length > 0
-                ? message.description
-                : String(message.task_id || 'task')
-              const summary = typeof message.summary === 'string' ? message.summary.trim() : ''
-              notice += (notice.length > 0 ? '\n\n' : '') + '⚙ 后台任务通知：' + what
-                + (summary.length > 0 ? '\n\n' + summary.slice(0, 4000) : '')
+              ccTaskNotification(run, idleAgent(), message)
             }
             return
           }
@@ -2804,17 +3570,25 @@ return {
           if (message.type === 'control_request') {
             const request = message.request || {}
             if (request.subtype === 'can_use_tool') {
-              let agent
-              try { agent = agents === undefined ? undefined : agents.get(sessionId) } catch (error) { agent = undefined }
+              const agent = idleAgent()
               if (agent !== undefined) {
                 answerPermission(run, agent, stateOf(sessionId), message, idleSignal)
               }
             }
             return
           }
+          // Parented stream (a subagent working while the main agent is idle)
+          // feeds the mirror children just as it does inside a turn.
+          if (message.type === 'assistant' && parent !== null) {
+            mirrorParentedAssistant(run, parent, message.message || {})
+            return
+          }
+          if (message.type === 'user' && parent !== null) {
+            mirrorParentedResult(run, parent, message.message || {})
+            return
+          }
           if (message.type !== 'result') return
-          await projectIdleStretch(sessionId, run, notice, message.ccmodeOffset)
-          notice = ''
+          await projectIdleStretch(sessionId, run, message.ccmodeOffset)
         }
 
         try {
@@ -2839,7 +3613,7 @@ return {
           // (the projection answers its own unanswered calls) and the queue is
           // cleared, leaving the incoming turn a clean stream.
           if (relieved && run.idleExpired !== true) {
-            try { await projectIdleStretch(sessionId, run, notice) } catch (error) {
+            try { await projectIdleStretch(sessionId, run) } catch (error) {
               console.error('cc-mode: could not project the interrupted round:', errorText(error))
             }
             run.queue.length = 0
@@ -2885,11 +3659,12 @@ return {
       followInFlight.add(sessionId)
       const work = (async () => {
         const dir = sessionDir(sessionId)
-        const meta = await readJsonFile(dir + '/meta.json')
+        const remote = remoteOf(state)
+        const meta = await readJsonFile(dir + '/meta.json', remote)
         if (meta === null) return false
-        const exited = await readJsonFile(dir + '/exit.json')
+        const exited = await readJsonFile(dir + '/exit.json', remote)
         if (exited !== null) return false
-        if (!(await isAlive(meta.brokerPid))) return false
+        if (!(await isAlive(meta.brokerPid, remote))) return false
         // Launched under different settings: leave it to the next turn's
         // ensureRun, which knows how to retire and replace a process.
         const snapshot = launchSnapshot(state)
@@ -2898,11 +3673,11 @@ return {
         // this was reading files, and two readers on one queue lose messages.
         if (runs.has(sessionId) || activeTurns.has(sessionId)) return false
 
-        const attachState = await readJsonFile(dir + '/attach.json')
+        const attachState = await readJsonFile(dir + '/attach.json', remote)
         const offset = attachState !== null && typeof attachState.offset === 'number'
           ? attachState.offset
-          : await fileSize(dir + '/out.log')
-        const run = createRun(sessionId, dir, snapshot, meta.claudeSessionId)
+          : await fileSize(dir + '/out.log', remote)
+        const run = createRun(sessionId, dir, snapshot, meta.claudeSessionId, remote)
         run.brokerPid = meta.brokerPid
         run.cwd = meta.cwd || (session.header ? session.header.cwd : '')
         run.offset = offset
@@ -3038,7 +3813,7 @@ return {
       let step = lastStep
       let stepOpen = false
       const append = (type, data) => session.append(type, data,
-        type === 'user/message' || type === 'assistant/message' || type === 'tool/result' ? { surfaceOp: 'append' } : undefined)
+        SURFACE_EVENT_TYPES.has(type) ? { surfaceOp: 'append' } : undefined)
       const closeStep = () => { if (stepOpen) { append('step/end', { turn: turn, step: step }); stepOpen = false } }
       const openStep = () => {
         closeStep()
@@ -3162,16 +3937,17 @@ return {
       const path = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd)) + '/' + shellQuote(claudeSessionId + '.jsonl')
       // Size BEFORE reading: whatever lands after this snapshot is the live
       // sync's business, never lost between the two.
-      const sizeAtImport = await fileSizeOfShellWord(path)
-      const raw = await runCapture(['/bin/sh', '-c',
-        'grep -E \'"type":"(user|assistant)"\' ' + path + ' 2>/dev/null'], 120000)
+      const remote = remoteOf(stateOf(sessionId))
+      const sizeAtImport = await fileSizeOfShellWord(path, remote)
+      const raw = await runCapture(shArgv(
+        'grep -E \'"type":"(user|assistant)"\' ' + path + ' 2>/dev/null', remote), 120000)
 
       const rows = []
       for (const line of String(raw).split('\n')) {
         if (line.trim().length === 0) continue
         let event = null
         try { event = JSON.parse(line) } catch (error) { continue }
-        if (event.isSidechain === true || event.isReplay === true) continue
+        if (event.isSidechain === true || event.isReplay === true || machineryRow(event)) continue
         if (event.message === null || event.message === undefined) continue
         rows.push(event)
       }
@@ -3180,9 +3956,9 @@ return {
       // 「Claude 默认」) even though its transcript says otherwise — and the
       // next turn would then run under a posture the user never chose.
       const state0 = stateOf(sessionId, session)
-      const settings = await runCapture(['/bin/sh', '-c',
+      const settings = await runCapture(shArgv(
         'grep -o \'"permissionMode":"[a-zA-Z]*"\' ' + path + ' 2>/dev/null | tail -1; '
-        + 'grep -o \'"model":"[^"]*"\' ' + path + ' 2>/dev/null | tail -1'], 20000)
+        + 'grep -o \'"model":"[^"]*"\' ' + path + ' 2>/dev/null | tail -1', remote), 20000)
       const posture = (String(settings).match(/"permissionMode":"([a-zA-Z]+)"/) || [])[1]
       const model = (String(settings).match(/"model":"([^"]+)"/) || [])[1]
       if (posture !== undefined && PERMISSION_MODES.some((entry) => entry.id === posture)) {
@@ -3211,8 +3987,8 @@ return {
       // outcome the fallback used to produce.
       try {
         let text = ''
-        const titled = await runCapture(['/bin/sh', '-c',
-          'grep -E \'"type":"(ai-title|custom-title)"\' ' + path + ' 2>/dev/null | tail -5'], 8000)
+        const titled = await runCapture(shArgv(
+          'grep -E \'"type":"(ai-title|custom-title)"\' ' + path + ' 2>/dev/null | tail -5', remote), 8000)
         for (const line of String(titled).split('\n')) {
           if (line.trim().length === 0) continue
           let event = null
@@ -3252,10 +4028,10 @@ return {
      * user said). Names stay as Claude reports them — the same title a live tool
      * row carries.
      */
-    async function previewClaudeConversation(cwd, claudeSessionId, limit) {
+    async function previewClaudeConversation(cwd, claudeSessionId, limit, remote) {
       const path = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd)) + '/' + shellQuote(claudeSessionId + '.jsonl')
-      const raw = await runCapture(['/bin/sh', '-c',
-        'grep -E \'"type":"(user|assistant)"\' ' + path + ' 2>/dev/null | tail -' + (limit || 60)], 15000)
+      const raw = await runCapture(shArgv(
+        'grep -E \'"type":"(user|assistant)"\' ' + path + ' 2>/dev/null | tail -' + (limit || 60), remote), 15000)
 
       const items = []
       const byCallId = new Map()
@@ -3263,7 +4039,7 @@ return {
         if (line.trim().length === 0) continue
         let event = null
         try { event = JSON.parse(line) } catch (error) { continue }
-        if (event.isSidechain === true || event.isReplay === true) continue
+        if (event.isSidechain === true || event.isReplay === true || machineryRow(event)) continue
         const message = event.message
         if (message === null || message === undefined) continue
         const content = typeof message.content === 'string'
@@ -3356,6 +4132,30 @@ return {
     }
 
     /**
+     * Route a supervised Claude child's question to its parent conversation
+     * through the agent-mesh control, when this session is a managed child. The
+     * mesh parks the question for the parent (the same surface a parent answers
+     * an approval on) and resolves with the chosen answers keyed by question
+     * text. Returns `{ answered, answers }`, or null when the mesh is not
+     * composed — in which case the caller falls back to the human question card.
+     * @param agent 发起这次 AskUserQuestion 的 dsh agent。
+     * @param items dsh 题目数组（含稳定 id 与题面）。
+     * @param signal 本轮的中断信号。
+     */
+    async function meshRouteQuestion(agent, items, signal) {
+      const control = ctx.get('multiagentControl')
+      if (control === undefined || typeof control.answerQuestion !== 'function') return null
+      const childId = agent === undefined || agent.session === undefined ? '' : agent.session.id
+      if (childId === '') return null
+      try {
+        return await control.answerQuestion(childId, items, signal)
+      } catch (error) {
+        console.error('cc-mode: routing a question to the parent failed:', errorText(error))
+        return null
+      }
+    }
+
+    /**
      * dsh 的答案 → Claude 的 `updatedInput.answers`。Claude 按**题面文本**取键、
      * 值是一个字符串，所以多选把选中的标签连起来，「其他」的自由文本也拼在后面
      * ——实测自由文本能原样送达（CLI 会说 "The user answered ..."）。
@@ -3395,6 +4195,18 @@ return {
     async function answerUserQuestion(respond, request, agent, signal) {
       const items = dshQuestionsOf(request.input)
       if (items.length === 0) { respond('allow'); return }
+      // If this Claude conversation is a supervised child of another
+      // conversation, its question belongs to that PARENT, not the human at
+      // this UI — the parent opened it and is the one waiting to hear from it.
+      // The mesh returns answers already keyed by question text (the shape the
+      // CLI wants back); a child nobody supervises resolves `answered:false`
+      // and falls through to dsh's own question card below.
+      const routed = await meshRouteQuestion(agent, items, signal)
+      if (routed !== null && routed.answered === true) {
+        console.log('cc-mode: a supervised child\'s question was answered by its parent')
+        respond('allow', undefined, { ...request.input, answers: routed.answers })
+        return
+      }
       console.log('cc-mode: asking dsh to answer', items.length, 'question(s)')
       let answers = {}
       try {
@@ -3456,6 +4268,40 @@ return {
      * @param signal 本轮的中断信号。
      */
     async function answerPlanReview(respond, request, run, agent, state, signal) {
+      // A supervised child's plan review is the parent's call, not the human's.
+      // Route it as one question carrying the plan; the parent picks Approve or
+      // sends feedback, which maps to leave-plan-mode / keep-planning exactly as
+      // the human card does. A child nobody supervises falls through to the
+      // native plan-review card below.
+      const routed = await meshRouteQuestion(agent, [{
+        id: PLAN_REVIEW_ID,
+        header: 'Plan review',
+        question: 'Approve this plan and leave plan mode? Pick “' + PLAN_APPROVE_LABEL
+          + '” to approve, or reply with feedback to keep planning.\n\n--- PLAN ---\n' + String(request.input.plan),
+        options: [
+          { label: PLAN_APPROVE_LABEL, description: 'Leave plan mode; the plan is carried out from the next step.' },
+          { label: PLAN_KEEP_LABEL, description: 'Stay in plan mode; feedback goes back to the model.' },
+        ],
+        multiSelect: false,
+      }], signal)
+      if (routed !== null && routed.answered === true) {
+        const chosen = String((routed.answers && routed.answers[Object.keys(routed.answers)[0]]) || '').trim()
+        const approvedByParent = chosen === PLAN_APPROVE_LABEL
+        if (!approvedByParent) {
+          respond('deny', chosen === '' || chosen === PLAN_KEEP_LABEL
+            ? 'The parent chose to keep planning; revise the plan and present it again.'
+            : 'The parent chose to keep planning; their feedback: ' + chosen)
+          return
+        }
+        if (state.permissionMode === 'plan') {
+          state.permissionMode = 'manual'
+          applySupervision(run.sessionId, state)
+          persistStates()
+          console.log('cc-mode: plan approved by parent — posture plan -> manual')
+        }
+        respond('allow')
+        return
+      }
       console.log('cc-mode: asking dsh to review the plan')
       let answer
       try {
@@ -3671,6 +4517,395 @@ return {
           content: resultBlocksOf(block.content),
         })
       }
+    }
+
+    // ---------- dsh-native mirror of Claude Code background work ----------
+    //
+    // Claude Code reports background work (the Agent/Task tools, detached Bash,
+    // Monitor) through `task_started` / `task_notification` system events. This
+    // mirror publishes those facts in dsh's native vocabulary, so the jobs list
+    // and the subagent catalog that dsh-better-sidebar and the native UI draw
+    // from show them the way they show dsh's own:
+    //
+    //   * every task becomes a `ctx.jobs` row (kind `claude-task`), settled by
+    //     its notification — the 后台任务 section;
+    //   * an Agent/Task tool call additionally becomes a real subagent child
+    //     session (header origin `subagent` under this conversation), fed the
+    //     parented stream and finalized by the task notification — the
+    //     subagent cards.
+    //
+    // Nothing about a task is written into the conversation itself. It used to
+    // be — ⚙ notes, from before this mirror existed — and with both native
+    // surfaces live that was a third copy of the same fact, interrupting the
+    // transcript with ids nobody reads. A child mirrors the parented stream
+    // event for event (`step/start` → `assistant/message` → `tool/call` →
+    // `tool/result` → `step/end`), because that is what dsh's tool cards are
+    // built from: the card node starts at a `tool/call`, and a result without
+    // one cannot even name its tool, let alone pick a renderer for it.
+
+    /** First line of a possibly multi-line description — the jobs label. */
+    function firstLineOf(text) {
+      const cut = text.indexOf('\n')
+      return cut < 0 ? text : text.slice(0, cut)
+    }
+
+    /** One-line job label for a task event, truncated for the row. */
+    function ccTaskLabel(message, fallback) {
+      const text = typeof message.description === 'string' && message.description.length > 0
+        ? message.description
+        : String(fallback || message.task_id || message.subagent_type || message.task_type || 'claude task')
+      return firstLineOf(text).slice(0, 200)
+    }
+
+    /**
+     * Create the subagent child session mirroring one Agent/Task tool call.
+     * The child is a real dsh session with `origin: 'subagent'` under this
+     * conversation, stamped with a one-shot descriptor, so the subagent
+     * catalog (native header popover and the sidebar Subagent page) lists it
+     * and its transcript can be opened. Returns the record or null on any
+     * failure — the mirror must never take the turn down with it.
+     */
+    function spawnCcSubagent(run, mainSession, toolCallId, description) {
+      if (sessionsStore === undefined) return null
+      if (toolCallId.length === 0 || run.ccSubagents.has(toolCallId)) return null
+      let child = null
+      let detach = null
+      try {
+        const header = mainSession.header || {}
+        child = sessionsStore.prepare('session-' + uuid(), {
+          meta: {
+            origin: 'subagent',
+            parentSession: String(mainSession.id),
+            ...(typeof header.cwd === 'string' ? { cwd: header.cwd } : {}),
+            delegationDepth: 1,
+          },
+        })
+        detach = sessionsStore.enter(child)
+        sessionsStore.announce(child)
+      } catch (error) {
+        console.error('cc-mode: 子会话镜像建立失败:', errorText(error))
+        return null
+      }
+      // Durable identity: a terminal one-shot child, labeled by the delegation
+      // description (the text the subagent cards show).
+      try {
+        child.append('subagent/descriptor', {
+          version: 2,
+          mode: 'one-shot',
+          provider: 'claude-code',
+          ...(description.length > 0 ? { label: description.slice(0, 200) } : {}),
+        })
+      } catch (error) {
+        console.error('cc-mode: 子会话 descriptor 写入失败:', errorText(error))
+      }
+      // Open one turn so the session is not perceived as blank (a session with
+      // no turn/start is hidden from some list baselines and never shown as a
+      // real conversation); the closing edge lands in finalizeCcSubagent.
+      try {
+        child.append('turn/start', { turn: 1 })
+      } catch (error) { /* best effort */ }
+      const record = {
+        parentCallId: toolCallId,
+        child: child,
+        detach: detach,
+        label: firstLineOf(description).slice(0, 200),
+        step: 0,
+        stepOpen: false,
+        // Calls announced in this child and the step each was announced in, so
+        // finalize can answer whatever the run never got a result for — an
+        // unanswered tool/call leaves its card spinning forever.
+        pending: new Map(),
+        answered: new Set(),
+        // The last text the subagent itself produced. The task notification
+        // repeats it verbatim as the report, and appending it again gave every
+        // finished child two identical final messages.
+        lastText: '',
+        finalized: false,
+      }
+      run.ccSubagents.set(toolCallId, record)
+      return record
+    }
+
+    /** Scan a main-level assistant message for Agent/Task tool calls to mirror. */
+    function spawnCcSubagentsFrom(run, mainSession, message) {
+      for (const block of (message.content || [])) {
+        if (block.type !== 'tool_use' && block.type !== 'server_tool_use' && block.type !== 'mcp_tool_use') continue
+        const name = block.name || ''
+        if (name !== 'Agent' && name !== 'Task') continue
+        const description = block.input !== null && typeof block.input === 'object'
+          && typeof block.input.description === 'string'
+          ? block.input.description
+          : ''
+        spawnCcSubagent(run, mainSession, String(block.id || ''), description)
+      }
+    }
+
+    /**
+     * Append one event to a mirror child, never throwing into the turn.
+     *
+     * The surface marker is not decoration and not optional: dsh requires it on
+     * the three message-producing events and REJECTS it on every other type
+     * ("is not surface-eligible and cannot carry surfaceOp"). Stamping it on
+     * everything is why `tool/call` and `turn/end` never reached a single child
+     * — every one of them threw in here and was swallowed, leaving the
+     * subagent transcripts with results whose call was unknown, so no tool card
+     * could be built for them at all.
+     */
+    function ccChildAppend(record, type, data) {
+      try {
+        record.child.append(type, data, SURFACE_EVENT_TYPES.has(type) ? { surfaceOp: 'append' } : undefined)
+      } catch (error) {
+        console.error('cc-mode: 子会话写入失败 (' + type + '):', errorText(error))
+      }
+    }
+
+    /** Close the child's open step, if one is open. */
+    function ccChildCloseStep(record) {
+      if (!record.stepOpen) return
+      ccChildAppend(record, 'step/end', { turn: 1, step: record.step })
+      record.stepOpen = false
+    }
+
+    /** Open the next step of the child's single turn — the main transcript's bracket. */
+    function ccChildStep(record) {
+      ccChildCloseStep(record)
+      record.step += 1
+      ccChildAppend(record, 'step/start', { turn: 1, step: record.step })
+      record.stepOpen = true
+      return record.step
+    }
+
+    /** Mirror one parented assistant message (text + tool calls) into its child. */
+    function mirrorParentedAssistant(run, parent, message) {
+      const record = run.ccSubagents.get(parent)
+      if (record === undefined || record.finalized) return
+      const blocks = assistantBlocksOf(message.content)
+      if (blocks.length === 0) return
+      const step = ccChildStep(record)
+      ccChildAppend(record, 'assistant/message', {
+        turn: 1,
+        step: step,
+        message: {
+          id: uuid(),
+          role: 'assistant',
+          content: blocks,
+          source: { kind: 'model', provider: PROVIDER, model: typeof message.model === 'string' ? message.model : 'claude-code' },
+        },
+      })
+      const text = blocks.filter((block) => block.type === 'text').map((block) => block.text).join('\n\n').trim()
+      if (text.length > 0) record.lastText = text
+      for (const block of blocks) {
+        if (block.type !== 'tool-call') continue
+        ccChildAppend(record, 'tool/call', {
+          turn: 1,
+          step: step,
+          callId: block.id,
+          name: block.name,
+          arguments: block.arguments,
+        })
+        record.pending.set(block.id, step)
+      }
+    }
+
+    /** Mirror one parented tool-result message into its child. */
+    function mirrorParentedResult(run, parent, message) {
+      const record = run.ccSubagents.get(parent)
+      if (record === undefined || record.finalized) return
+      if (typeof message.content === 'string') return
+      for (const block of (message.content || [])) {
+        if (block.type !== 'tool_result') continue
+        const subCallId = String(block.tool_use_id || '')
+        // One result per call, whoever writes it: the CLI re-sends a finished
+        // result inside the complete tool_result array, and dsh's chat node
+        // treats a second result for one call as a protocol error.
+        if (record.answered.has(subCallId)) continue
+        record.answered.add(subCallId)
+        record.pending.delete(subCallId)
+        ccChildAppend(record, 'tool/result', {
+          turn: 1,
+          step: record.stepOpen ? record.step : ccChildStep(record),
+          message: {
+            id: uuid(),
+            role: 'user',
+            source: { kind: 'tool', callId: subCallId },
+            content: [{
+              type: 'tool-result',
+              toolCallId: subCallId,
+              content: resultBlocksOf(block.content),
+              isError: block.is_error === true,
+            }],
+          },
+        })
+      }
+    }
+
+    /**
+     * The single pending subagent child whose label equals the task's, or
+     * undefined when none or several match. The label is the delegation
+     * description, which `task_started` echoes for Agent/Task tasks.
+     */
+    function findCcSubagentByLabel(run, label) {
+      if (label.length === 0) return undefined
+      let found = undefined
+      for (const record of run.ccSubagents.values()) {
+        if (record.finalized) continue
+        if (record.label !== label) continue
+        if (found !== undefined) return undefined
+        found = record
+      }
+      return found
+    }
+
+    /** Record one `task_started`: link an Agent child, or open a jobs row. */
+    function ccTaskStarted(run, agent, message) {
+      // The Agent/Task tool call is already mirrored as a pending child: this
+      // task IS that subagent. Link it by task id so its notification can
+      // finalize the child, and open no job row — the subagent card covers it.
+      const linked = findCcSubagentByLabel(run, ccTaskLabel(message, message.subagent_type || 'agent'))
+      if (linked !== undefined) {
+        run.ccTasks.set(String(message.task_id || ''), { child: linked })
+        return
+      }
+      if (jobs === undefined || agent === undefined) return
+      const taskId = typeof message.task_id === 'string' && message.task_id.length > 0 ? message.task_id : null
+      if (taskId === null) return
+      // One entry object shared by the job hooks and the notification settle
+      // path, so readOutput sees the latest summary (it is never a bare local).
+      const entry = {
+        job: null,
+        settle: null,
+        label: ccTaskLabel(message, 'claude task'),
+        summary: '',
+      }
+      const done = new Promise((resolve) => { entry.settle = resolve })
+      try {
+        entry.job = jobs.start({
+          kind: 'claude-task',
+          label: entry.label,
+          owner: agent,
+          run: () => ({
+            cancel: () => {
+              // Best-effort: ask the running CLI to stop the task. The broker
+              // is per-session, so this resolves through the live run.
+              const live = runs.get(String(agent.id))
+              if (live !== undefined) {
+                try { live.control({ subtype: 'stop_task', task_id: taskId }) } catch (error) { /* best effort */ }
+              }
+            },
+            done: done,
+            readOutput: () => entry.summary,
+          }),
+        })
+      } catch (error) {
+        console.error('cc-mode: 后台任务入账失败:', errorText(error))
+        return
+      }
+      // Park a waiter so the settlement snapshot arrives `reported` and the
+      // shared tool-jobs completion notice stays away: the task_notification
+      // already wakes Claude's own round, and a second, dsh-side "job
+      // finished" user message would steer a duplicate turn into the product.
+      try { void jobs.wait(entry.job, 24 * 3600 * 1000, agent).catch(() => undefined) } catch (error) { /* best effort */ }
+      run.ccTasks.set(taskId, entry)
+    }
+
+    /**
+     * Close one subagent child: answer whatever is still open, append the
+     * report, close the turn, then release the session. `reason` is how the
+     * turn ended — a task notification completes it, a dying run interrupts it.
+     */
+    function finalizeCcSubagent(run, record, summary, reason) {
+      if (record.finalized) return
+      record.finalized = true
+      // A call with no result keeps its card spinning for good, and the child
+      // is durable — so the same interrupted result the main transcript writes.
+      for (const entry of record.pending) {
+        const callId = entry[0]
+        record.answered.add(callId)
+        ccChildAppend(record, 'tool/result', {
+          turn: 1,
+          step: record.stepOpen ? record.step : entry[1],
+          message: {
+            id: uuid(),
+            role: 'user',
+            source: { kind: 'tool', callId: callId },
+            content: [{
+              type: 'tool-result',
+              toolCallId: callId,
+              content: [{ type: 'text', text: '这次调用没有等到结果（子代理的这一轮被中断）。' }],
+              isError: true,
+            }],
+          },
+        })
+      }
+      record.pending.clear()
+      // The notification's summary IS the subagent's last message; appending it
+      // again is how every finished child ended with the report printed twice.
+      if (summary.length > 0 && summary !== record.lastText) {
+        ccChildAppend(record, 'assistant/message', {
+          turn: 1,
+          step: ccChildStep(record),
+          message: {
+            id: uuid(),
+            role: 'assistant',
+            content: [{ type: 'text', text: summary.slice(0, 4000) }],
+            source: { kind: 'model', provider: PROVIDER, model: '<synthetic>' },
+          },
+        })
+      }
+      ccChildCloseStep(record)
+      ccChildAppend(record, 'turn/end', { turn: 1, reason: reason || { kind: 'completed' } })
+      try { record.detach() } catch (error) {
+        console.error('cc-mode: 子会话收尾失败:', errorText(error))
+      }
+      run.ccSubagents.delete(record.parentCallId)
+    }
+
+    /** Settle one `task_notification`: close the linked job and/or child. */
+    function ccTaskNotification(run, agent, message) {
+      const taskId = typeof message.task_id === 'string' ? message.task_id : ''
+      const summary = typeof message.summary === 'string' ? message.summary.trim() : ''
+      const entry = taskId.length > 0 ? run.ccTasks.get(taskId) : undefined
+      if (entry !== undefined) {
+        if (entry.summary !== undefined) entry.summary = summary
+        if (entry.settle !== undefined) {
+          try {
+            entry.settle({
+              status: 'completed',
+              detail: 'exit code 0',
+              ...(summary.length > 0 ? { output: summary } : {}),
+            })
+          } catch (error) { /* best effort */ }
+        }
+        if (entry.child !== undefined) finalizeCcSubagent(run, entry.child, summary)
+        run.ccTasks.delete(taskId)
+        return
+      }
+      // A notification whose task_started was missed (re-attach, replay): fold
+      // the report into the sole pending child, if exactly one is running.
+      if (summary.length > 0) {
+        let pending = 0
+        let only = undefined
+        for (const record of run.ccSubagents.values()) {
+          if (record.finalized) continue
+          pending += 1
+          only = record
+        }
+        if (pending === 1 && only !== undefined) finalizeCcSubagent(run, only, summary)
+      }
+    }
+
+    /**
+     * Release the mirror when its run ends (see detachInner). A child left
+     * mid-turn stays that way on disk — it is a durable session — so each one
+     * is closed as interrupted rather than merely detached.
+     */
+    function cleanupCcMirror(run) {
+      for (const record of Array.from(run.ccSubagents.values())) {
+        if (record.finalized) continue
+        finalizeCcSubagent(run, record, '', { kind: 'interrupted' })
+      }
+      run.ccSubagents.clear()
+      run.ccTasks.clear()
     }
 
     // ---------- one hijacked turn ----------
@@ -3905,6 +5140,8 @@ return {
       // Where this turn's `result` sits in out.log, so the reader that takes
       // over between turns knows exactly where its first stretch begins.
       let roundEndsAt
+      // How many times this turn was resumed after waiting out a usage limit.
+      let continues = 0
       const onAbort = () => {
         if (interrupted) return
         interrupted = true
@@ -3932,7 +5169,9 @@ return {
       try {
         // Terminal Claude records every typed prompt here; a -p session does not,
         // and that index is exactly what `claude --resume` lists.
-        recordPromptHistory(cwd, run.claudeSessionId, typedTextOf(messages) || prompt)
+        // The index row must name the directory the PROCESS opened; the dsh
+        // workspace path would be a row `--resume` can never match.
+        recordPromptHistory(run.cwd || cwd, run.claudeSessionId, typedTextOf(messages) || prompt, run.remote)
 
         const promptContent = []
         if (prompt.length > 0) promptContent.push({ type: 'text', text: prompt })
@@ -3966,7 +5205,7 @@ return {
             console.error(ignoredInterrupt
               ? 'cc-mode: 中断后 10 秒没有收到 result，松开这一轮（Claude 进程保留）'
               : 'cc-mode: 提交后 120 秒没有任何回应，判定输入没有送达；保留进程并松开这一轮')
-            runCapture(['/bin/sh', '-c', 'rm -f ' + shellQuote(run.dir + '/attach.json')], 3000).catch(() => undefined)
+            runCapture(shArgv('rm -f ' + shellQuote(run.dir + '/attach.json'), run.remote), 3000).catch(() => undefined)
             detach(sessionId, false)
           })
         }, 2000)
@@ -3989,7 +5228,7 @@ return {
           if (message.type === 'system') {
             if (message.subtype === 'init') {
               run.init = message
-              rememberCommands(message.slash_commands)
+              rememberCommands(message.slash_commands, run.remote)
               run.claudeSessionId = message.session_id || run.claudeSessionId
               if (state.claudeSessionId !== run.claudeSessionId) {
                 state.claudeSessionId = run.claudeSessionId
@@ -4003,23 +5242,17 @@ return {
             }
             // Background work (the Agent tool runs in the background by
             // default now; detached Bash and Monitor report the same way).
-            // waku renders these as live work items; here the transcript gets
-            // an honest note — otherwise the model's later reply to a task
-            // notification reads as an answer to nothing.
+            // These used to also leave ⚙ notes in the transcript, from before
+            // the mirror existed. They do not any more: a task is a `ctx.jobs`
+            // row and an Agent task is a subagent child session, and both have
+            // their own native surface (the jobs list, the subagent catalog,
+            // and dsh-better-sidebar's pages over them). The note was a third
+            // copy of the same fact, sitting in the middle of the conversation.
             if (message.subtype === 'task_started' && parent === null) {
-              const what = typeof message.description === 'string' && message.description.length > 0
-                ? message.description
-                : String(message.subagent_type || message.task_type || 'task')
-              transcript.note('⚙ 后台任务启动：' + what
-                + (typeof message.task_id === 'string' && message.task_id.length > 0 ? '（' + message.task_id + '）' : ''))
+              ccTaskStarted(run, agent, message)
             }
             if (message.subtype === 'task_notification' && parent === null) {
-              const what = typeof message.description === 'string' && message.description.length > 0
-                ? message.description
-                : String(message.task_id || 'task')
-              const summary = typeof message.summary === 'string' ? message.summary.trim() : ''
-              transcript.note('⚙ 后台任务通知：' + what
-                + (summary.length > 0 ? '\n\n' + summary.slice(0, 4000) : ''))
+              ccTaskNotification(run, agent, message)
             }
             // Auto-compaction happens mid-turn and takes tens of seconds. The
             // terminal says so; without this dsh just went quiet and then
@@ -4053,15 +5286,20 @@ return {
             if (parent === null) {
               const calls = transcript.assistantMessage(message.message || {})
               for (const call of calls) run.mainCalls.add(call.id)
+              spawnCcSubagentsFrom(run, session, message.message || {})
             } else {
               subagentAssistant(session, run, parent, message.message || {})
+              mirrorParentedAssistant(run, parent, message.message || {})
             }
             continue
           }
           if (message.type === 'user') {
-            if (message.isReplay === true) continue
+            if (message.isReplay === true || machineryRow(message)) continue
             if (parent === null) transcript.toolResults(message.message || {})
-            else subagentResults(session, run, parent, message.message || {})
+            else {
+              subagentResults(session, run, parent, message.message || {})
+              mirrorParentedResult(run, parent, message.message || {})
+            }
             continue
           }
           if (message.type === 'result') {
@@ -4078,7 +5316,24 @@ return {
               const detail = typeof message.result === 'string' && message.result.length > 0
                 ? message.result
                 : String(message.subtype || 'error')
-              transcript.note('⚠ Claude Code 报错：' + detail)
+              // Running out of subscription quota is not an error to report and
+              // forget — Claude's own TUI waits the window out and picks the
+              // task back up. So does this, in the same turn. Everything else
+              // still reads as the error it is.
+              const spent = await quotaLimitHit(run.remote)
+              if (spent !== null && continues >= QUOTA_MAX_CONTINUES) {
+                transcript.note('⚠ 又一次撞上用量上限（' + spent.label + '）· 这一轮已自动续跑 '
+                  + continues + ' 次，到此为止')
+              } else if (spent !== null) {
+                continues += 1
+                console.log('cc-mode: quota limit on', sessionId, '— holding turn', turn,
+                  'until', new Date(spent.at).toISOString())
+                // The wait leaves its own note either way; a turn that resumes
+                // keeps reading this very stream.
+                if (await waitOutQuota(sessionId, transcript, run, spent, signal)) continue
+              } else {
+                transcript.note('⚠ Claude Code 报错：' + detail)
+              }
             }
             roundEndsAt = message.ccmodeOffset
             return
@@ -4202,6 +5457,17 @@ return {
           source: { type: 'base64', media_type: image.mediaType, data: image.data },
         }))
         if (text.length > 0) content.push({ type: 'text', text: text })
+        // A turn held for the usage limit keeps waiting. Writing this now would
+        // send Claude straight back into the limit, and its error result would
+        // then be read as the end of the resumed round — so the message waits
+        // with the turn and rides the continuation out.
+        const waiting = quotaWaits.get(sessionId)
+        if (waiting !== undefined) {
+          waiting.held.push(content)
+          safely('quota wait note', () => waiting.note('⏸ 正在等用量重置 —— 这条消息会在恢复后一起发给 Claude'))
+          console.log('cc-mode: held a message on', sessionId, 'until the usage limit resets')
+          continue
+        }
         try {
           active.run.write({
             type: 'user',
@@ -4257,6 +5523,25 @@ return {
 
     // ---------- Package-private RPC for the Client half ----------
 
+    /**
+     * Whether this conversation is pinned to the machine it already ran on.
+     *
+     * A Claude conversation is its transcript, and that file lives on ONE
+     * machine — the same reason the engine itself cannot be switched after a
+     * turn. Moving the target afterwards would open a blank conversation
+     * behind an unchanged dsh transcript, so once there is a Claude session
+     * id the target is fixed.
+     */
+    function remoteLockedFor(state) {
+      return typeof state.claudeSessionId === 'string' && state.claudeSessionId.length > 0
+    }
+
+    /** The targets a picker offers: this machine first, then each declared one. */
+    function remoteIndex() {
+      return [{ id: '', label: '本机' }].concat(
+        [...REMOTES.values()].map((remote) => ({ id: remote.id, label: remote.label, host: remote.host })))
+    }
+
     function publicState(sessionId) {
       const session = sessionOf(sessionId)
       const state = stateOf(sessionId, session)
@@ -4264,6 +5549,12 @@ return {
       const committed = committedEngine(session)
       return {
         mode: state.mode,
+        // '' is this machine. Paired with `remoteLocked`, which says the
+        // conversation can no longer move: its Claude transcript and broker
+        // live on one machine, so re-homing it would strand both.
+        remote: typeof state.remote === 'string' ? state.remote : '',
+        remoteCwd: typeof state.remoteCwd === 'string' ? state.remoteCwd : '',
+        remoteLocked: remoteLockedFor(state),
         permissionMode: state.permissionMode,
         model: state.model,
         // What the process actually runs (from its init handshake) — shown
@@ -4277,6 +5568,9 @@ return {
           ? run.claudeSessionId
           : (state.claudeSessionId || null),
         approvalAvailable: approval !== undefined,
+        // Set while a turn is held waiting for the subscription window to
+        // reset; the composer counts it down and offers the cancel.
+        quotaWait: quotaWaitOf(sessionId),
         // Once a session has taken a turn it belongs to that engine for good.
         committed: committed === undefined ? null : committed,
         locked: committed !== undefined,
@@ -4335,13 +5629,13 @@ return {
             } else {
               // No broker log (a conversation imported but never run here):
               // the Claude transcript records both the model and the posture.
-              const cwd = session !== undefined && session.header ? session.header.cwd : ''
+              const cwd = projectCwd(sessionId, session) || ''
               if (typeof cwd === 'string' && cwd.length > 0) {
                 const path = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd)) + '/'
                   + shellQuote(state.claudeSessionId + '.jsonl')
-                const settings = await runCapture(['/bin/sh', '-c',
+                const settings = await runCapture(shArgv(
                   'grep -o \'"permissionMode":"[a-zA-Z]*"\' ' + path + ' 2>/dev/null | tail -1; '
-                  + 'grep -o \'"model":"[^"]*"\' ' + path + ' 2>/dev/null | tail -1'], 20000)
+                  + 'grep -o \'"model":"[^"]*"\' ' + path + ' 2>/dev/null | tail -1', remoteOf(state)), 20000)
                 const posture = (String(settings).match(/"permissionMode":"([a-zA-Z]+)"/) || [])[1]
                 const model = (String(settings).match(/"model":"([^"]+)"/) || [])[1]
                 let changed = false
@@ -4368,6 +5662,19 @@ return {
         return publicState(sessionId)
       }),
 
+      // Cheap enough for the composer to ask on a short beat: a map lookup,
+      // no process, no network. `state.get` cannot serve this — it drains and
+      // repairs, and a Claude session stops polling it once it is locked.
+      harness.handle('quota.state', (args) => ({
+        wait: quotaWaitOf(String(args.sessionId || '')),
+      })),
+
+      // The composer's own cancel on the waiting chip. Stop works too — this
+      // one only lets go of the wait and keeps the Claude process.
+      harness.handle('quota.cancel', (args) => ({
+        cancelled: cancelQuotaWait(String(args.sessionId || ''), 'cancelled'),
+      })),
+
       harness.handle('mode.set', (args) => {
         const sessionId = String(args.sessionId || '')
         const session = sessionOf(sessionId)
@@ -4380,6 +5687,28 @@ return {
           console.log('cc-mode: refusing to switch', sessionId, 'to', wanted, '— already a', committed, 'conversation')
           state.mode = committed
           return publicState(sessionId)
+        }
+        // Applied before the mode so a switch to DSH still stops the broker on
+        // the machine it is actually running on.
+        if (typeof args.remote === 'string' && args.remote !== (state.remote || '')) {
+          if (remoteLockedFor(state)) {
+            console.log('cc-mode: refusing to move', sessionId, 'to', args.remote || 'this machine',
+              '— it already has a Claude conversation on', state.remote || 'this machine')
+          } else if (args.remote !== '' && REMOTES.get(args.remote) === undefined) {
+            console.error('cc-mode: no SSH target named "' + args.remote + '"')
+          } else if (state.mode === 'claude') {
+            // Not yet committed, but a broker may already be up on the old
+            // machine from a conversation that never took a turn.
+            stopRun(sessionId).catch(() => undefined)
+            state.remote = args.remote
+          } else {
+            state.remote = args.remote
+          }
+        }
+        // Same lock as the target itself: the conversation's transcript is
+        // filed under its project directory, so moving it strands the history.
+        if (typeof args.remoteCwd === 'string' && !remoteLockedFor(state)) {
+          state.remoteCwd = args.remoteCwd.trim()
         }
         state.mode = wanted
         if (state.mode === 'dsh') {
@@ -4463,8 +5792,79 @@ return {
 
       harness.handle('engines', () => ({ engines: engineIndex() })),
 
-      harness.handle('commands', () => {
-        const names = claudeCommands()
+      harness.handle('remotes', () => ({ remotes: remoteIndex() })),
+
+      /**
+       * One level of directories on a target, for the working-directory
+       * picker. `pwd` comes back with the listing because the shell is what
+       * canonicalises the path — the client must never join or normalise a
+       * path itself, least of all for a filesystem it cannot see.
+       */
+      /**
+       * Point one conversation at a directory on its target.
+       *
+       * Its own verb rather than a `mode.set` with an extra field: changing a
+       * directory must not drag along a posture re-apply and a header repair.
+       * Pinned once the conversation has a Claude session, for the same reason
+       * the target itself is — the transcript is filed under the project dir.
+       */
+      harness.handle('remote.cwd.set', (args) => {
+        const sessionId = String((args && args.sessionId) || '')
+        const state = stateOf(sessionId, sessionOf(sessionId))
+        const wanted = String((args && args.remoteCwd) || '').trim()
+        if (remoteLockedFor(state)) {
+          console.log('cc-mode: refusing to move', sessionId, '— it already has a Claude conversation in',
+            state.remoteCwd || '（目标的默认目录）')
+        } else if (wanted !== (state.remoteCwd || '')) {
+          state.remoteCwd = wanted
+          rememberDir(remoteOf(state), wanted)
+          persistStates()
+          console.log('cc-mode:', sessionId, 'works in', wanted || '（目标的默认目录）')
+        }
+        return publicState(sessionId)
+      }),
+
+      harness.handle('remote.dirs', async (args) => {
+        const remote = REMOTES.get(String((args && args.remote) || ''))
+        if (remote === undefined) return { ok: false, reason: 'no-remote' }
+        const asked = String((args && args.path) || '').trim()
+        const base = asked.length > 0 ? asked : await remoteCwdOf({}, remote)
+        const raw = await runCapture(shArgv(
+          'cd ' + shellQuote(base) + ' 2>/dev/null || exit 0; pwd; '
+          + 'for d in */ .*/; do case "$d" in ./|../) continue;; esac; '
+          + '[ -d "$d" ] || continue; printf "%s\\n" "${d%/}"; done', remote), 15000)
+        const lines = String(raw).split('\n').map((line) => line.trim()).filter((line) => line.length > 0)
+        if (lines.length === 0) return { ok: false, reason: 'unreadable', path: base }
+        const path = lines[0]
+        return { ok: true, path: path, parent: parentDir(path), dirs: lines.slice(1).sort() }
+      }),
+
+      /**
+       * Create one directory on a target — "新建项目到远端目录" without
+       * leaving the picker. `mkdir -p` so re-picking an existing name is a
+       * no-op rather than an error.
+       */
+      harness.handle('remote.mkdir', async (args) => {
+        const remote = REMOTES.get(String((args && args.remote) || ''))
+        if (remote === undefined) return { ok: false, reason: 'no-remote' }
+        const at = String((args && args.path) || '').trim()
+        const name = String((args && args.name) || '').trim()
+        if (at.length === 0 || name.length === 0 || name.indexOf('/') >= 0 || name === '.' || name === '..') {
+          return { ok: false, reason: 'bad-name' }
+        }
+        const full = (at === '/' ? '' : at) + '/' + name
+        const raw = await runCapture(shArgv(
+          'mkdir -p ' + shellQuote(full) + ' 2>&1 && cd ' + shellQuote(full) + ' && pwd', remote), 15000)
+        const path = String(raw).trim().split('\n').pop()
+        if (typeof path !== 'string' || path.indexOf('/') !== 0) return { ok: false, reason: 'mkdir-failed' }
+        return { ok: true, path: path }
+      }),
+
+      harness.handle('commands', (args) => {
+        const names = claudeCommands(
+          args !== null && args !== undefined && typeof args.sessionId === 'string' && args.sessionId.length > 0
+            ? remoteOf(stateOf(args.sessionId))
+            : browsingRemote(args))
         return { commands: names, oneShot: names.filter((name) => ONE_SHOT_COMMANDS.has(name)) }
       }),
 
@@ -4476,7 +5876,7 @@ return {
           : (session !== undefined && session.header ? session.header.cwd : '')
         const init = await lastHandshake(sessionId)
         if (init === undefined) return { known: false }
-        const scopes = await mcpScopes(cwd)
+        const scopes = await mcpScopes(cwd, remoteOf(stateOf(sessionId)))
         return {
           known: true,
           cwd: init.cwd || cwd,
@@ -4558,17 +5958,17 @@ return {
       harness.handle('claude.conversations', async (args) => {
         const cwd = String(args.cwd || '')
         if (cwd.length === 0) return { conversations: [] }
-        return { conversations: await listClaudeConversations(cwd) }
+        return { conversations: await listClaudeConversations(cwd, browsingRemote(args)) }
       }),
 
       harness.handle('claude.search', async (args) => {
         const cwd = String(args.cwd || '')
         if (cwd.length === 0) return { hits: [] }
-        return searchClaudeConversations(cwd, String(args.query || ''))
+        return searchClaudeConversations(cwd, String(args.query || ''), browsingRemote(args))
       }),
 
       harness.handle('claude.preview', async (args) => previewClaudeConversation(
-        String(args.cwd || ''), String(args.claudeSessionId || ''), 40)),
+        String(args.cwd || ''), String(args.claudeSessionId || ''), 40, browsingRemote(args))),
 
       /** Adopt an existing Claude conversation into this (blank) dsh session. */
       harness.handle('claude.adopt', async (args) => {
@@ -4588,7 +5988,7 @@ return {
         let backfill = { backfilled: 0, skipped: 'session not live' }
         const cwd = typeof args.cwd === 'string' && args.cwd.length > 0
           ? args.cwd
-          : (session !== undefined && session.header ? session.header.cwd : '')
+          : (projectCwd(sessionId, session) || '')
         if (session !== undefined && typeof cwd === 'string' && cwd.length > 0) {
           try {
             backfill = await backfillClaudeTranscript(sessionId, session, cwd, claudeSessionId)
@@ -4632,7 +6032,11 @@ return {
         return { count: list.length }
       }),
 
-      harness.handle('usage', (args) => usageSnapshot(args !== null && args !== undefined && args.force === true)),
+      harness.handle('usage', (args) => usageSnapshot(
+        args !== null && args !== undefined && args.force === true,
+        args !== null && args !== undefined && typeof args.sessionId === 'string' && args.sessionId.length > 0
+          ? remoteOf(stateOf(args.sessionId))
+          : browsingRemote(args))),
 
       // The engine seat locks, but ending the process must stay possible.
       harness.handle('claude.stop', async (args) => {
@@ -4650,6 +6054,12 @@ return {
 
     // A控制面 for other packages (the integration-test harness uses it, and it
     // is the seam any future dsh-side automation would drive the engine through).
+    // Automation, unlike a human, must not move the DEFAULTS: `rememberDefaults`
+    // records "what the user last chose" for the next new conversation, and a
+    // parent agent configuring one child is not the user changing their mind.
+    // The choice still has to be DURABLE, though — a child switched to Claude
+    // before its first turn has nothing in its log to infer the engine from, so
+    // a restart would hand it back to dsh.
     ctx.provide('ccmodeControl', {
       state: (sessionId) => publicState(String(sessionId)),
       setMode: (sessionId, mode) => {
@@ -4661,12 +6071,14 @@ return {
         state.mode = wanted
         if (state.mode === 'dsh') stopRun(String(sessionId)).catch(() => undefined)
         applySupervision(String(sessionId), state)
+        persistStates()
         return publicState(String(sessionId))
       },
       setPosture: (sessionId, posture) => {
         const state = stateOf(String(sessionId))
         if (PERMISSION_MODES.some((entry) => entry.id === posture)) state.permissionMode = posture
         applySupervision(String(sessionId), state)
+        persistStates()
         return publicState(String(sessionId))
       },
       setModel: (sessionId, model, effort) => {
@@ -4677,13 +6089,15 @@ return {
         if (run !== undefined && run.proc !== null && !run.closed && state.model.length > 0) {
           try { run.control({ subtype: 'set_model', model: state.model }) } catch (error) { /* dead */ }
         }
+        persistStates()
         return publicState(String(sessionId))
       },
       stop: (sessionId) => { stopRun(String(sessionId)).catch(() => undefined); return true },
       // Exposed for the integration harness: the same thing a hot update does.
       detach: (sessionId) => detach(String(sessionId)),
       sessionDir: (sessionId) => sessionDir(String(sessionId)),
-      usage: (force) => usageSnapshot(force === true),
+      usage: (force, sessionId) => usageSnapshot(force === true,
+        typeof sessionId === 'string' && sessionId.length > 0 ? remoteOf(stateOf(sessionId)) : null),
     })
 
     // The teardown below sets `shuttingDown` too late to help: dsh aborts the

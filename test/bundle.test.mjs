@@ -81,3 +81,35 @@ test('每条 shell 命令都是 GNU/BSD 双兼容（macOS 回归防线）', () =
     assert.ok(line.includes('stat -f'), 'GNU-only 的 stat 调用（缺 BSD 兜底）: ' + line.trim())
   }
 })
+
+test('the bundle no longer carries the multi-agent half — it moved to dsh-agent-mesh', async () => {
+  const mod = await import(path.join(root, 'lib/index.js'))
+
+  const registered = []
+  const routes = []
+  const services = {
+    apiProxy: { sessions: {}, workspace: {} },
+    tools: { register: (tool) => { registered.push(tool); return () => {} } },
+    webServer: { port: 8090, register: (route) => { routes.push(route); return () => {} } },
+  }
+  const ctx = {
+    get: (name) => services[name],
+    on: () => () => {},
+    provide: () => () => {},
+    effect: (fn) => { fn(); return () => {} },
+    interval: () => () => {},
+    timeout: (fn, ms) => { const h = setTimeout(fn, Math.min(ms, 5)); return () => clearTimeout(h) },
+    webServer: services.webServer,
+  }
+  mod.apply(ctx)
+
+  // The agent_* tools and the multi-agent MCP endpoint belong to the standalone
+  // dsh-agent-mesh plugin now; the Claude engine bundle must not register them
+  // (two host lines publishing the same service would collide).
+  assert.deepEqual(registered.map(tool => tool.name).filter(name => name.startsWith('agent_')), [],
+    'no agent_* tools are registered by the Claude engine bundle')
+  assert.ok(
+    !routes.some(route => route.path === '/claude-in-dsh/agents/mcp'),
+    'the old embedded MCP endpoint is gone',
+  )
+})

@@ -69,6 +69,8 @@ function buildRead(home) {
   const deps = {
     shellQuote: (v) => "'" + String(v).replace(/'/g, "'\\''") + "'",
     projectSlug: (cwd) => String(cwd).replace(/[^A-Za-z0-9]/g, '-'),
+    // 本机就是 /bin/sh -c；远端换成 ssh/docker 前缀，命令串一个字都不变。
+    shArgv: (command) => ['/bin/sh', '-c', command],
     // 真的跑 shell：tail | grep 那条管线本身也是被测的一部分。
     runCapture: (argv) => {
       try {
@@ -139,6 +141,7 @@ function buildWrite(world) {
   const deps = {
     errorText: String,
     stateOf: () => state,
+    remoteOf: () => null,
     runs: new Map(),
     titleRefreshed: new Set(),
     persistStates: () => { calls.persisted += 1 },

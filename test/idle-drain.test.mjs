@@ -33,7 +33,7 @@ const IDLE_STOPPED = { idleStopped: true }
 
 /** 引擎体的一小块，依赖全部从外面注入。 */
 function build(overrides) {
-  const calls = { projected: [], permissions: [], timers: [], detached: [], errors: [] }
+  const calls = { projected: [], permissions: [], timers: [], detached: [], errors: [], ccMirror: [] }
   const deps = {
     detach: (sessionId) => { calls.detached.push(sessionId) },
     IDLE_STOPPED: IDLE_STOPPED,
@@ -50,13 +50,19 @@ function build(overrides) {
     },
     stateOf: () => ({ mode: 'claude' }),
     agents: { get: () => ({ id: 'agent' }) },
+    // The dsh-native mirror of background tasks is wired through the idle
+    // reader too; the rig stubs it and records every call.
+    ccTaskStarted: (run, agent, message) => { calls.ccMirror.push(['started', message.task_id]) },
+    ccTaskNotification: (run, agent, message) => { calls.ccMirror.push(['notified', message.task_id]) },
+    mirrorParentedAssistant: () => {},
+    mirrorParentedResult: () => {},
     armTimeout: (fn, ms) => {
       const entry = { fn: fn, ms: ms, cancelled: false }
       calls.timers.push(entry)
       return () => { entry.cancelled = true }
     },
-    projectIdleStretch: async (sessionId, run, notice, endsAt) => {
-      calls.projected.push({ notice: notice, endsAt: endsAt })
+    projectIdleStretch: async (sessionId, run, endsAt) => {
+      calls.projected.push({ endsAt: endsAt })
       return 1
     },
     answerPermission: (run, agent, state, message) => { calls.permissions.push(message) },
@@ -196,7 +202,7 @@ test('轮次的投影终点取自 result 自带的位置', async () => {
   await rig.stopIdleDrain(run)
 })
 
-test('后台任务通知作为附言随这一轮投影出去', async () => {
+test('后台任务通知只喂 dsh 自己的面，不写进对话', async () => {
   const rig = build()
   const run = makeRun()
   rig.startIdleDrain('s', run)
@@ -210,10 +216,10 @@ test('后台任务通知作为附言随这一轮投影出去', async () => {
   run.push({ type: 'result', ccmodeOffset: 64 })
   await settle()
 
-  const notice = rig.calls.projected[0].notice
-  assert.match(notice, /后台任务通知/)
-  assert.match(notice, /等 3 分钟/)
-  assert.match(notice, /exit code 0/)
+  // jobs 行结算 / subagent 子会话收尾——这才是通知该去的地方。转录里不再多一条
+  // 「⚙ 后台任务通知：bsd03x8rc」：同一件事在侧栏已经有原生的呈现了。
+  assert.deepEqual(rig.calls.ccMirror, [['notified', 'bsd03x8rc']], '通知要同步进 cc 镜像')
+  assert.deepEqual(rig.calls.projected, [{ endsAt: 64 }], '投影只带这一轮真实的消息')
   await rig.stopIdleDrain(run)
 })
 
@@ -266,6 +272,9 @@ function buildFollow(world) {
     runs: world.runs || new Map(),
     activeTurns: world.activeTurns || new Map(),
     stateOf: () => state,
+    // 这个会话跑在哪台机器上：null 是本机。跟随器的每一次读都要带上它，
+    // 否则会去读本机同名路径——那正是 broker 明明活着却「未就位」的原因。
+    remoteOf: (value) => (value && typeof value.remote === 'string' && value.remote !== '' ? { id: value.remote } : null),
     sessionDir: () => '/tmp/ccmode/session-x',
     launchSnapshot: () => 'bypassPermissions|',
     isAlive: async (pid) => world.alivePids.includes(pid),
@@ -276,7 +285,7 @@ function buildFollow(world) {
       if (p.endsWith('attach.json')) return world.attach === undefined ? null : world.attach
       return null
     },
-    createRun: (sessionId, dir, snapshot, claudeSessionId) => ({ sessionId, dir, snapshot, claudeSessionId }),
+    createRun: (sessionId, dir, snapshot, claudeSessionId, remote) => ({ sessionId, dir, snapshot, claudeSessionId, remote: remote === undefined ? null : remote }),
     attach: async (run) => { calls.attached.push(run.offset) },
     startIdleDrain: (sessionId, run, offset) => { calls.followed.push(offset) },
   }

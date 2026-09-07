@@ -45,7 +45,8 @@ test('默认模型是清单里的一个具体模型', () => {
 test('什么都没选过时，开局落在那个默认模型上', () => {
   const { defaultModel } = catalog()
   // 新会话的初值来自 defaults，而 defaults 自己的出厂值是这一行。
-  assert.match(host, /const defaults = \{ mode: 'dsh', permissionMode: 'manual', model: DEFAULT_MODEL, effort: '' \}/)
+  // remote 的出厂值是空串 —— 没配过 SSH 目标时，Claude 就跑在本机。
+  assert.match(host, /const defaults = \{ mode: 'dsh', permissionMode: 'manual', model: DEFAULT_MODEL, effort: '', remote: '' \}/)
   assert.ok(defaultModel.length > 0)
 })
 

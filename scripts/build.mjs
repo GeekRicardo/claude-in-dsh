@@ -9,6 +9,8 @@
 //          → lib/index.js         ES module { apply, inject }; the `harness`
 //                                 table is served over one same-origin route,
 //                                 POST /claude-in-dsh/rpc (loopback-guarded).
+//                                 The multi-agent operations that once rode here
+//                                 moved to the standalone dsh-agent-mesh plugin.
 //   client src/client.dynamic.js  globals: React, console, styles, host, harness
 //          → lib/client.js        window.__ModuleLoader__ bundle; `host.call`
 //                                 becomes a fetch to that route, `styles.insert`
@@ -113,6 +115,12 @@ function apply(ctx) {
     },
   }), 'claude-in-dsh: rpc route')
 
+  // The multi-agent operations that open and drive OTHER conversations used to
+  // ride inside this bundle; they now live in the standalone dsh-agent-mesh
+  // plugin, which publishes the same multiagentControl service this host half
+  // reads (multiagentMcpConfig / launchSnapshot / question routing). Composing
+  // that plugin is optional — without it, a Claude conversation simply has no
+  // agent_* tools and its questions go to the human UI as before.
   return engineHalf(harness).apply(ctx)
 }
 

@@ -2,6 +2,93 @@
 
 本文件记录 claude-in-dsh 的版本变化。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 1.12.0 — 未发布
+
+### 变更
+
+- **多 agent 协作拆分成独立插件 [dsh-agent-mesh](https://github.com/GeekRicardo/dsh-agent-mesh)**。此前内嵌在本 bundle 里的 `agent_*` 工具与多 agent MCP 端点整体搬了出去；本 bundle 不再注册它们，也不再挂 `/claude-in-dsh/agents/mcp`（两条 host 行发布同名服务会冲突）。dsh-agent-mesh 发布本 host 半边一直消费的同名 `multiagentControl` 服务，所以 `--mcp-config` 装配、`launchSnapshot` 判定都无需改动；组合它是可选的，不装时 Claude 会话就没有 `agent_*` 工具、提问照旧走人工卡片。
+
+### 新增
+
+- **被托管的 Claude 子对话，提问也会通知主对话**。子对话的 `AskUserQuestion` / `ExitPlanMode` 不再默认弹在子对话自己的界面等一个不存在的人，而是先问 dsh-agent-mesh：如果这个会话是某个主对话监督下的子对话，就把问题/计划审核路由回主对话（`answerQuestion`），答案按题面文本回给 CLI，和人在卡片里选的一模一样；不是被监督的子对话才退回本地人工卡片。
+
+## 1.11.0 — 未发布
+
+### 新增
+
+- **Claude Code 的后台任务进了 dsh 自己的面**。此前 Agent/Task 子代理、detached Bash、Monitor 这类后台工作只在转录里留一句「⚙ 后台任务…」注记，dsh 的侧栏（dsh-better-sidebar 的 Subagent 页、原生 jobs 列表、会话头部的 subagent 目录）一概看不到。现在同一份事实镜像进 dsh 的原生词汇：
+
+  - **普通后台任务**（detached Bash / Monitor / 非 Agent 工具的任务）在 `task_started` 时入账成一行 `ctx.jobs` 记录（kind `claude-task`，label 取描述首行），`task_notification` 到达时结算——后台任务区出现一条从「运行中」变「已完成」的行，时长、状态照常展示，可以 `job_kill`（会向运行中的 CLI 发 `stop_task`）。结算快照刻意记为已读，让共享的 tool-jobs 完成通知不再注入——`task_notification` 本来就会唤醒 Claude 自己那一轮，再来一条 dsh 侧的「任务完成」用户消息只会把重复的一轮写进产品 stdin。
+  - **Agent/Task 工具调用**额外镜像成一个真正的 subagent 子会话（header `origin: subagent`、挂在本会话名下、写入 one-shot descriptor，label 是派发描述），父级流里的子代理消息/工具调用/结果**照主 agent 的写法逐事件**同步进子会话日志（`step/start` → `assistant/message` → `tool/call` → `tool/result` → `step/end`，工具名和参数都过同一张 dsh 词汇表），任务通知把最终报告写进子会话后收尾释放（转入持久化，卡片变 inactive）——subagent 目录和侧栏卡片区出现一张张可点开的卡片，运行中显示其最后文本与工具调用，点开能看子代理自己的转录，工具卡片和主对话里长得一模一样（dsh-better-tool-ui 之类挂在工具名上的渲染器照常生效）。
+
+  **后台任务不再在对话里留注记**。转录里那句「⚙ 后台任务启动/通知：<task_id>」是镜像还不存在时的唯一记录；两个原生面都活了之后它成了同一件事的第三份拷贝，还带着没人读的 id 横在对话中间。现在 `task_started` / `task_notification` 只喂 jobs 行和子会话，一个字都不写进转录（自发轮次的投影同理）。
+
+  依赖缺失（没有 `jobs` / `sessions` 服务）时不呈现后台工作，镜像失败只记日志，绝不影响 Claude 进程和转录。
+
+  实测跟进（侧栏卡片/输出读不出来）：
+  - job 的 `readOutput` 之前永远返回空（摘要挂在了一个没人更新的局部变量上）——现在结算前先把摘要写回任务条目，`jobs.read` / `job_output` 能读到真实内容。
+  - 子代理镜像会话之前没有 `turn/start`/`turn/end`，会被 dsh 当成「blank」会话（部分列表基线藏它，目录卡片停在「加载中」）。现在建会话即开一轮、收尾即关一轮。
+  - **子会话里一条 `tool/call` 都没有**，工具调用只以 `assistant/message` 里的块存在，于是结果卡片拿不到工具名、更选不到渲染器。根因是镜像给**每一条**事件都盖了 `{ surfaceOp: 'append' }`，而 dsh 只允许 `user/message`/`assistant/message`/`tool/result` 三种带这个标记，其余类型带了就抛——`tool/call`、`turn/end`、`step/*` 全在 catch 里被无声吞掉。现在按类型决定标记（和 `projectClaudeEvents` 同一条规则），测试里的假 session 也照 `Session.append` 的原话校验这一条，同样的错过不去了。
+  - 收尾时的报告和子代理自己最后那句话是同一段文字，之前会被打印两遍；未答复的工具调用也没人管，卡片永远转下去。现在报告重复就不再追加，未答复的调用补一个「被中断」的结果，run 断掉时子会话按 `interrupted` 关轮而不是只 detach。
+
+- **用量读数不再空白，缓存优先展示**。此前输入框下方那条 5h/7d 读数是「拿到才画」：切一次对话、刷一次页面，组件重挂载就从空开始，要等 host 那一趟 `api/oauth/usage` 回来才重新出现；host 抖一下（endpoint 不通、token 过期）更是直接换成一句「Claude usage unavailable」。现在按 dsh-balance 的做法把上一次成功的读数缓存在**内存 + localStorage**：切会话、刷页面先渲染缓存再后台校准，缓存读数期间轻微降透明并在 tooltip 里注明「缓存的读数，正在刷新…」；请求失败保留上一次读数而不是清空。
+
+  和余额不一样的是，用量快照**自带过期时刻**：每个窗口都有 `resetsAt`，过了那个点百分比不是「旧」，是「错」。所以缓存有两条硬边界——超过 6 小时的缓存不拿来播种（宁可短暂空着），任一窗口过了重置时刻就让下一次轮询带 `force` 绕开 host 的 60 秒缓存，让新周期的数字尽快替换掉。客户端轮询同时从 60 秒收到 20 秒（多出来的调用绝大多数由 host 缓存当场应掉，代价是本地一次 RPC，换来重置后读数及时翻篇），强制重取之间留 2 分钟下限——endpoint 挂掉时缓存会一直是「过期」状态，没有这条下限就变成每 20 秒捶一次 Anthropic。`official:false`（API key / 第三方网关）是明确结论而不是失败，此时缓存会被清掉、读数照旧不显示。
+
+- **`claude_usage` 工具：让 agent 自己看得到额度**。同一份用量此前只画给人看，模型无从得知自己还剩多少 5h 额度，只能在一轮活干到一半时撞上限额。现在多 agent 那份工具表里多一个 `claude_usage`（Claude 会话经 MCP 调 `mcp__dsh-agents__claude_usage`，dsh 会话原生调用），返回每个窗口用了多少、还剩多少、还有多久重置（分钟数 + 具体时刻），并在报告里点出 5h 窗口是那个会把一轮活截断的窗口，好让模型自己决定是拆任务、派子对话，还是先等窗口。默认走 host 的 60 秒缓存，`refresh: true` 才重取。账号是 API key 或走第三方网关时它明说「没有订阅窗口可报」，不编数字。
+
+- **修复：`api/oauth/usage` 被限流时，读数会静静变成空白**。那个 endpoint 的拒绝体本身就是一份合法 JSON（`{"error":{"type":"rate_limit_error",…}}`），解析得动、只是里面一个窗口都没有，于是取数半边把它当成了「这个账号没有窗口」——快照是 `official:true, windows: []`，而不是「等会儿再问」，读数那一行就整条消失。现在带 `error` 的响应和一个窗口都没有的响应都明确算取数失败（把服务端自己的说法原样带上），客户端据此保留上一次读数而不是清空。
+
+  同时给失败加退避：一次拒绝之后 **5 分钟**内不再打（成功读数照旧 60 秒过期），并且 `refresh: true` / 强制刷新也绕不开刚刚那次拒绝的第一分钟——限流期间自己捶得更勤只会让它拒绝得更久。这个账号的额度本来就同时被终端里的 Claude Code 打着。
+
+## 1.10.0 — 2026-08-27
+
+### 新增
+
+- **撞上订阅用量上限时，这一轮不再报错收尾，而是等窗口重置后自己接着干**。Claude Code 自己的 TUI 有这个行为（设置项 `autoContinueAtUsageLimit`，界面上写作 "Usage limit reached · continuing automatically"），但它整个住在交互式 app 层：本插件驱动的是 `-p --output-format stream-json` 进程，那条路上没有那个对话框，于是一轮活干到一半撞上 5h 限额，就只在转录里留一句「⚠ Claude Code 报错」，活儿丢在那里等人发现、重打一遍。
+
+  现在同一件事做在插件这一侧，而且是**在人开的那一轮里面**做完：轮次不结束（所以停止按钮、composer 的运行态、broker 的 idle 回收判定全都还是原来的意思），等到额度回来，把 Claude 自己那句续跑提示逐字发进同一个进程（"Your claude.ai usage limit has reset. Continue the task you were working on when the limit was reached; do not repeat work that is already complete."），接着读同一条流。插件不会为此另起一轮——没人说话就不该有一轮对话，这条底线没有变。
+
+  **判定不看错误文案，看账号自己的用量窗口**：一次错误结算之后强制拉一次 `api/oauth/usage`，只有当某个窗口确实顶到线、且重置时间还在前面，才认定是限额；其余错误照旧原样报出来。这样 CLI 换一种措辞不会让功能静默失效。等待期间每 5 分钟复看一次用量，额度提前回来就提前继续（用的是 Claude 对应的另一句提示）；读不到用量不算恢复，只是继续等。
+
+  边界都按 Claude 自己的规矩来：重置在 24 小时以后就不等（挂一整天的轮次不是等待，是卡死）；同一轮最多自动续跑 3 次；按停止即放手，且**不会**再替你发那句续跑提示。**等待期间插话不算取消**：任务本来就是你先给的，等待中补的话是同一件事的一部分，所以它攒着不发（当场发只会让 Claude 立刻再撞一次限额，而那条错误 result 又会被读成续跑那一轮的结束），等额度回来时跟在续跑提示后面一起发出去。dsh 重启会中断等待（和 Claude Code 自己被重启时一样），转录里留着记录，发一句话就能继续。
+
+  界面上：转录里一条「⏳ 已达 Claude 用量上限（5h）· 将在 HH:MM 自动继续」，输入框下方的用量读数旁多一枚倒计时芯片（秒级走字），芯片上的 ✕ 只取消等待、保留 Claude 进程。
+
+## 1.9.0 — 2026-08-27
+
+### 新增
+
+- **多 agent：一个对话可以像人一样新开、驱动、审批、配置另一个对话**。任何 Claude 会话都会拿到一组 `agent_*` 工具（dsh 会话也在同一份工具表里），可以开一个新的 dsh 对话或新的 cc-in-dsh 对话、像人打字一样给它发消息、读它的输出、答它的权限请求、改它的模型与权限档、打断它。
+
+  实现上只有一条控制路径：**`ctx.apiProxy`**——web 前端点「新对话」和在输入框里敲字时走的正是这套 API（`session.create` / `session.prompt` / `session.cancel` / `session.selectModel` / `workspace.create`）。所以子对话不是插件私有的什么东西，就是一个普通对话：出现在侧边栏、原生渲染、正常持久化，人随时可以点进去接管，插件停掉它也还在。Claude 子对话只多一步——用 `ccmodeControl` 把引擎钉成 Claude；此后它的一轮仍然是 dsh 的一轮，写的仍然是 dsh 的会话事件，所以「读输出」「中断」这些操作对两种引擎是同一份代码。
+
+  审批走 `approval/request` 这个 waterfall：本插件在最前面挂一个监听器，只认领**自己管着的**子会话的请求，交给它的父会话回答（`agent_approve`），其余会话的请求原样 `next()` 落到人手上的审批卡片。所以「父 agent 审批」不是绕过 dsh 的审批，而是接进它——子会话在自己的工具调用里真的阻塞着等回答，日志里照样有 `approval/asked` / `approval/decided` 这对审计事件。父会话不想管的可以按会话选 `human`（照旧问人）、`allow` / `deny`（常备答案）。
+
+  Claude 会话怎么看见这些工具：进程启动时多带一个 `--mcp-config`，指向 dsh web 端口上一条**按会话寻址**的 MCP 端点（`/claude-in-dsh/agents/mcp/<sessionId>`，回环 + Bearer + 拒绝跨站）。父会话身份因此是进程的事实，而不是模型可以声称的参数——一个 Claude 进程只能以它自己的身份开子会话。token 存在 `~/.cache/ccmode/multiagent.json`（与子会话注册表同一处），第一次生成之后不再变，否则每次插件热更新都会让已经在跑的 Claude 拿着过期 token 撞 401。用的是 `--mcp-config` 而不是 `--strict-mcp-config`：你自己配的 MCP server 必须继续能用。
+
+  **子对话会主动回来叫醒发起方**。委派出去之后父会话通常就把话说完了——不主动通知，它既不知道子对话跑完没有，也不知道它正卡在一个只有自己能答的审批上。所以子对话一轮结束、或者一个审批被 park 住时，插件会给**父会话**投一条消息；dsh 只为 `source.kind === 'user'` 的消息唤醒 agent，所以这条通知就是一条普通消息，像有人走过来说了一句，两种引擎的父会话都照样醒。
+
+  这与「插件不得替用户发起轮次」并不矛盾，判据是**这一轮的源头是不是真人的意图**：Cordis 运行器那类插件自己的通知不该烧额度，而子对话是父会话奉用户之命开出来的，它的完成属于同一条委派链。投递用的是 **`steer` 而不是 `queue`**：排队的输入要等**下一轮**才被读到，也就是说一个正在干活的父会话只有在自己也干完之后才知道子对话早就完了——而它这一轮正是靠这条信息决定该做什么的；队列里若还压着别的输入，还会更晚。steer 把通知折进**正在跑的那一轮**（Claude 父会话就是直接写进它进程的当前轮），而对空闲的父会话 steer 同样会唤起驱动、起一轮，所以一条路径同时服务两种状态。相应地，父会话**正在跑**时立即投递、不等去抖窗口（steer 不额外花一轮，等待只会让它拿着过期的认知继续干）；父会话**空闲**时才去抖合并，因为那真的要花一轮。
+
+  代价仍然自己控住：只在父会话**松手之后**才通知（同步 `wait` 着的调用本来就会把结果返回，不再重复一次）、一批子对话同时完成**去抖合并成一次**投递、父会话已经被 dsh 卸载成冷会话时**不硬把它唤起来**（通知先攒着，随它下一次调用 `agent_*` 的返回值一起带出去）。不想要的可以按会话 `notify: 'off'`。
+
+  整套能力可以用 `CLAUDE_IN_DSH_MULTIAGENT=off` 关掉——不想让对话开对话的部署应该能直说，而不必去改插件。
+
+  斜杠命令按归属分流：dsh 子对话里的 `/permission read-only` 直接走 dsh 的命令注册表执行，不经过模型（和人在那个对话的输入框里敲一样）；Claude 子对话里的 `/context` 原样发给 Claude，因为那是它自己的命令。
+
+  读转录时默认滤掉 dsh 注入的 runtime context 快照、skill 目录和插件通知——那些是子会话的脚手架而不是它的对话，把真正的回复埋在下面，父会话就不会再读了（要看可以 `context: true`）。`turn/end` 的 `blocked` 渲染成 `done`：那是 Claude 引擎每一轮正常的收尾方式（pre-step 接管完这一轮后 reject 掉模型请求），照字面报出来会让每一轮健康的对话都读起来像失败。
+
+  子会话注册表持久化在 `~/.cache/ccmode/multiagent.json`：子对话本身是持久的，父会话隔一天回来必须还能找到它们、还能读、还能继续拥有它们的审批权。会话若已经被 dsh 卸载（idle 的对话不常驻 agent），读取自动退到持久化历史页，不会去唤醒它。
+
+### 修复
+
+- **多 agent 半不再因为「启动得比 API 网关早」而空转**。dsh 按 composition 顺序挂载各行，而这个 bundle 完全可能在 `apiProxy` 之前 apply——在会话里当动态包跑时永远遇不到（那是启动很久之后才 run 的），装成正式包第一次重启就撞上了：日志里一句 `apiProxy unavailable`，工具一个都没注册，MCP 路由压根没挂（`curl` 回 405）。现在服务是**延迟绑定**：等到网关出现再注册工具、接审批桥、挂端点、读注册表，最多等 60 秒才认输。
+
+- **升级后已经在跑的 Claude 进程也会拿到这组工具**。`--mcp-config` 是启动参数，一个在这半边被组合进来之前起的进程永远不可能长出 `agent_*` 工具，而 broker 的复用判据（`launchSnapshot`）此前只看权限档和 effort，于是老进程会被一直复用下去。现在这份判据把「多 agent 是否可用」也算进去：升级后每个会话的下一轮会重启进程（resume 同一个 Claude 会话，对话本身不断），此后就带着工具了。
+
+- **`ccmodeControl` 的改动现在会落盘**。它此前只改内存里的每会话状态：一个刚被切成 Claude 引擎、还没跑过第一轮的会话，日志里没有任何可供 `committedEngine` 判定的痕迹，dsh 一重启就被交还给 DSH 引擎。现在 `setMode` / `setPosture` / `setModel` 都 `persistStates()`，但**不**碰 `rememberDefaults`——那份默认记的是「用户上次主动选了什么」，自动化替某个子会话配置一次，不是用户改主意。
+
 ## 1.8.0 — 2026-08-25
 
 ### 新增
