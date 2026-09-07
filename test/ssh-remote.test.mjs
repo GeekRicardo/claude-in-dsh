@@ -425,3 +425,39 @@ test('访问器之外，不再有任何地方直接摸 session.events', () => {
   const leaks = outside.match(/session\.events/g) || []
   assert.deepEqual(leaks, [], '还有地方直接读 session.events，在 dsh 0.1.2 上会炸')
 })
+
+// 「跑在本机」是一个选择，不是「没选过」。这两者在盘上必须能区分：
+// 早先写盘时省掉了空值，于是 dsh 一重启，本机会话就被按 #defaults.remote
+// 重新播种、静默漂到默认目标上——transcript 留在一台机器，进程重开在另一台。
+test('明确选了本机，重启后不会漂到默认目标上', () => {
+  const written = (() => {
+    const state = { mode: 'claude', permissionMode: 'manual', model: 'm', effort: '',
+      remote: '', claudeSessionId: 'cs-1' }
+    const remote = typeof state.remote === 'string' ? state.remote : ''
+    // 与实现里那段落盘表达式同形
+    return {
+      mode: state.mode,
+      remote: remote,
+      ...(claudeIdOf(state) === '' ? {} : { claudeSessionId: claudeIdOf(state) }),
+    }
+    function claudeIdOf(s) { return s.claudeSessionId === undefined ? '' : s.claudeSessionId }
+  })()
+  assert.ok('remote' in written, '空的 remote 也必须写进去，否则和「没选过」无法区分')
+  assert.equal(written.remote, '')
+
+  // 读回来：键在 → 用它；键不在 → 才继承默认
+  const load = (saved, defaultRemote) => {
+    const state = { remote: defaultRemote }
+    if (typeof saved.remote === 'string') state.remote = saved.remote
+    return state.remote
+  }
+  assert.equal(load(written, 'worker'), '', '写过本机就该还是本机')
+  assert.equal(load({}, 'worker'), 'worker', '真的没选过才继承默认')
+})
+
+test('落盘表达式本身不再省略空的 remote', () => {
+  // 钉住实现：这一处一旦改回 `remote === '' ? {} : …`，上面那个漂移就回来了
+  assert.doesNotMatch(source, /\.\.\.\(remote === '' \? \{\} : \{ remote: remote \}\)/,
+    '空 remote 又被省掉了——本机会话会在重启后漂到默认目标')
+  assert.match(source, /^\s+remote: remote,$/m, '落盘里应无条件写 remote')
+})
