@@ -389,3 +389,39 @@ test('新会话继承的是「这个目标上次的目录」', () => {
   assert.equal(build('')('s3').remoteCwd, '', '本机不带远端目录')
   assert.equal(build('never-used')('s4').remoteCwd, '', '没记过的目标留空，由目标的 dir / home 兜底')
 })
+
+// dsh 0.1.2-rc.1 把 Session 的事件日志改成私有：公开数组 `session.events`
+// 没了，取而代之的是 snapshotEvents()。升级后第一轮就抛
+// "session.events is not iterable"。两种形态都认，因为一台机器升级了
+// 不等于这插件跑的每台机器都升级了。
+test('事件日志：新老两种 dsh 都读得到', () => {
+  const sessionEvents = new Function(`${sliceFunction('sessionEvents')}; return sessionEvents`)()
+  const rows = [{ type: 'turn/start' }, { type: 'turn/end' }]
+
+  // 0.1.2：私有日志 + 快照方法
+  let asked = 0
+  assert.deepEqual(sessionEvents({ snapshotEvents: () => { asked += 1; return rows } }), rows)
+  assert.equal(asked, 1, '快照是按次要的——它自己缓存到下次 append')
+
+  // ≤0.1.1：公开数组
+  assert.deepEqual(sessionEvents({ events: rows }), rows)
+
+  // 两个都没有，或者根本没 session：给空表，别把一轮炸掉
+  assert.deepEqual(sessionEvents({}), [])
+  assert.deepEqual(sessionEvents({ events: 'not an array' }), [])
+  assert.deepEqual(sessionEvents(undefined), [])
+  assert.deepEqual(sessionEvents(null), [])
+
+  // 新形态优先：两个都在时不该去读那个陈旧的数组
+  assert.deepEqual(sessionEvents({ snapshotEvents: () => rows, events: [] }), rows)
+})
+
+test('访问器之外，不再有任何地方直接摸 session.events', () => {
+  // 挖掉访问器自身（它内部当然要读那个旧字段兜底），再剥掉注释——
+  // 这条守卫管的是代码，不是散文里提到这个名字。
+  const outside = source.replace(sliceFunction('sessionEvents'), '')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/[^\n]*/g, '')
+  const leaks = outside.match(/session\.events/g) || []
+  assert.deepEqual(leaks, [], '还有地方直接读 session.events，在 dsh 0.1.2 上会炸')
+})

@@ -674,7 +674,7 @@ return {
     function committedEngine(session) {
       if (session === undefined || session === null) return undefined
       let sawDsh = false
-      for (const event of session.events) {
+      for (const event of sessionEvents(session)) {
         if (event.type === 'assistant/message') {
           const source = event.data && event.data.message ? event.data.message.source : undefined
           if (source === undefined || source.provider === undefined) continue
@@ -747,7 +747,7 @@ return {
       for (const agent of list) {
         const sessionId = String(agent.id)
         const session = agent.session
-        const count = session === undefined ? 0 : session.events.length
+        const count = session === undefined ? 0 : sessionEvents(session).length
         const cached = engineCache.get(sessionId)
         let engine
         if (cached !== undefined && cached.count === count) engine = cached.engine
@@ -922,7 +922,7 @@ return {
       // Only calls this plugin logged are ours to close: a dsh tool call that is
       // still running belongs to the built-in loop and must be left alone.
       const claudeCalls = new Set()
-      for (const event of session.events) {
+      for (const event of sessionEvents(session)) {
         if (event.type === 'assistant/message') {
           const message = event.data ? event.data.message : undefined
           const source = message === undefined ? undefined : message.source
@@ -1429,6 +1429,22 @@ return {
      * something the person said — and it fires precisely when they asked for
      * no output, so it contradicts them in their own voice.
      */
+    /**
+     * This Session's event log, across the dsh versions that expose it
+     * differently.
+     *
+     * Up to dsh 0.1.1-rc the log was a public array (`session.events`). 0.1.2
+     * made it private and serves immutable snapshots instead — a full snapshot
+     * is cached until the next append, so asking per read costs nothing. The
+     * old shape is still accepted because one deployment upgrading does not
+     * upgrade every machine this plugin runs on.
+     */
+    function sessionEvents(session) {
+      if (session === null || session === undefined) return []
+      if (typeof session.snapshotEvents === 'function') return session.snapshotEvents()
+      return Array.isArray(session.events) ? session.events : []
+    }
+
     function machineryRow(event) {
       return event !== null && event !== undefined
         && (event.isMeta === true || event.isSynthetic === true)
@@ -3036,7 +3052,7 @@ return {
         // Belt and braces: even with a stale offset, anything whose tool call
         // is already in the transcript was rendered live and is skipped.
         const seenCalls = new Set()
-        for (const event of session.events) {
+        for (const event of sessionEvents(session)) {
           if (event.type === 'tool/call' && event.data && typeof event.data.callId === 'string') {
             seenCalls.add(event.data.callId)
           }
@@ -3086,7 +3102,7 @@ return {
 
       let lastBandTurn = 0
       let lastDenseTurn = 0
-      for (const event of session.events) {
+      for (const event of sessionEvents(session)) {
         if (event.type !== 'turn/start' || typeof event.data.turn !== 'number') continue
         if (event.data.turn >= BAND) lastBandTurn = Math.max(lastBandTurn, event.data.turn)
         else lastDenseTurn = Math.max(lastDenseTurn, event.data.turn)
@@ -3100,7 +3116,7 @@ return {
       // it is append-only — and the honest fix is to re-import the Claude
       // conversation, whose own transcript is intact.
       let lastTurnWritten
-      for (const event of session.events) {
+      for (const event of sessionEvents(session)) {
         if (event.type === 'turn/start' && typeof event.data.turn === 'number') lastTurnWritten = event.data.turn
       }
       if (lastTurnWritten !== lastBandTurn) {
@@ -3113,7 +3129,7 @@ return {
       // Only the stranded stretch: assistant text logged under the LAST band
       // turn, which is the one a live agent wrote and the reload cannot show.
       const stranded = []
-      for (const event of session.events) {
+      for (const event of sessionEvents(session)) {
         if (event.type !== 'assistant/message') continue
         if (event.data.turn !== lastBandTurn) continue
         const message = event.data.message || {}
@@ -3163,8 +3179,9 @@ return {
           // TOOL_OUTCOME_UNKNOWN: its REAL result is in the broker log, and
           // everything from that line on is the missing tail.
           let callId = ''
-          for (let index = session.events.length - 1; index >= 0; index -= 1) {
-            const event = session.events[index]
+          const logged = sessionEvents(session)
+          for (let index = logged.length - 1; index >= 0; index -= 1) {
+            const event = logged[index]
             if (event.type === 'tool/call' && event.data && typeof event.data.callId === 'string') {
               callId = event.data.callId
               break
@@ -3208,7 +3225,7 @@ return {
         // and projecting it would duplicate calls whose results then pair
         // across turns — which is exactly how a card ends up spinning forever.
         const known = new Set()
-        for (const event of session.events) {
+        for (const event of sessionEvents(session)) {
           if (event.type === 'tool/call' && event.data && typeof event.data.callId === 'string') known.add(event.data.callId)
         }
         let lastKnown = -1
@@ -3476,7 +3493,7 @@ return {
       // call the transcript already holds would come back as a duplicate whose
       // result then pairs across turns, which is how a card spins forever.
       const known = new Set()
-      for (const event of session.events) {
+      for (const event of sessionEvents(session)) {
         if (event.type === 'tool/call' && event.data && typeof event.data.callId === 'string') known.add(event.data.callId)
       }
       const fresh = rows.filter((event) => {
@@ -3797,7 +3814,7 @@ return {
       const knownCallIds = new Set()
       const answeredCallIds = new Set()
       let lastStep = 0
-      for (const event of session.events) {
+      for (const event of sessionEvents(session)) {
         const data = event.data
         if (data !== undefined && data !== null && data.turn === turn
           && typeof data.step === 'number' && data.step > lastStep) lastStep = data.step
@@ -3930,7 +3947,7 @@ return {
     async function backfillClaudeTranscript(sessionId, session, cwd, claudeSessionId) {
       // Idempotent: importing into a conversation that already shows content
       // must not duplicate it.
-      for (const event of session.events) {
+      for (const event of sessionEvents(session)) {
         if (event.type === 'assistant/message') return { backfilled: 0, skipped: 'already has content' }
       }
 
@@ -5011,7 +5028,7 @@ return {
       const current = session.requestHeader()
       if (current === undefined || current.config === undefined) return false
       if (current.config.provider !== PROVIDER) return false
-      const events = session.events
+      const events = sessionEvents(session)
       for (let index = events.length - 1; index >= 0; index -= 1) {
         const event = events[index]
         if (event.type !== 'request/header') continue
@@ -5784,7 +5801,7 @@ return {
         const rows = [{ type: 'assistant', message: { model: 'claude-code', content: [{ type: 'text', text: String(args.text || 'PROJECTION-PROBE') }] } }]
         const written = queueProjection(sessionId, rows, '')
         let last = 0
-        for (const event of session.events) {
+        for (const event of sessionEvents(session)) {
           if (event.type === 'turn/start' && typeof event.data.turn === 'number') last = event.data.turn
         }
         return { ok: true, written: written, lastTurn: last }
