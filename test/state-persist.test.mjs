@@ -41,10 +41,11 @@ function build(fileContent, options = {}) {
     // 同一个 calls：落盘替身和被测函数必须记在同一本账上。
     calls: calls,
     STATE_PATH: '/tmp/does-not-matter.json',
+    // 真的 runCapture 从不 reject：起不来、超时、真没文件，回来的都是 ''。
+    // 所以替身也不 reject——「读失败」就是回一个空串。
     runCapture: async () => {
-      if (options.readFails) throw new Error('读不了')
       await new Promise((resolve) => setTimeout(resolve, 300))
-      return fileContent
+      return options.readFails ? '' : fileContent
     },
     errorText: (error) => String(error && error.message ? error.message : error),
     console: { log: () => {}, error: (...args) => { calls.errors.push(args.join(' ')) } },
@@ -125,12 +126,15 @@ test('实例 id 从文件里读回来，而不是每次重启换一个新的', a
 })
 
 test('文件不存在时才 mint 一个新 id', async () => {
-  const rig = build('')
+  const rig = build('@@ccmode-absent@@')
   await rig.load()
   assert.equal(rig.instance(), 'minted-id')
 })
 
-test('文件读不出来：什么都不写——宁可不存，也不能拿看不到的东西去覆盖', async () => {
+// 读回来是空的，可能是「真没文件」，也可能是起不来 / 超时——runCapture 分不出来。
+// 分不出来就不能当成「没东西可恢复」，否则一次超时就把全部设置写没了（实测：
+// 恢复好的 11671 字节，一小时里被写回 153 字节两次，机器当时负载 80）。
+test('读回来是空的（超时/起不来）：什么都不写——只有 shell 明说「文件不存在」才算空', async () => {
   const rig = build(FILE, { readFails: true })
   await rig.load()
   rig.persist()
