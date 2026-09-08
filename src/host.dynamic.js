@@ -1500,6 +1500,52 @@ return {
       return session !== undefined && session !== null && session.header ? session.header.cwd : undefined
     }
 
+    /**
+     * Warn when the user's own MCP config shadows the per-session mesh endpoint.
+     *
+     * `--mcp-config` ADDS to the user's servers rather than replacing them, and
+     * that is deliberate: a conversation should keep the servers its owner
+     * configured. But a `dsh-agent-mesh` entry of their own points at a FIXED
+     * handle, exposes the same tool names, and silently wins — so every child
+     * this conversation opens is filed under that handle instead of under the
+     * conversation. Nothing fails: the children run, and only the notices go
+     * nowhere, because a handle names no dsh session to wake. That is a very
+     * quiet way to lose a feature, so it is worth one line in the log.
+     *
+     * Checked once per machine, out of band: a launch must not wait on it.
+     */
+    const shadowChecked = new Set()
+    function warnShadowedMeshConfig(remote) {
+      const key = remote === null || remote === undefined ? '' : remote.id
+      if (shadowChecked.has(key)) return
+      shadowChecked.add(key)
+      const where = key === '' ? 'this machine' : key
+      runCapture(shArgv('cat "$HOME"/.claude.json 2>/dev/null', remote), 8000).then((raw) => {
+        let config = null
+        try { config = JSON.parse(String(raw)) } catch (error) { return }
+        const found = []
+        const walk = (node) => {
+          if (node === null || typeof node !== 'object') return
+          const servers = node.mcpServers
+          if (servers !== null && typeof servers === 'object') {
+            for (const name of Object.keys(servers)) {
+              const entry = servers[name]
+              const url = entry !== null && typeof entry === 'object' ? entry.url : undefined
+              if (typeof url === 'string' && url.indexOf('/dsh-agent-mesh/mcp/') >= 0) found.push(name + ' -> ' + url)
+            }
+          }
+          for (const value of Object.values(node)) if (value !== servers) walk(value)
+        }
+        walk(config)
+        if (found.length === 0) return
+        console.error('cc-mode: an mcpServers entry on ' + where + ' points at the agent-mesh endpoint'
+          + ' and will shadow the per-conversation one this plugin injects — children opened from a Claude'
+          + ' conversation would then be filed under that fixed handle, and their completion notices could'
+          + ' never reach the conversation. Remove it (or rename it so the tool names do not collide): '
+          + found.join(', '))
+      }, () => undefined)
+    }
+
     function sessionDir(sessionId) {
       return BROKER_ROOT + '/' + String(sessionId).replace(/[^A-Za-z0-9_.-]/g, '_')
     }
@@ -1974,6 +2020,7 @@ return {
       // flag, so it must never sit immediately before a positional. Here it is
       // followed by `--session-id`/`--resume`, which stops it.
       const agentsMcp = await multiagentMcpConfig(sessionId)
+      if (agentsMcp !== null) warnShadowedMeshConfig(remote)
       if (agentsMcp !== null) argv.push('--mcp-config', agentsMcp)
       if (forkFrom !== null) {
         // The three compose, verified against the CLI: it resumes the parent,
