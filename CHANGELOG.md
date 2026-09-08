@@ -6,6 +6,10 @@
 
 ### 修复
 
+- **僵尸 broker 不再被当成活着的 broker**。插件靠 `exit.json` 加上对 broker pid 的存活检查来决定「重新挂上去」还是「重开一个」，而存活检查是 `kill -0`——它对**僵尸进程**也说「在」。一个死掉但没人收尸的 broker（容器的 pid 1 是 `sleep infinity`，永远不收）于是被判成活的，插件重新挂上去，把每一条 prompt 写进一个没人读的 fifo，对话就此不说话，日志里没有任何一行解释。现在存活检查看的是**进程状态**（`ps -o stat=`，`Z` 开头即死），没有 `ps` 的机器退回原来的存在性判断。
+- **broker 干完活会真的退出**。`process.exit()` 在这个文件里出不去——实测它进了退出路径就不回来，进程还活着：这个进程为了不让 fifo 断掉，把 `in` 同时按读写打开，那是个谁都不会关的句柄。后果是每个跑完的对话都留下一个不死的 broker。现在每一条离开的路都走同一个硬退出：先杀掉 Claude 子进程，再给自己一刀——信号不会卡住。
+- **broker 死了一定留下话**。上面那个僵尸的成因：`out.log` 写入流和 `in` fifo 读取流都没有 `error` 处理，一个未处理的 stream 错误直接把 Node 打死（退出码 1），`exit.json` 没写、`cc-exit` 没记——现场是 broker 退出码 1、它的 Claude 退出码 0（stdin EOF，握着 fifo 的只有 broker）、`out.log` 断在半句话上、一轮挂了几个小时。现在两个流都接住 `error`，另加 `uncaughtException` / `unhandledRejection` 兜底，每一条离开 broker 的路都先写 `cc-exit` 和 `exit.json`——附着的插件因此立刻知道进程没了，而不是干等。
+
 - **dsh 重启不再让 Claude 觉得 `dsh-agents` 没了**。`dsh-agents` 是 dsh 自己提供的 HTTP MCP 服务，而 Claude 以前直接连着 dsh。于是每次 dsh 重启（pm2 十来秒）都会变成某个工具调用里的连接错误，CLI 把它报成「服务器断开」，模型从此不再用 mesh——一个正带着十四个子对话的主对话就退回自己动手，还会说「MCP 连接又断了」。broker 天生比 dsh 活得久（这正是它存在的理由），所以现在 Claude 连的是 **broker 自己起的一跳**：`--mcp-config` 里的地址是个占位符，broker 绑好本机端口后替换成自己的，再把请求转发给 dsh（对面的 MCP 传输是无状态 POST，转发就是转发）。dsh 不在时这一跳**重试**而不是失败；实在过不去就回一个 `isError` 的 JSON-RPC 结果——「这次调用失败了」，模型会重试，而不是「这个服务器没了」。绑不上端口就退回直连，行为和以前一样。顺带：上游 token 从 Claude 的 argv 挪进了 0600 的 `mesh.json`，`ps` 看不到了。
 
 - **另一个 dsh 不会再回收你的 Claude 了**。broker 目录住在目标机器共享的 `/tmp/ccmode` 里，而同一台机器可能被不止一个 dsh 驱动——笔记本上的 dsh 通过 `docker exec` 伸进容器，容器里往往还跑着一个自己的 dsh。对第二个 dsh 来说，第一个建的每个目录都是它没听说过的会话（「孤儿」），于是它的回收器在 **5 分钟**空闲后就把那个 Claude 杀掉、把目录 `rm -rf` 了。表现出来就是「隔几分钟回来一发消息就卡住」——实测一个下午同一个对话被这样收了 11 次，而干活的那台 dsh 日志里一条回收记录都没有。现在每个 dsh 有一个持久的实例 id（`~/.cache/ccmode/state.json` 的 `#instance`），每次启动都把它盖进 broker 目录的 `owner` 文件；扫描时别人盖章的目录一律不碰，只有整整一天没动过的才会被当成「那个 dsh 已经不在了」扫掉。
