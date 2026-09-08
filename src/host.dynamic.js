@@ -773,12 +773,38 @@ return {
       return out
     }
 
+    // Nothing may be written before the file has been READ.
+    //
+    // `persistStates()` rewrites the whole file from memory, and memory before
+    // the load is EMPTY — so a single early write (a command roster, a settings
+    // touch, anything) replaces the file with a two-key stub. That is how
+    // `#remotes` went missing: the block whose own comment says our writes must
+    // never erase the user's targets, erased by our own write, one tick before
+    // the load that would have populated it. Every conversation's engine choice
+    // and this dsh's identity went with it, which is why a restart came up with
+    // no targets and a brand-new instance id.
+    let statesLoaded = false
+    let persistWaiting = false
+
     async function loadPersistedStates() {
-      const raw = await runCapture(['/bin/sh', '-c', 'cat ' + STATE_PATH + ' 2>/dev/null'], 5000)
       let stored = null
-      try { stored = JSON.parse(raw) } catch (error) { stored = null }
-      if (stored === null || typeof stored !== 'object') { mintInstanceId(); return }
-      try { return await applyPersistedStates(stored) } finally { mintInstanceId() }
+      try {
+        const raw = await runCapture(['/bin/sh', '-c', 'cat ' + STATE_PATH + ' 2>/dev/null'], 5000)
+        try { stored = JSON.parse(raw) } catch (error) { stored = null }
+      } catch (error) {
+        // The file could not be READ. Staying un-loaded means nothing is ever
+        // written either, which is the only safe answer: a write now would
+        // replace settings we failed to see with settings we do not have.
+        console.error('cc-mode: could not read', STATE_PATH, '— nothing will be persisted this run:', errorText(error))
+        return
+      }
+      try {
+        if (stored !== null && typeof stored === 'object') await applyPersistedStates(stored)
+      } finally {
+        statesLoaded = true
+        mintInstanceId()
+        if (persistWaiting) { persistWaiting = false; persistStates() }
+      }
     }
 
     /**
@@ -882,6 +908,8 @@ return {
 
     /** Persist the per-conversation choices, coalesced to one write per tick. */
     function persistStates() {
+      // Before the load, memory is not the truth — the file is. See statesLoaded.
+      if (!statesLoaded) { persistWaiting = true; return }
       if (statePersistScheduled) return
       statePersistScheduled = true
       armTimeout(() => {
