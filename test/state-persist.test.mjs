@@ -138,3 +138,28 @@ test('文件读不出来：什么都不写——宁可不存，也不能拿看�
   assert.deepEqual(rig.calls.writes, [], '读失败之后写一次就是拿空内存覆盖真设置')
   assert.equal(rig.instance(), '', '连 id 都不该 mint——mint 会触发落盘')
 })
+
+// 落盘必须是「写临时文件 + mv」。`cat > file` 一打开就把文件截断了，而这个插件
+// 一次 dsh 启动会激活不止一次（日志里一次重启三次激活）：激活 B 正好在激活 A
+// 截断的那一瞬间去读，读到空文件，于是认定「没有东西可恢复」，再把这个结论写
+// 回去——用户的目标和所有对话设置就这么没了，两次。同目录内的 mv 是原子的，读
+// 的人只会看到旧文件或新文件，看不到中间那个空档。
+test('状态文件是 mv 进去的，不是就地截断重写', () => {
+  const body = sliceFunction('persistStates')
+  assert.match(body, /\.tmp\.\$\$/, '没有临时文件，就还是就地截断')
+  assert.match(body, /&& mv /, '临时文件要 mv 进去，这一步才是原子的')
+  // 只看真正的命令行（注释里也提到了 `cat > file`，那是在讲这个 bug 本身）。
+  const command = body.split('\n').filter((line) => line.indexOf('//') === -1 && line.indexOf('cat > ') !== -1)
+  assert.equal(command.length, 1, '落盘命令应该只有一处')
+  assert.match(command[0], /cat > ' \+ STATE_PATH \+ '\.tmp\.\$\$/,
+    'cat 的目标必须是临时文件——直接 cat > 真文件就是那个 bug 本身')
+})
+
+test('内容读回来是坏的，就当读失败——不是当成空的重来一遍', async () => {
+  const rig = build('{ 这不是 JSON')
+  await rig.load()
+  rig.persist()
+  await settled()
+  assert.deepEqual(rig.calls.writes, [], '解析不了就不许写：那多半是读到了别人写到一半的文件')
+  assert.equal(rig.instance(), '', '也不该 mint——mint 会触发落盘')
+})

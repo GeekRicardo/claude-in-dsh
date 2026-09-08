@@ -790,7 +790,8 @@ return {
       let stored = null
       try {
         const raw = await runCapture(['/bin/sh', '-c', 'cat ' + STATE_PATH + ' 2>/dev/null'], 5000)
-        try { stored = JSON.parse(raw) } catch (error) { stored = null }
+        if (String(raw).trim().length === 0) stored = null   // no file yet — a legitimate empty start
+        else stored = JSON.parse(raw)                        // unparsable is a FAILURE, not an empty start
       } catch (error) {
         // The file could not be READ. Staying un-loaded means nothing is ever
         // written either, which is the only safe answer: a write now would
@@ -960,7 +961,18 @@ return {
         }
         try {
           const proc = silenceStdin(subprocess.spawn({
-            argv: ['/bin/sh', '-c', 'mkdir -p ' + STATE_DIR + ' && cat > ' + STATE_PATH],
+            // Written to a temp file and MOVED into place, never straight into
+            // the real one. `cat > file` truncates the moment it opens, and this
+            // plugin activates more than once per dsh start (three activations
+            // in one restart, by the log): activation B read the file during
+            // activation A's truncation, saw an empty file, concluded there was
+            // nothing to restore, and wrote that conclusion back. The user's
+            // targets and every conversation's settings went with it — twice.
+            // `mv` within one directory is atomic, so a reader sees either the
+            // old file or the new one and never the gap between them.
+            argv: ['/bin/sh', '-c', 'mkdir -p ' + STATE_DIR
+              + ' && cat > ' + STATE_PATH + '.tmp.$$'
+              + ' && mv ' + STATE_PATH + '.tmp.$$ ' + STATE_PATH],
             cwd: '/',
             stdio: { stdin: 'pipe', stdout: 'ignore', stderr: 'ignore' },
             graceMs: 2000,
