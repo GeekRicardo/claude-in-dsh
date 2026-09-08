@@ -777,7 +777,23 @@ return {
       const raw = await runCapture(['/bin/sh', '-c', 'cat ' + STATE_PATH + ' 2>/dev/null'], 5000)
       let stored = null
       try { stored = JSON.parse(raw) } catch (error) { stored = null }
-      if (stored === null || typeof stored !== 'object') return
+      if (stored === null || typeof stored !== 'object') { mintInstanceId(); return }
+      try { return await applyPersistedStates(stored) } finally { mintInstanceId() }
+    }
+
+    /**
+     * Name this dsh, once and durably. A brand-new deployment gets its id here;
+     * every launch from then on stamps its broker directories with it, so the
+     * sweep can tell its own work from another dsh's on the same machine.
+     */
+    function mintInstanceId() {
+      if (instanceId.length > 0) return
+      instanceId = uuid()
+      persistStates()
+      console.log('cc-mode: this dsh is', instanceId, '— broker directories are stamped with it')
+    }
+
+    async function applyPersistedStates(stored) {
       // Written as a bare array before targets existed — that roster is this
       // machine's, so it loads under the empty key rather than being dropped.
       const savedCommands = stored['#commands']
@@ -801,6 +817,9 @@ return {
         }
         if (EFFORTS.some((entry) => entry.id === savedDefaults.effort)) defaults.effort = savedDefaults.effort
         if (typeof savedDefaults.remote === 'string') defaults.remote = savedDefaults.remote
+      }
+      if (typeof stored['#instance'] === 'string' && stored['#instance'].length > 0) {
+        instanceId = stored['#instance']
       }
       const savedDirs = stored['#lastDirs']
       if (savedDirs !== null && typeof savedDirs === 'object' && !Array.isArray(savedDirs)) {
@@ -827,7 +846,7 @@ return {
       }
       for (const sessionId of Object.keys(stored)) {
         if (sessionId === '#commands' || sessionId === '#defaults' || sessionId === '#remotes'
-          || sessionId === '#lastDirs') continue
+          || sessionId === '#lastDirs' || sessionId === '#instance') continue
         const saved = stored[sessionId]
         if (saved === null || typeof saved !== 'object') continue
         const state = stateOf(sessionId)
@@ -880,6 +899,7 @@ return {
         // first persist after boot would delete every target the user declared.
         if (remotesRaw !== null) out['#remotes'] = remotesRaw
         if (lastDirs.size > 0) out['#lastDirs'] = Object.fromEntries(lastDirs)
+        if (instanceId.length > 0) out['#instance'] = instanceId
         for (const [sessionId, state] of states) {
           const claudeSessionId = state.claudeSessionId === undefined ? '' : state.claudeSessionId
           const remote = typeof state.remote === 'string' ? state.remote : ''
@@ -1436,6 +1456,22 @@ return {
     const BYTES = new TextEncoder()
     const BROKER_ROOT = '/tmp/ccmode'
     const BROKER_PATH = BROKER_ROOT + '/broker.mjs'
+    // How long another dsh's broker directory may sit untouched before this one
+    // sweeps it anyway. Long enough that it can only mean that dsh is gone.
+    const FOREIGN_REAP_MS = 24 * 60 * 60 * 1000
+
+    // Which dsh this deployment is. Broker directories live in a shared /tmp on
+    // the target machine, and more than one dsh can drive that machine: this
+    // laptop's dsh reaches into the container over `docker exec`, and the
+    // container runs a dsh of its own. To the second one every directory the
+    // first created is a conversation it has never heard of — "orphaned" — and
+    // its reaper killed those Claudes after five idle minutes and rm -rf'd
+    // their directories. The symptom was a conversation that hung the moment
+    // you came back to it after a few minutes away: the process it was talking
+    // to had been collected by a dsh that had nothing to do with it, eleven
+    // times over in one afternoon by the log. So each launch stamps the
+    // directory with its owner, and a sweep leaves other people's alone.
+    let instanceId = ''
     const BROKER_SOURCE = "// cc-mode broker \u2014 owns one Claude Code process so the dsh plugin can come and\n// go without killing it.\n//\n// Written to /tmp/ccmode/broker.mjs by the plugin and started detached\n// into its own session, so it survives a plugin hot-update, a plugin stop,\n// and a dsh restart. The plugin attaches by tailing `out.log` from a byte offset and\n// speaks to Claude by writing lines into the `in` fifo. Nothing in the plugin\n// holds the process itself.\n//\n// Layout of a session directory:\n//   in         fifo   \u2192 Claude's stdin (held open r+ so writers never EOF it)\n//   out.log    file   \u2192 every stdout line, append-only; the attach point\n//   meta.json  file   \u2192 pid, child pid, claude session id, launch snapshot\n//   exit.json  file   \u2192 written once the child exits\n\nimport { spawn } from 'node:child_process'\nimport fs from 'node:fs'\n\nconst dir = process.argv[2]\nconst argv = process.argv.slice(3)\nif (typeof dir !== 'string' || argv.length === 0) {\n  console.error('usage: broker.mjs <dir> <argv...>')\n  process.exit(2)\n}\n\nconst out = fs.createWriteStream(dir + '/out.log', { flags: 'a' })\n\nfunction record(value) {\n  out.write(JSON.stringify(value) + '\\n')\n}\n\nconst child = spawn(argv[0], argv.slice(1), { stdio: ['pipe', 'pipe', 'pipe'] })\n\nfunction patchMeta(patch) {\n  let meta = {}\n  try { meta = JSON.parse(fs.readFileSync(dir + '/meta.json', 'utf8')) } catch (error) { meta = {} }\n  fs.writeFileSync(dir + '/meta.json', JSON.stringify({ ...meta, ...patch }))\n}\n\npatchMeta({ brokerPid: process.pid, childPid: child.pid, startedAt: Date.now() })\n\nchild.stdout.pipe(out, { end: false })\nchild.stderr.on('data', (chunk) => {\n  const text = String(chunk).trim()\n  if (text.length > 0) record({ type: 'cc-stderr', text: text })\n})\n\n// Holding the fifo open for read AND write is what keeps it from ending the\n// moment a `cat > in` writer closes: there is always one writer (us).\nconst fifo = fs.openSync(dir + '/in', 'r+')\nfs.createReadStream(null, { fd: fifo }).pipe(child.stdin)\nchild.stdin.on('error', () => { /* the child went away; the exit handler reports it */ })\n\nchild.on('exit', (code, signal) => {\n  record({ type: 'cc-exit', exitCode: code, signal: signal })\n  try { fs.writeFileSync(dir + '/exit.json', JSON.stringify({ code: code, signal: signal, at: Date.now() })) } catch (error) { /* best effort */ }\n  setTimeout(() => process.exit(0), 200)\n})\n\n// A broker with no child is pointless; a broker whose parent died is the point.\nprocess.on('SIGHUP', () => { /* survive the detaching shell */ })\n"
 
     /**
@@ -2170,6 +2206,9 @@ return {
         + 'rm -f ' + shellQuote(dir + '/exit.json') + ' ' + shellQuote(dir + '/attach.json') + '; '
         + '[ -p ' + shellQuote(dir + '/in') + ' ] || mkfifo ' + shellQuote(dir + '/in') + '; '
         + 'touch ' + shellQuote(dir + '/out.log') + '; '
+        // Whose broker this is. Written every launch (not just the first) so a
+        // directory adopted from an older build gets a name too.
+        + 'printf %s ' + shellQuote(instanceId) + ' > ' + shellQuote(dir + '/owner') + '; '
         + 'printf %s ' + shellQuote(metaSeed) + ' > ' + shellQuote(dir + '/meta.json') + '; '
         + 'mkdir -p ' + shellQuote(cwd) + '; cd ' + shellQuote(cwd) + '; '
         + shellQuote(nodeBin) + ' -e ' + shellQuote(detachLauncher) + ' ' + shellQuote(BROKER_PATH) + ' ' + shellQuote(dir) + ' '
@@ -2282,7 +2321,8 @@ return {
       const listing = await runCapture(shArgv(
         'for d in ' + shellQuote(BROKER_ROOT) + '/session-*; do '
         + '[ -d "$d" ] || continue; '
-        + 'echo "$d|$(stat -c %Y "$d/out.log" 2>/dev/null || stat -f %m "$d/out.log" 2>/dev/null || echo 0)"; done', remote), 8000)
+        + 'echo "$d|$(stat -c %Y "$d/out.log" 2>/dev/null || stat -f %m "$d/out.log" 2>/dev/null || echo 0)'
+        + '|$(cat "$d/owner" 2>/dev/null)"; done', remote), 8000)
       const now = Date.now()
       // Sessions dsh still knows about. A broker for a conversation that no
       // longer exists (deleted, or from an older dsh state) is pure waste and
@@ -2293,11 +2333,22 @@ return {
       }
       for (const line of String(listing).split('\n')) {
         const parts = line.trim().split('|')
-        if (parts.length !== 2 || parts[0].length === 0) continue
+        if (parts.length < 2 || parts[0].length === 0) continue
         const dir = parts[0]
         const touchedAt = parseInt(parts[1], 10) * 1000
         if (isNaN(touchedAt)) continue
+        const owner = parts.length > 2 ? parts[2].trim() : ''
         const idleMs = now - touchedAt
+        // Another dsh's broker. Not ours to judge: the conversation behind it
+        // is live on a screen we cannot see, and the age rules below would read
+        // it as an orphan and collect it after five minutes. Only a directory
+        // that has been silent for a day is swept regardless of owner, so a dsh
+        // that was uninstalled cannot leave /tmp growing forever.
+        if (owner.length > 0 && owner !== instanceId) {
+          if (idleMs < FOREIGN_REAP_MS) continue
+          console.log('cc-mode: sweeping a broker left by another dsh (' + owner + ') —',
+            'idle', Math.round(idleMs / 3600000), 'h')
+        }
         // "Orphaned" must mean the conversation is GONE, not that nobody is
         // looking at it. `agents.list()` answers the second question: dsh
         // unloads an idle agent, so a conversation you simply left alone drops
