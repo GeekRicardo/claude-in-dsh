@@ -113,3 +113,18 @@ test('the bundle no longer carries the multi-agent half — it moved to dsh-agen
     'the old embedded MCP endpoint is gone',
   )
 })
+
+// broker 的源码是插件真正写到目标机 /tmp/ccmode 的那份文本。它曾经是手工粘进
+// host 里的一个字符串字面量，于是发生了手工副本必然发生的事：它悄悄过期了。
+// broker 的修复写了、构建了、提交了，却一次都没有到过任何一台机器上——因为跑起来
+// 的是那个字面量。现在由构建生成，这条测试保证两边不会再分家。
+test('内嵌的 broker 源码就是 src/broker.mjs，一个字节都不差', () => {
+  const src = fs.readFileSync(path.join(root, 'src/broker.mjs'), 'utf8')
+  const index = fs.readFileSync(path.join(root, 'lib/index.js'), 'utf8')
+  assert.equal(index.indexOf('@@BROKER_SOURCE@@'), -1,
+    '构建没有把标记替换掉——那样发到目标机的会是字面上的 "@@BROKER_SOURCE@@"')
+  const match = index.match(/const BROKER_SOURCE = (".*")\n/)
+  assert.ok(match !== null, 'lib/index.js 里找不到 BROKER_SOURCE')
+  assert.equal(JSON.parse(match[1]), src,
+    '内嵌的 broker 和 src/broker.mjs 不一致：改了 broker 却没重新构建，目标机拿到的还是旧的')
+})

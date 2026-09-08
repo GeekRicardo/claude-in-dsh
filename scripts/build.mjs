@@ -30,7 +30,14 @@ const write = (rel, text) => {
   console.log('built', rel, `(${Buffer.byteLength(text)} bytes)`)
 }
 
-const hostBody = read('src/host.dynamic.js')
+// The broker text the plugin writes to /tmp/ccmode comes from src/broker.mjs,
+// generated here rather than pasted into the host by hand — see the marker's
+// comment in src/host.dynamic.js for what that cost.
+const brokerSource = read('src/broker.mjs')
+const hostBody = read('src/host.dynamic.js').replace("'@@BROKER_SOURCE@@'", () => JSON.stringify(brokerSource))
+if (hostBody.indexOf('@@BROKER_SOURCE@@') !== -1) {
+  throw new Error('build: the BROKER_SOURCE marker is still in the host body — the broker would ship stale')
+}
 const clientBody = read('src/client.dynamic.js')
 
 // ---------------------------------------------------------------------------

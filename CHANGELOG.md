@@ -6,6 +6,8 @@
 
 ### 修复
 
+- **broker 的修复终于会到达目标机**。插件写到目标机 `/tmp/ccmode/broker.mjs` 的那份文本，来自 `src/host.dynamic.js` 里一个**手工粘贴的字符串字面量**，而不是 `src/broker.mjs`；构建只是把 `src/broker.mjs` 复制成 `lib/broker.mjs` 当参考。于是发生了手工副本必然发生的事：它悄悄过期了。broker 的改动写了、构建了、提交了、测试也是对着真 broker 跑的——却一次都没有到过任何一台机器上。现场是 Claude 拿到了没被替换的占位符地址：`dialing http://__ccmode_mesh__/… (ECONNRESET)`。现在这段文本由构建从 `src/broker.mjs` 生成，标记没被替换就直接构建失败，另有一条测试逐字节比对内嵌文本和源文件。
+
 - **僵尸 broker 不再被当成活着的 broker**。插件靠 `exit.json` 加上对 broker pid 的存活检查来决定「重新挂上去」还是「重开一个」，而存活检查是 `kill -0`——它对**僵尸进程**也说「在」。一个死掉但没人收尸的 broker（容器的 pid 1 是 `sleep infinity`，永远不收）于是被判成活的，插件重新挂上去，把每一条 prompt 写进一个没人读的 fifo，对话就此不说话，日志里没有任何一行解释。现在存活检查看的是**进程状态**（`ps -o stat=`，`Z` 开头即死），没有 `ps` 的机器退回原来的存在性判断。
 - **broker 干完活会真的退出**。`process.exit()` 在这个文件里出不去——实测它进了退出路径就不回来，进程还活着：这个进程为了不让 fifo 断掉，把 `in` 同时按读写打开，那是个谁都不会关的句柄。后果是每个跑完的对话都留下一个不死的 broker。现在每一条离开的路都走同一个硬退出：先杀掉 Claude 子进程，再给自己一刀——信号不会卡住。
 - **broker 死了一定留下话**。上面那个僵尸的成因：`out.log` 写入流和 `in` fifo 读取流都没有 `error` 处理，一个未处理的 stream 错误直接把 Node 打死（退出码 1），`exit.json` 没写、`cc-exit` 没记——现场是 broker 退出码 1、它的 Claude 退出码 0（stdin EOF，握着 fifo 的只有 broker）、`out.log` 断在半句话上、一轮挂了几个小时。现在两个流都接住 `error`，另加 `uncaughtException` / `unhandledRejection` 兜底，每一条离开 broker 的路都先写 `cc-exit` 和 `exit.json`——附着的插件因此立刻知道进程没了，而不是干等。
