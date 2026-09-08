@@ -461,3 +461,22 @@ test('落盘表达式本身不再省略空的 remote', () => {
     '空 remote 又被省掉了——本机会话会在重启后漂到默认目标')
   assert.match(source, /^\s+remote: remote,$/m, '落盘里应无条件写 remote')
 })
+
+// 进程搬到远端目标上跑之后，dsh 交给它的回调地址还是 dsh 自己的 loopback。
+// 在那台机器上 127.0.0.1 就是那台机器——实测容器里恰好也蹲着一个 dsh，于是
+// 请求打给了另一个实例，症状只是「token 被拒、mesh 工具消失」。
+test('回调地址要改写成目标机器打得通的那个', () => {
+  const made = new Function(`${sliceFunction('reachableFromTarget')}; return reachableFromTarget`)()
+  const url = 'http://127.0.0.1:3080/dsh-agent-mesh/mcp/session-abc'
+
+  assert.equal(made(url, null), url, '本机进程用 loopback 是对的')
+  assert.equal(made(url, { dshHost: '' }), url, '没声明就别乱改——但另有告警提醒')
+  assert.equal(made(url, { dshHost: '0.250.250.254:3082' }),
+    'http://0.250.250.254:3082/dsh-agent-mesh/mcp/session-abc', '只换 origin，路径原样保留')
+  assert.equal(made(url, { dshHost: 'https://box.example:9000' }),
+    'https://box.example:9000/dsh-agent-mesh/mcp/session-abc', '带 scheme 的照用')
+  assert.equal(made(url, { dshHost: 'host:1/' }),
+    'http://host:1/dsh-agent-mesh/mcp/session-abc', '尾斜杠不该拼出双斜杠')
+  // 路径里带着会话 id——按会话寻址必须留住，否则 parent 又会认错
+  assert.ok(made(url, { dshHost: 'h:1' }).endsWith('/session-abc'))
+})

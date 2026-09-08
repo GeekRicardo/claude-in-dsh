@@ -491,6 +491,14 @@ return {
         // a PATH routinely lacks, and the spawn then fails with no output at
         // all. Resolved once at load; `dockerBin` overrides.
         dockerBin: typeof raw.dockerBin === 'string' && raw.dockerBin.length > 0 ? raw.dockerBin : '',
+        // How this target reaches dsh's web server to call back into it.
+        // Everything dsh hands a Claude process as a callback URL is built from
+        // dsh's own loopback address — correct while the process runs beside
+        // it, meaningless once the process runs on another machine, where
+        // 127.0.0.1 is that machine. Worse than meaningless, in fact: a target
+        // that happens to run its own dsh on the same port answers instead, and
+        // the only symptom is a rejected token.
+        dshHost: typeof raw.dshHost === 'string' ? raw.dshHost.trim() : '',
       }
     }
 
@@ -1372,17 +1380,39 @@ return {
      * or null when the multi-agent half is not composed. Added, never strict:
      * the user's own MCP servers must keep working.
      */
-    async function multiagentMcpConfig(sessionId) {
+    /**
+     * Point a callback URL at an address the target can actually reach.
+     * @param url - the URL dsh built from its own loopback address.
+     * @param remote - the target the process runs on, or null for this machine.
+     * @returns the URL with its origin replaced when the target declares one.
+     */
+    function reachableFromTarget(url, remote) {
+      if (remote === null || remote === undefined || remote.dshHost === '') return url
+      const schemeAt = url.indexOf('://')
+      if (schemeAt < 0) return url
+      const pathAt = url.indexOf('/', schemeAt + 3)
+      if (pathAt < 0) return url
+      const origin = remote.dshHost.indexOf('://') >= 0 ? remote.dshHost : 'http://' + remote.dshHost
+      return origin.replace(/\/+$/, '') + url.slice(pathAt)
+    }
+
+    async function multiagentMcpConfig(sessionId, remote) {
       const control = ctx.get('multiagentControl')
       if (control === undefined || typeof control.endpoint !== 'function') return null
       let endpoint
       try { endpoint = await control.endpoint(sessionId) } catch (error) { return null }
       if (endpoint === null || endpoint === undefined || typeof endpoint.url !== 'string') return null
+      if (remote !== null && remote !== undefined && remote.dshHost === '') {
+        console.error('cc-mode: target "' + remote.id + '" declares no dshHost, so the agent-mesh endpoint handed to'
+          + ' Claude over there is dsh\'s own loopback address — which on that machine is that machine.'
+          + ' The mesh tools will fail to connect (or reach whatever else listens on that port).'
+          + ' Set "dshHost": "<host:port reachable from ' + remote.id + '>" on the target.')
+      }
       return JSON.stringify({
         mcpServers: {
           'dsh-agents': {
             type: 'http',
-            url: endpoint.url,
+            url: reachableFromTarget(endpoint.url, remote),
             headers: { Authorization: 'Bearer ' + endpoint.token },
           },
         },
@@ -1518,6 +1548,11 @@ return {
     function warnShadowedMeshConfig(remote) {
       const key = remote === null || remote === undefined ? '' : remote.id
       if (shadowChecked.has(key)) return
+      // A hand-written mesh server is the ONLY way to reach dsh from a target
+      // that declares no dshHost — telling someone to remove their only working
+      // route is worse than saying nothing. Speak up once the injected endpoint
+      // is actually usable there.
+      if (remote !== null && remote !== undefined && remote.dshHost === '') return
       shadowChecked.add(key)
       const where = key === '' ? 'this machine' : key
       runCapture(shArgv('cat "$HOME"/.claude.json 2>/dev/null', remote), 8000).then((raw) => {
@@ -1540,9 +1575,9 @@ return {
         if (found.length === 0) return
         console.error('cc-mode: an mcpServers entry on ' + where + ' points at the agent-mesh endpoint'
           + ' and will shadow the per-conversation one this plugin injects — children opened from a Claude'
-          + ' conversation would then be filed under that fixed handle, and their completion notices could'
-          + ' never reach the conversation. Remove it (or rename it so the tool names do not collide): '
-          + found.join(', '))
+          + ' conversation are then filed under that fixed handle, and their completion notices never reach'
+          + ' the conversation. The injected endpoint now reaches dsh from here on its own, so this entry can'
+          + ' go (or be renamed so the tool names do not collide): ' + found.join(', '))
       }, () => undefined)
     }
 
@@ -2019,7 +2054,7 @@ return {
       // `--mcp-config` is VARIADIC: it keeps eating arguments until the next
       // flag, so it must never sit immediately before a positional. Here it is
       // followed by `--session-id`/`--resume`, which stops it.
-      const agentsMcp = await multiagentMcpConfig(sessionId)
+      const agentsMcp = await multiagentMcpConfig(sessionId, remote)
       if (agentsMcp !== null) warnShadowedMeshConfig(remote)
       if (agentsMcp !== null) argv.push('--mcp-config', agentsMcp)
       if (forkFrom !== null) {
