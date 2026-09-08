@@ -4,6 +4,10 @@
 
 ## 1.12.0 — 未发布
 
+### 修复
+
+- **插件自己问的 `/context` 不会再串成对话里的一条消息**。上下文用量读数每轮问一次 Claude 的 `/context`，这是带外命令：命令循环吃掉自己的字节，再把 `result` 之后的偏移交给下一个读取器。可写超时或流断掉时它交不出偏移，于是重新挂上、掉线补投影、轮次之间的读取器都从命令**之前**开始读——Claude 的 `## Context Usage` 表格就被当成用户问出来的话渲染进了对话（实测：一条对话的 turn 4 第一句就是那张表）。现在命令写进去之前先把起始字节落盘，写成功才认；断流之后每条恢复路径都先读到那一轮的 `result` 再往下走，还活着的流则由泵把这一轮直接咽掉。命令从没写进去就不留标记——那种情况下要跳过的那一轮是用户的。
+
 ### 变更
 
 - **多 agent 协作拆分成独立插件 [dsh-agent-mesh](https://github.com/GeekRicardo/dsh-agent-mesh)**。此前内嵌在本 bundle 里的 `agent_*` 工具与多 agent MCP 端点整体搬了出去；本 bundle 不再注册它们，也不再挂 `/claude-in-dsh/agents/mcp`（两条 host 行发布同名服务会冲突）。dsh-agent-mesh 发布本 host 半边一直消费的同名 `multiagentControl` 服务，所以 `--mcp-config` 装配、`launchSnapshot` 判定都无需改动；组合它是可选的，不装时 Claude 会话就没有 `agent_*` 工具、提问照旧走人工卡片。
