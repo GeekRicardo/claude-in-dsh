@@ -136,6 +136,9 @@ test('用量提前回来就提前继续，用的是另一句提示', async () =>
 
 test('一次抖动不算恢复，读数回来后照常走完', async () => {
   let polls = 0
+  // 固定的重置时刻。用 Date.now()+30 每次算一遍会把 wait.at 一路往后推，
+  // 变成永远追不上的目标——等待就再也结束不了。
+  const at = Date.now() + 30
   const rig = build({
     QUOTA_POLL_MS: 1,
     // 第一次读不到，之后恢复正常但额度仍然用满——等待应该继续到重置。
@@ -143,10 +146,9 @@ test('一次抖动不算恢复，读数回来后照常走完', async () => {
       polls += 1
       return polls === 1
         ? { official: true, error: 'usage endpoint unavailable' }
-        : { official: true, windows: [window('five_hour', '5h', 100, Date.now() + 30)] }
+        : { official: true, windows: [window('five_hour', '5h', 100, at)] }
     },
   })
-  const at = Date.now() + 30
   const kept = await rig.waitOutQuota('s', transcriptOf(rig.calls), runOf(rig.calls),
     { id: 'five_hour', label: '5h', at: at }, new AbortController().signal)
 
