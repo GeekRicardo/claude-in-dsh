@@ -1802,6 +1802,28 @@ return {
       return isNaN(size) ? 0 : size
     }
 
+    /**
+     * Does that file exist? 'yes', 'no', or 'unknown' — and 'unknown' is the
+     * whole point.
+     *
+     * `runCapture` never rejects: a command that timed out and one that found
+     * nothing both come back as ''. Reading that as "the file is not there" is
+     * how a conversation lost its history — the 30MB transcript behind it was
+     * sitting right where it always was, a `stat` on a machine at load 80 took
+     * longer than its five seconds, and the answer came back empty. The plugin
+     * read that as "nothing to resume" and started the conversation over with a
+     * brand-new, empty Claude session. So the shell says which it means, in
+     * words, and anything else is 'unknown' — never 'no'.
+     */
+    async function fileExistsOfShellWord(word, remote) {
+      const answer = await runCapture(shArgv(
+        'if [ -f ' + word + ' ]; then echo yes; else echo no; fi', remote), 20000)
+      const text = String(answer).trim()
+      if (text === 'yes') return 'yes'
+      if (text === 'no') return 'no'
+      return 'unknown'
+    }
+
     function createRun(sessionId, dir, snapshot, claudeSessionId, remote) {
       const run = {
         sessionId: sessionId,
@@ -2256,9 +2278,19 @@ return {
       // same-id transcript under some other project directory).
       if (resume !== null) {
         const transcript = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd)) + '/' + shellQuote(resume + '.jsonl')
-        if (await fileSizeOfShellWord(transcript, remote) <= 0) {
+        // Only a definite "no" may cost a conversation its history. If the
+        // check cannot answer, RESUME: `--resume` against a missing transcript
+        // is one loud failed turn that the operator can see and retry, while
+        // not resuming silently replaces the conversation's Claude with an
+        // empty one — and the transcript, if it was there, stays orphaned.
+        const exists = await fileExistsOfShellWord(transcript, remote)
+        if (exists === 'no') {
           console.log('cc-mode: recorded Claude session', resume, 'has no transcript on disk — starting a fresh one')
           resume = null
+        } else if (exists === 'unknown') {
+          console.error('cc-mode: could not tell whether the transcript for', resume, 'exists —'
+            + ' resuming anyway rather than starting this conversation over with an empty Claude.'
+            + ' A loaded machine timing out that check is the usual cause.')
         }
       }
       // Nothing to resume, but dsh may have forked this conversation out of
