@@ -1489,18 +1489,31 @@ return {
       // as the server being gone, after which the model stops using the mesh
       // for the rest of its life. See the hop in broker.mjs.
       //
-      // The token rides in mesh.json (0600) instead of Claude's argv.
+      // dsh's own bearer stays in mesh.json (0600); the hop adds it upstream.
+      // What travels in argv is a DIFFERENT, per-launch secret that only the
+      // hop accepts — and it has to be there. A server configured with no
+      // `headers.Authorization` sends the CLI down its OAuth path instead:
+      // "No token data found", once a second, 1565 times in twenty-six minutes,
+      // with the model told its mesh is unreachable the whole while. An
+      // explicit header is what turns that off.
       const url = reachableFromTarget(endpoint.url, remote)
       const authority = originOf(url)
-      if (authority === '') return JSON.stringify(directMeshConfig(url, endpoint.token))
-      return JSON.stringify({
-        mcpServers: {
-          'dsh-agents': {
-            type: 'http',
-            url: url.replace(authority, MESH_PLACEHOLDER),
+      if (authority === '') return { config: JSON.stringify(directMeshConfig(url, endpoint.token)), seed: null }
+      const hopToken = uuid().replace(/-/g, '')
+      return {
+        config: JSON.stringify({
+          mcpServers: {
+            'dsh-agents': {
+              type: 'http',
+              url: url.replace(authority, MESH_PLACEHOLDER),
+              headers: { Authorization: 'Bearer ' + hopToken },
+            },
           },
-        },
-      })
+        }),
+        // What the broker needs: where dsh is, dsh's bearer, and the local
+        // secret this launch's Claude will present at the hop.
+        seed: { origin: authority, token: endpoint.token, local: hopToken },
+      }
     }
 
     /** `http://host:port/path` → `host:port`, or '' when it is not shaped like that. */
@@ -1521,21 +1534,6 @@ return {
       }
     }
 
-    /**
-     * What the broker needs to reach dsh on this conversation's behalf: the
-     * origin the placeholder stands in for, and the bearer it must add.
-     */
-    async function meshSeed(sessionId, remote) {
-      const control = ctx.get('multiagentControl')
-      if (control === undefined || typeof control.endpoint !== 'function') return null
-      let endpoint
-      try { endpoint = await control.endpoint(sessionId) } catch (error) { return null }
-      if (endpoint === null || endpoint === undefined || typeof endpoint.url !== 'string') return null
-      const url = reachableFromTarget(endpoint.url, remote)
-      const authority = originOf(url)
-      if (authority === '') return null
-      return { origin: authority, token: endpoint.token }
-    }
 
     // ---------- the Claude process, owned by a detached broker ----------
     //
@@ -2288,16 +2286,12 @@ return {
       // `--mcp-config` is VARIADIC: it keeps eating arguments until the next
       // flag, so it must never sit immediately before a positional. Here it is
       // followed by `--session-id`/`--resume`, which stops it.
-      const agentsMcp = await multiagentMcpConfig(sessionId, remote)
-      if (agentsMcp !== null) warnShadowedMeshConfig(remote)
-      if (agentsMcp !== null) argv.push('--mcp-config', agentsMcp)
-      // Only when the config actually carries the placeholder: a direct config
-      // (no origin to stand in for) must not leave a stale seed behind that a
-      // later launch would read.
-      const seed = agentsMcp !== null && agentsMcp.indexOf(MESH_PLACEHOLDER) !== -1
-        ? await meshSeed(sessionId, remote)
-        : null
-      const meshSeedJson = seed === null ? null : JSON.stringify(seed)
+      const agents = await multiagentMcpConfig(sessionId, remote)
+      if (agents !== null) warnShadowedMeshConfig(remote)
+      if (agents !== null) argv.push('--mcp-config', agents.config)
+      // A direct config (no origin to stand in for) must not leave a stale seed
+      // behind that a later launch would read.
+      const meshSeedJson = agents === null || agents.seed === null ? null : JSON.stringify(agents.seed)
       if (forkFrom !== null) {
         // The three compose, verified against the CLI: it resumes the parent,
         // branches instead of writing back into it, and takes the id we hand

@@ -76,11 +76,15 @@ async function waitForArgv(dir, timeoutMs = 8000) {
     + fs.readFileSync(path.join(dir, 'out.log'), 'utf8').slice(0, 1000))
 }
 
-function post(port, urlPath, body) {
+function post(port, urlPath, body, bearer = 'hop-secret') {
   return new Promise((resolve, reject) => {
     const request = http.request({
       host: '127.0.0.1', port: port, path: urlPath, method: 'POST',
-      headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) },
+      headers: {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+        ...(bearer === null ? {} : { authorization: 'Bearer ' + bearer }),
+      },
     }, (response) => {
       const chunks = []
       response.on('data', (chunk) => chunks.push(chunk))
@@ -107,7 +111,7 @@ test('broker 把 Claude 指向自己的 hop，并带着 token 转发到 dsh', as
   const dir = tempDir()
   const dsh = await upstream({ jsonrpc: '2.0', id: 1, result: { tools: [] } })
   fs.writeFileSync(path.join(dir, 'mesh.json'),
-    JSON.stringify({ origin: '127.0.0.1:' + dsh.port, token: 'tok-123' }))
+    JSON.stringify({ origin: '127.0.0.1:' + dsh.port, token: 'tok-123', local: 'hop-secret' }))
 
   const config = JSON.stringify({
     mcpServers: { 'dsh-agents': { type: 'http', url: 'http://__CCMODE_MESH__/dsh-agent-mesh/mcp/session-x' } },
@@ -135,7 +139,7 @@ test('dsh 关着的时候：hop 先重试，再答一个工具错误——而不
   const dir = tempDir()
   const dsh = await upstream({ jsonrpc: '2.0', id: 7, result: {} })
   const port = dsh.port
-  fs.writeFileSync(path.join(dir, 'mesh.json'), JSON.stringify({ origin: '127.0.0.1:' + port, token: 't' }))
+  fs.writeFileSync(path.join(dir, 'mesh.json'), JSON.stringify({ origin: '127.0.0.1:' + port, token: 't', local: 'hop-secret' }))
   const config = JSON.stringify({
     mcpServers: { 'dsh-agents': { type: 'http', url: 'http://__CCMODE_MESH__/mcp/p' } },
   })
@@ -164,7 +168,7 @@ test('dsh 回来之后，同一个 hop 继续用——不用重启对话', async
   const dir = tempDir()
   const first = await upstream({ jsonrpc: '2.0', id: 1, result: { round: 'before' } })
   const port = first.port
-  fs.writeFileSync(path.join(dir, 'mesh.json'), JSON.stringify({ origin: '127.0.0.1:' + port, token: 't' }))
+  fs.writeFileSync(path.join(dir, 'mesh.json'), JSON.stringify({ origin: '127.0.0.1:' + port, token: 't', local: 'hop-secret' }))
   const config = JSON.stringify({
     mcpServers: { 'dsh-agents': { type: 'http', url: 'http://__CCMODE_MESH__/mcp/p' } },
   })
@@ -200,9 +204,51 @@ test('没有 mesh.json 就没有 hop：占位符不该留在 Claude 的命令行
   // 配置里没有占位符时，host 侧走的是老形态（url 直连 + Authorization 头）。
   const source = fs.readFileSync(path.join(root, 'src/host.dynamic.js'), 'utf8')
   assert.match(source, /function directMeshConfig\(/, '留一条不带 hop 的老路，占位符替换不了时才有退路')
-  assert.match(source, /agentsMcp\.indexOf\(MESH_PLACEHOLDER\) !== -1/,
-    '只有配置里真的有占位符时才写 mesh.json，否则会留下过期的种子')
+  assert.match(source, /agents === null \|\| agents\.seed === null \? null/,
+    '只有配置真的带了种子时才写 mesh.json，否则会留下过期的种子')
   const broker = fs.readFileSync(path.join(root, 'src/broker.mjs'), 'utf8')
   assert.match(broker, /agent-mesh hop could not bind — talking to dsh directly/,
     'hop 绑不上端口时要退回直连，而不是让这次启动失败')
+})
+
+// 配置里必须有 Authorization——不是为了安全，是因为没有它 Claude Code 会走 OAuth：
+// 「No token data found」，一秒一次，二十六分钟里 1565 条，而这段时间模型一直以为
+// 自己的 mesh 断了。argv 里带的是这一次启动专用的、只有 hop 认的暗号，不是 dsh 的
+// 令牌——dsh 的令牌待在 0600 的 mesh.json 里，由 hop 往上游加。
+test('注入的配置带着 Authorization，而且不是 dsh 的令牌', () => {
+  const source = fs.readFileSync(path.join(root, 'src/host.dynamic.js'), 'utf8')
+  const at = source.indexOf('function multiagentMcpConfig')
+  const body = source.slice(at, source.indexOf('\n    }\n', at))
+  assert.match(body, /headers: \{ Authorization: 'Bearer ' \+ hopToken \}/,
+    '没有这个头，CLI 会一秒一次地去找 OAuth token，永远连不上')
+  assert.match(body, /seed: \{ origin: authority, token: endpoint\.token, local: hopToken \}/,
+    'hop 需要三样：dsh 在哪、dsh 的令牌、这次启动的本地暗号')
+  const headerAt = body.indexOf("headers: { Authorization")
+  const seedAt = body.indexOf('token: endpoint.token')
+  assert.ok(headerAt < seedAt, '别把 endpoint.token 写进 headers——那就等于又把 dsh 令牌塞回 argv')
+  assert.equal(body.slice(headerAt, headerAt + 60).indexOf('endpoint.token'), -1)
+})
+
+test('hop 只认自己那个暗号，别的本地进程进不来', async () => {
+  const dir = tempDir()
+  const dsh = await upstream({ jsonrpc: '2.0', id: 1, result: { ok: true } })
+  fs.writeFileSync(path.join(dir, 'mesh.json'),
+    JSON.stringify({ origin: '127.0.0.1:' + dsh.port, token: 'tok', local: 'hop-secret' }))
+  const config = JSON.stringify({
+    mcpServers: { 'dsh-agents': { type: 'http', url: 'http://__CCMODE_MESH__/mcp/p' } },
+  })
+  const broker = startBroker(dir, config)
+  try {
+    const hop = hopPortOf(await waitForArgv(dir))
+    const good = await post(hop.port, hop.path, '{"jsonrpc":"2.0","id":1,"method":"ping"}')
+    assert.equal(good.status, 200)
+    const bad = await post(hop.port, hop.path, '{"jsonrpc":"2.0","id":1,"method":"ping"}', 'wrong')
+    assert.equal(bad.status, 401)
+    const none = await post(hop.port, hop.path, '{"jsonrpc":"2.0","id":1,"method":"ping"}', null)
+    assert.equal(none.status, 401)
+    assert.equal(dsh.seen.length, 1, '被挡下的请求不该打到 dsh')
+  } finally {
+    broker.kill('SIGKILL')
+    await dsh.close()
+  }
 })
