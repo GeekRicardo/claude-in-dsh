@@ -87,7 +87,12 @@ return {
 
     // Only what dsh has no class for: a left-anchored menu and the two previews.
     styles.insert(`
-      .ccmode-menu-left { left:0; right:auto; }
+      /* 这里曾经有一条 .ccmode-menu-left { left:0; right:auto } 把菜单左对齐到
+         触发器——那是 dsh 的菜单还用 absolute 定位的年代。现在它是
+         position:fixed 且不带任何 inset：没有 inset 的 fixed 元素停在自己在文档
+         流里的静态位置，而菜单就紧跟在触发器后面，于是天然贴着它。插件再写一个
+         left:0，在 fixed 下的含义就变成「贴视口最左边」，菜单被拽到屏幕左下角，
+         离触发器 719px。让位给 dsh 自己的定位即可。 */
       /* dsh's own access selector (PermissionSelect) — replaced, not doubled */
       body[data-ccmode="claude"] .Sh0Q9G_trigger { display:none; }
       .ccmode-diff-add { color:var(--dsw-alias-state-success-primary, #3fb950); }
@@ -134,6 +139,13 @@ return {
       .ccmode-import-row-hit { font-size:11px; color:var(--dsw-alias-label-tertiary, #888);
         white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; }
       .ccmode-import-body { flex:1; overflow:auto; padding:12px 16px; display:flex; flex-direction:column; gap:10px; }
+      .ccmode-import-sources { display:flex; flex-wrap:wrap; gap:6px; margin:6px 0 2px; }
+      .ccmode-import-source { border:none; cursor:pointer; font:inherit; font-size:12px; line-height:18px;
+        padding:2px 10px; border-radius:20px; color:var(--dsw-alias-label-secondary, #666);
+        background:var(--dsw-alias-interactive-bg, rgba(127,127,127,0.10)); }
+      .ccmode-import-source:hover { background:var(--dsw-alias-interactive-bg-hover, rgba(127,127,127,0.18)); }
+      .ccmode-import-source.on { color:var(--dsw-alias-label-primary, #111); font-weight:500;
+        background:var(--dsw-alias-interactive-bg-selected, rgba(217,119,87,0.16)); }
       .ccmode-import-empty { color:var(--dsw-alias-label-tertiary, #888); font-size:13px; padding:24px 0; text-align:center; }
       .ccmode-import-msg { display:flex; font-size:13px; line-height:1.6; }
       .ccmode-import-msg.user { justify-content:flex-end; }
@@ -348,7 +360,7 @@ return {
           props.effort === undefined ? null : h('span', { className: SEL.triggerEffort }, props.effort),
           h('span', { className: SEL.chevron + (open ? ' ' + SEL.chevronOpen : '') }, icon(CHEVRON_DOWN, 14, undefined, 14))),
         open ? h('div', {
-          className: SEL.menu + (props.align === 'left' ? ' ccmode-menu-left' : ''),
+          className: SEL.menu,
           role: 'menu',
         },
           h('div', { className: SEL.groups },
@@ -464,7 +476,6 @@ return {
       return h(Select, {
         value: claude ? (remoteId === '' ? 'claude' : 'claude:' + remoteId) : 'dsh',
         onSelect: choose,
-        align: 'left',
         disabled: locked,
         glyph: claude ? CLAUDE_GLYPH : undefined,
         label: 'DSH',
@@ -586,7 +597,7 @@ return {
             : h('span', { className: SEL.triggerLabel, style: { display: 'inline-flex', alignItems: 'center' } },
               icon(FOLDER, 14, undefined, 14)),
           h('span', { className: SEL.chevron + (open ? ' ' + SEL.chevronOpen : '') }, icon(CHEVRON_DOWN, 14, undefined, 14))),
-        open ? h('div', { className: SEL.menu + ' ccmode-menu-left', role: 'menu' },
+        open ? h('div', { className: SEL.menu, role: 'menu' },
           h('div', { className: SEL.groups },
             h('div', { className: SEL.groupTitle },
               busy ? '读取中…' : (view !== null && view.ok === true ? view.path : '读不到这个目录')),
@@ -643,7 +654,6 @@ return {
       return h(Select, {
         value: state.permissionMode,
         onSelect: choose,
-        align: 'left',
         label: '权限',
         title: 'Claude Code 的权限档，替代 dsh 的访问档（下一轮生效：用同一个 Claude 会话重启进程）',
         options: catalog.permissionModes || [],
@@ -1942,27 +1952,33 @@ return {
 
       ctx.effect(() => commandUi.register({
         name: 'claude-import',
-        description: '导入本机 Claude Code 的历史对话',
+        description: '导入 Claude Code 的历史对话（本机或任一目标）',
         available: (session) => {
           const state = stateOf(String(session && session.sessionId))
           return state.locked !== true
         },
         ui: {
           kind: 'popupSelect',
+          // 先选从哪台机器导，再进面板挑对话。对话列表是按机器分的——同一个
+          // 目录名在本机和目标上是两份完全不同的 transcript，混在一个列表里
+          // 只会让人导错那一份。
           options: async (session) => {
             const cwd = cwdOf(session)
-            const answer = await host.call('claude.conversations', { cwd: cwd })
-            const rows = (answer && answer.conversations) || []
-            if (rows.length === 0) return [{ id: '', label: '这个目录下没有 Claude 对话', detail: cwd }]
-            return rows.map((row) => ({
-              id: row.claudeSessionId,
-              label: row.title || row.claudeSessionId.slice(0, 8),
-              detail: agoText(row.updatedAt) + ' · ' + Math.round(row.bytes / 1024) + 'KB · ' + (row.firstPrompt || '').slice(0, 40),
+            const answer = await host.call('claude.sources', { sessionId: String(session.sessionId), cwd: cwd })
+            const sources = (answer && answer.sources) || [{ id: '', label: '本机', cwd: cwd }]
+            return sources.map((entry) => ({
+              // id 要把 cwd 一起带过去：onSelect 只拿得到这一个字符串。
+              id: entry.id + '\u0000' + (entry.cwd || ''),
+              label: entry.label,
+              detail: entry.cwd || '(读不到这个目标的工作目录)',
             }))
           },
           onSelect: async (option, session) => {
-            if (option.id === '') return
-            openImportPreview(String(session.sessionId), cwdOf(session), option.id)
+            const cut = String(option.id).indexOf('\u0000')
+            if (cut === -1) return
+            const id = String(option.id).slice(0, cut)
+            const sourceCwd = String(option.id).slice(cut + 1)
+            openImportPreview(String(session.sessionId), cwdOf(session), '', undefined, { id: id, cwd: sourceCwd })
           },
         },
       }), 'cc-mode: /claude-import command')
@@ -2146,7 +2162,14 @@ return {
       }).catch((error) => fail(String(error && error.message ? error.message : error)))
     }
 
-    function openImportPreview(sessionId, cwd, claudeSessionId, workspace) {
+    /**
+     * 导入面板。
+     *
+     * `source` 是「从哪台机器导」：{ id, cwd }，id 为空串表示本机。cwd 必须是
+     * 那台机器上的路径——transcript 的目录名是 cwd 算出来的 slug，拿 dsh 工作区
+     * 的本机路径去问远端，只会找到一个空目录然后报「没有对话」。
+     */
+    function openImportPreview(sessionId, cwd, claudeSessionId, workspace, source) {
       closeImportPanel()
       const scrim = el('div', 'ccmode-import-scrim')
       const panel = el('div', 'ccmode-import')
@@ -2159,7 +2182,13 @@ return {
       titleRow.appendChild(back)
       titleRow.appendChild(el('span', 'ccmode-import-title', '导入 Claude Code 对话'))
       head.appendChild(titleRow)
-      head.appendChild(el('span', 'ccmode-import-sub', cwd))
+      // 当前这一份是从哪儿来的：源的 id 决定问哪台机器，cwd 决定问那台机器的
+      // 哪个目录。切源要把两样一起换掉。
+      let current = { id: (source && source.id) || '', cwd: (source && source.cwd) || cwd }
+      const sourceRow = el('div', 'ccmode-import-sources')
+      head.appendChild(sourceRow)
+      const sub = el('span', 'ccmode-import-sub', current.cwd)
+      head.appendChild(sub)
       const body = el('div', 'ccmode-import-body')
       const foot = el('div', 'ccmode-import-foot')
       const note = el('span', 'ccmode-import-note', '点一条对话看详情。')
@@ -2218,7 +2247,7 @@ return {
           (row.title || '').toLowerCase().indexOf(needle) !== -1
           || (row.firstPrompt || '').toLowerCase().indexOf(needle) !== -1)
         renderRows(titleHits)
-        host.call('claude.search', { cwd: cwd, query: query.trim() }).then((answer) => {
+        host.call('claude.search', { cwd: current.cwd, remote: current.id, query: query.trim() }).then((answer) => {
           if (importPanel !== scrim || seq !== renderSeq) return
           const snippets = new Map()
           for (const hit of (answer && answer.hits) || []) snippets.set(hit.claudeSessionId, hit.snippet || '')
@@ -2231,7 +2260,7 @@ return {
       function enterPreview(row) {
         back.style.display = ''
         search.style.display = 'none'
-        showPreview(scrim, body, foot, note, sessionId, cwd, row, workspace)
+        showPreview(scrim, body, foot, note, sessionId, current.cwd, row, workspace, current.id)
       }
 
       back.addEventListener('click', () => {
@@ -2250,17 +2279,57 @@ return {
       })
       search.addEventListener('keydown', (event) => { if (event.key === 'Escape') { search.value = ''; renderRows(allRows) } })
 
-      body.appendChild(el('div', 'ccmode-import-empty', '读取中…'))
-      host.call('claude.conversations', { cwd: cwd }).then((answer) => {
-        if (importPanel !== scrim) return
-        allRows = (answer && answer.conversations) || []
-        renderRows(allRows)
-        search.focus()
-      }).catch((error) => {
-        if (importPanel !== scrim) return
+      /** 拉当前源的对话列表。切源、首次打开都走这里。 */
+      function loadConversations() {
+        const seq = ++renderSeq
+        allRows = []
         body.textContent = ''
-        body.appendChild(el('div', 'ccmode-import-empty', '读取失败：' + String(error && error.message ? error.message : error)))
-      })
+        body.appendChild(el('div', 'ccmode-import-empty', '读取中…'))
+        sub.textContent = current.cwd || '(这个目标上读不到工作目录)'
+        host.call('claude.conversations', { cwd: current.cwd, remote: current.id }).then((answer) => {
+          if (importPanel !== scrim || seq !== renderSeq) return
+          allRows = (answer && answer.conversations) || []
+          renderRows(allRows)
+          search.focus()
+        }).catch((error) => {
+          if (importPanel !== scrim || seq !== renderSeq) return
+          body.textContent = ''
+          body.appendChild(el('div', 'ccmode-import-empty', '读取失败：' + String(error && error.message ? error.message : error)))
+        })
+      }
+
+      /** 一排源：本机 + 每个目标，点一下换一台机器。只有一个源时不占地方。 */
+      function renderSources(sources) {
+        sourceRow.textContent = ''
+        if (sources.length <= 1) return
+        for (const entry of sources) {
+          const chip = el('button', 'ccmode-import-source' + (entry.id === current.id ? ' on' : ''), entry.label)
+          chip.type = 'button'
+          chip.title = entry.cwd || '(读不到这个目标的工作目录)'
+          chip.addEventListener('click', () => {
+            if (entry.id === current.id) return
+            current = { id: entry.id, cwd: entry.cwd || '' }
+            search.value = ''
+            back.style.display = 'none'
+            search.style.display = ''
+            const ok = foot.querySelector('.ccmode-import-ok')
+            if (ok !== null) ok.remove()
+            note.textContent = '点一条对话看详情。'
+            renderSources(sources)
+            loadConversations()
+          })
+          sourceRow.appendChild(chip)
+        }
+      }
+
+      loadConversations()
+      host.call('claude.sources', { sessionId: sessionId || '', cwd: cwd }).then((answer) => {
+        if (importPanel !== scrim) return
+        const sources = (answer && answer.sources) || []
+        // 命令入口已经选过源时，用它带进来的 cwd；否则跟随本机那一项。
+        if ((source === undefined || source === null) && sources.length > 0) current = { id: sources[0].id, cwd: sources[0].cwd }
+        renderSources(sources)
+      }).catch(() => { /* 至少本机那一份已经在列了 */ })
     }
 
     function previewMessage(item) {
@@ -2379,7 +2448,7 @@ return {
       return card
     }
 
-    function showPreview(scrim, body, foot, note, sessionId, cwd, row, workspace) {
+    function showPreview(scrim, body, foot, note, sessionId, cwd, row, workspace, remote) {
       body.textContent = ''
       body.appendChild(el('div', 'ccmode-import-empty', '读取中…'))
       const active = Date.now() - row.updatedAt < 120000
@@ -2396,7 +2465,7 @@ return {
       importButton.onclick = () => {
         importButton.disabled = true
         importButton.textContent = '⏳ 导入中…'
-        Promise.resolve(adoptConversation(sessionId, cwd, row.claudeSessionId, workspace))
+        Promise.resolve(adoptConversation(sessionId, cwd, row.claudeSessionId, workspace, remote))
           .catch((error) => {
             if (importPanel !== scrim) return
             importButton.disabled = false
@@ -2405,7 +2474,7 @@ return {
           })
       }
 
-      host.call('claude.preview', { cwd: cwd, claudeSessionId: row.claudeSessionId }).then((answer) => {
+      host.call('claude.preview', { cwd: cwd, remote: remote || '', claudeSessionId: row.claudeSessionId }).then((answer) => {
         if (importPanel !== scrim) return
         const messages = (answer && (answer.items || answer.messages)) || []
         body.textContent = ''
@@ -2420,8 +2489,11 @@ return {
       }).catch(() => {})
     }
 
-    function adoptConversation(sessionId, cwd, claudeSessionId, workspace) {
-      const bind = (target) => host.call('claude.adopt', { sessionId: target, claudeSessionId: claudeSessionId, cwd: cwd })
+    function adoptConversation(sessionId, cwd, claudeSessionId, workspace, remote) {
+      // remote 一并送过去：导入一条远端对话之后，这个会话就该钉在那台机器上，
+      // 否则它会拿远端的 session id 去本机 --resume 一个不存在的 transcript。
+      const bind = (target) => host.call('claude.adopt',
+        { sessionId: target, claudeSessionId: claudeSessionId, cwd: cwd, remote: remote || '' })
         .then((answer) => {
           if (answer && answer.state) put(target, answer.state)
           if (sessions !== undefined && typeof sessions.open === 'function' && sessionId === null) {
