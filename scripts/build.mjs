@@ -34,9 +34,17 @@ const write = (rel, text) => {
 // generated here rather than pasted into the host by hand — see the marker's
 // comment in src/host.dynamic.js for what that cost.
 const brokerSource = read('src/broker.mjs')
-const hostBody = read('src/host.dynamic.js').replace("'@@BROKER_SOURCE@@'", () => JSON.stringify(brokerSource))
-if (hostBody.indexOf('@@BROKER_SOURCE@@') !== -1) {
-  throw new Error('build: the BROKER_SOURCE marker is still in the host body — the broker would ship stale')
+// The cc-daemon the plugin installs on a remote target, generated here for the
+// same reason the broker is: a hand-pasted copy goes stale, and the copy that
+// ships is the only one that ever runs on a machine.
+const daemonSource = read('src/cc-daemon.mjs')
+const hostBody = read('src/host.dynamic.js')
+  .replace("'@@BROKER_SOURCE@@'", () => JSON.stringify(brokerSource))
+  .replace("'@@DAEMON_SOURCE@@'", () => JSON.stringify(daemonSource))
+for (const marker of ['@@BROKER_SOURCE@@', '@@DAEMON_SOURCE@@']) {
+  if (hostBody.indexOf(marker) !== -1) {
+    throw new Error('build: the ' + marker + ' marker is still in the host body — it would ship stale')
+  }
 }
 const clientBody = read('src/client.dynamic.js')
 

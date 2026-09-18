@@ -151,12 +151,11 @@ test('远端会话不能开在 dsh 工作区那条路径上', async () => {
   // 那是本机的目录，远端多半没有——`set -e` 下 cd 直接就失败了。
   const calls = []
   const names = ['remoteHome', 'remoteCwdOf']
-  const made = new Function('runCapture', 'shArgv', 'calls', `
+  const made = new Function('captureOn', 'calls', `
     ${names.map(sliceFunction).join('\n')}
     return { ${names.join(', ')} }
   `)(
-    (argv) => { calls.push(argv); return Promise.resolve('/home/dev\n') },
-    (command) => command,
+    (command) => { calls.push(command); return Promise.resolve('/home/dev\n') },
     calls,
   )
   // 会话自己选过就用它的
@@ -361,29 +360,33 @@ test('重开进程从上一个进程的输出之后开始读', () => {
 
 test('目录按目标记：换一台机器不会带着上一台的路径开', () => {
   const lastDirs = new Map()
+  const names = ['dirKey', 'rememberDir', 'lookupDir']
   const made = new Function('lastDirs', 'persistStates', `
-    ${sliceFunction('rememberDir')}
-    return rememberDir
+    ${names.map(sliceFunction).join('\n')}
+    return { rememberDir, lookupDir }
   `)(lastDirs, () => {})
-  made({ id: 'devbox' }, '/srv/work')
-  made({ id: 'app' }, '/workspace')
-  assert.equal(lastDirs.get('devbox'), '/srv/work')
-  assert.equal(lastDirs.get('app'), '/workspace', '两台机器各记各的')
+  const ws = '/Users/me/proj'
+  made.rememberDir({ id: 'devbox' }, '/srv/work', ws)
+  made.rememberDir({ id: 'app' }, '/workspace', ws)
+  assert.equal(made.lookupDir(ws, 'devbox'), '/srv/work')
+  assert.equal(made.lookupDir(ws, 'app'), '/workspace', '两台机器各记各的')
   // 本机没有「目标」这个概念，工作目录由 dsh 工作区决定
-  made(null, '/whatever')
+  made.rememberDir(null, '/whatever', ws)
   assert.equal(lastDirs.size, 2)
   // 空值不该把记住的抹掉
-  made({ id: 'devbox' }, '')
-  assert.equal(lastDirs.get('devbox'), '/srv/work')
+  made.rememberDir({ id: 'devbox' }, '', ws)
+  assert.equal(made.lookupDir(ws, 'devbox'), '/srv/work')
 })
 
-test('新会话继承的是「这个目标上次的目录」', () => {
-  const lastDirs = new Map([['devbox', '/srv/work'], ['app', '/workspace']])
-  const build = (remote) => new Function('defaults', 'states', 'lastDirs', 'DEFAULT_MODEL', 'committedEngine', `
-    ${sliceFunction('stateOf')}
+test('新会话继承的是「这个项目 + 这个目标上次的目录」', () => {
+  const WS = '/Users/me/proj'
+  const lastDirs = new Map([[WS + '\u0000devbox', '/srv/work'], [WS + '\u0000app', '/workspace']])
+  const names = ['dirKey', 'lookupDir', 'stateOf']
+  const build = (remote) => new Function('defaults', 'states', 'lastDirs', 'DEFAULT_MODEL', 'committedEngine', 'workspaceOf', `
+    ${names.map(sliceFunction).join('\n')}
     return stateOf
   `)({ mode: 'claude', permissionMode: 'manual', model: 'm', effort: '', remote: remote },
-     new Map(), lastDirs, 'm', () => undefined)
+     new Map(), lastDirs, 'm', () => undefined, () => WS)
   assert.equal(build('devbox')('s1').remoteCwd, '/srv/work')
   assert.equal(build('app')('s2').remoteCwd, '/workspace', '换目标就换目录')
   assert.equal(build('')('s3').remoteCwd, '', '本机不带远端目录')
@@ -479,4 +482,107 @@ test('回调地址要改写成目标机器打得通的那个', () => {
     'http://host:1/dsh-agent-mesh/mcp/session-abc', '尾斜杠不该拼出双斜杠')
   // 路径里带着会话 id——按会话寻址必须留住，否则 parent 又会认错
   assert.ok(made(url, { dshHost: 'h:1' }).endsWith('/session-abc'))
+})
+
+// 目标机接第三方网关时，插件推自己的模型名不会报错——它会「成功」地什么都不做。
+// 实测：`claude -p --model claude-opus-5` 打到 DeepSeek 的 anthropic 端点，
+// duration_api_ms 为 0、token 全零、stop_reason 是 stop_sequence，答案是空的。
+// 一个不说话、不花钱、也不报错的对话，是最难被发现的那种坏。
+test('目标可以声明「模型我自己定」', () => {
+  const { normalizeRemote } = build()
+  assert.equal(normalizeRemote('g', { ssh: 'g' }).ownModel, false, '默认仍然由插件挑模型')
+  assert.equal(normalizeRemote('g', { ssh: 'g', ownModel: true }).ownModel, true)
+})
+
+test('声明了自己定模型的目标，不会被 set_model 改掉', () => {
+  const calls = []
+  const applyModel = new Function('console', `${sliceFunction('applyModel')}; return applyModel`)(
+    { error: () => undefined })
+
+  const gateway = { remote: { ownModel: true }, appliedModel: '', control: (message) => calls.push(message) }
+  applyModel(gateway, { model: 'claude-opus-5' })
+  assert.deepEqual(calls, [], '换过去就是把一个正在工作的对话指向一个网关没听过的模型')
+
+  const plain = { remote: null, appliedModel: '', control: (message) => calls.push(message) }
+  applyModel(plain, { model: 'claude-opus-5' })
+  assert.deepEqual(calls, [{ subtype: 'set_model', model: 'claude-opus-5' }], '普通目标照旧')
+})
+
+// 隧道那条 ssh 和一次性命令那条 ssh，要的东西正好相反。
+// ControlPersist 会让 ssh 在连上之后 fork 出后台 master、前台进程退出——插件
+// 握着的那个进程于是立刻 resolve，被读成「隧道死了」，而转发还在一个没人管的
+// 进程里活着。实测：四十个候选端口全被走完，留下四十个孤儿 master 占着端口。
+test('隧道的 ssh 不能带 ControlPersist —— 它会把前台进程交出去', () => {
+  const tunnelArgv = new Function('remote', 'localPort', 'remotePort', `
+    ${sliceFunction('tunnelArgv')}
+    return tunnelArgv(remote, localPort, remotePort)
+  `)
+  const argv = tunnelArgv({ id: 'box', port: '2223', identityFile: '', options: [], host: 'box' }, 39321, 37785)
+
+  assert.equal(argv.includes('ControlPersist=10m'), false, '带上它，插件握着的就不再是隧道本身')
+  assert.equal(argv.includes('ControlMaster=auto'), false)
+  assert.equal(argv.includes('ControlMaster=no'), true, '隧道必须是我们自己这条连接')
+  assert.equal(argv.includes('-N'), true, '不跑命令，只转发')
+  assert.equal(argv.includes('ExitOnForwardFailure=yes'), true, '端口占用要当场死，不能留一条不转发的隧道')
+  assert.ok(argv.includes('127.0.0.1:39321:127.0.0.1:37785'), '两端都只绑回环')
+  assert.equal(argv[argv.length - 1], 'box', '目标永远是最后一个位置参数')
+  assert.ok(argv.includes('-p') && argv.includes('2223'), '端口要带上')
+})
+
+test('一次性命令那条 ssh 仍然要 ControlMaster —— 一轮有几十条', () => {
+  const { normalizeRemote, sshArgvPrefix } = build()
+  const argv = sshArgvPrefix(normalizeRemote('box', { ssh: 'box' }))
+  assert.equal(argv.includes('ControlMaster=auto'), true)
+  assert.equal(argv.includes('ControlPersist=10m'), true)
+})
+
+// dsh 0.1.5-rc.2 起，assistant/message 自带它的 source stream，再挂
+// sourceEventSeqs 会被直接拒掉——那一下把每一轮 Claude 都打掉了，本机档和远端
+// 档一起。而这个字段本来就只对 replace 有意义（声明它遮住了哪些节点），
+// append 什么都不遮。
+test('assistant/message 不带 sourceEventSeqs', () => {
+  const source = fs.readFileSync(path.join(root, 'src/host.dynamic.js'), 'utf8')
+  const at = source.indexOf("session.append(\n          'assistant/message',")
+  assert.notEqual(at, -1, '找不到 assistant/message 的写入点——它被改写了')
+  const block = source.slice(at, at + 1600)
+  assert.equal(/sourceEventSeqs:/.test(block), false, 'dsh 会当场拒掉这条事件')
+  assert.ok(block.indexOf("surfaceOp: 'append'") !== -1, 'append 标记还得在')
+})
+
+// 目录记忆按 (dsh 工作区, 目标) 走，而不是只按目标。
+// 只按目标时，在项目 B 里开会话会继承项目 A 的目录——机器对了，活儿不对，
+// 每开一个新会话都得手动改回来。
+test('同一个 dsh 项目 + 同一个目标，下一个会话开在上次那里', () => {
+  const lastDirs = new Map()
+  const names = ['dirKey', 'lookupDir', 'rememberDir']
+  const made = new Function('lastDirs', 'persistStates', `
+    ${names.map(sliceFunction).join('\n')}
+    return { dirKey, lookupDir, rememberDir }
+  `)(lastDirs, () => undefined)
+
+  const box = { id: 'box' }
+  made.rememberDir(box, '/srv/a', '/Users/me/projects/A')
+  made.rememberDir(box, '/srv/b', '/Users/me/projects/B')
+
+  assert.equal(made.lookupDir('/Users/me/projects/A', 'box'), '/srv/a')
+  assert.equal(made.lookupDir('/Users/me/projects/B', 'box'), '/srv/b', '换个项目就该换个目录')
+  assert.equal(made.lookupDir('/Users/me/projects/C', 'box'), '', '没去过的项目不瞎猜')
+})
+
+test('升级不会让每个目标都忘掉自己在哪儿工作', () => {
+  const lastDirs = new Map()
+  const names = ['dirKey', 'lookupDir', 'rememberDir']
+  const made = new Function('lastDirs', 'persistStates', `
+    ${names.map(sliceFunction).join('\n')}
+    return { dirKey, lookupDir, rememberDir }
+  `)(lastDirs, () => undefined)
+
+  // 旧版存下来的键只有目标名，没有工作区。
+  lastDirs.set('box', '/srv/legacy')
+  assert.equal(made.lookupDir('/Users/me/projects/A', 'box'), '/srv/legacy', '先用旧记忆兜底')
+
+  // 一旦这个项目自己记下过，就不再回退。
+  made.rememberDir({ id: 'box' }, '/srv/a', '/Users/me/projects/A')
+  assert.equal(made.lookupDir('/Users/me/projects/A', 'box'), '/srv/a')
+  assert.equal(made.lookupDir('/Users/me/projects/Z', 'box'), '/srv/legacy', '没记过的项目仍然兜底')
 })

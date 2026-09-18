@@ -167,8 +167,8 @@ return {
     async function recoverRoute(run, state) {
       if (typeof state.route === 'string' && /\[/.test(state.route)) return
       try {
-        const line = await runCapture(shArgv(
-          'grep -a \'"subtype":"init"\' ' + shellQuote(run.dir + '/out.log') + ' | tail -1 | head -c 4000', run.remote), 8000)
+        const line = await captureOn(
+          'grep -a \'"subtype":"init"\' ' + shellQuote(run.dir + '/out.log') + ' | tail -1 | head -c 4000', run.remote, 8000)
         const init = JSON.parse(String(line || '').trim())
         if (typeof init.model === 'string' && init.model.length > 0 && state.route !== init.model) {
           state.route = init.model
@@ -438,12 +438,49 @@ return {
      */
     const lastDirs = new Map()
 
+    /**
+     * The memory is keyed by (dsh workspace, target), not by target alone.
+     *
+     * A person works one project at a time, and on a given target that project
+     * lives in one directory. Keyed by target alone, opening a conversation in
+     * project B inherited project A's directory — right machine, wrong work —
+     * and every new conversation had to be re-pointed by hand. Keyed by the
+     * pair, a second conversation in the same project on the same target opens
+     * where the first one did, and switching projects switches the directory
+     * with it.
+     */
+    function dirKey(workspace, remoteId) {
+      return String(workspace || '') + '\u0000' + String(remoteId || '')
+    }
+
+    /** This dsh conversation's own workspace directory, when it has one. */
+    function workspaceOf(sessionId) {
+      const session = sessionOf(sessionId)
+      const header = session === undefined || session === null ? undefined : session.header
+      return header !== undefined && header !== null && typeof header.cwd === 'string' ? header.cwd : ''
+    }
+
+    /**
+     * Where this (workspace, target) pair was last worked in.
+     *
+     * Falls back to the target's own older memory — entries written before the
+     * key carried a workspace — so an upgrade does not look like every target
+     * forgetting where it works.
+     */
+    function lookupDir(workspace, remoteId) {
+      const scoped = lastDirs.get(dirKey(workspace, remoteId))
+      if (typeof scoped === 'string' && scoped.length > 0) return scoped
+      const legacy = lastDirs.get(String(remoteId || ''))
+      return typeof legacy === 'string' ? legacy : ''
+    }
+
     /** Record where a target was last worked in; empty values never overwrite. */
-    function rememberDir(remote, cwd) {
+    function rememberDir(remote, cwd, workspace) {
       if (remote === null || remote === undefined) return
       if (typeof cwd !== 'string' || cwd.length === 0) return
-      if (lastDirs.get(remote.id) === cwd) return
-      lastDirs.set(remote.id, cwd)
+      const key = dirKey(workspace, remote.id)
+      if (lastDirs.get(key) === cwd) return
+      lastDirs.set(key, cwd)
       persistStates()
     }
 
@@ -461,6 +498,11 @@ return {
       const container = typeof raw.docker === 'string' ? raw.docker.trim() : ''
       // One transport is the minimum; both together mean a container over there.
       if (host.length === 0 && container.length === 0) return null
+      if (raw.daemon === true && host.length === 0) {
+        // Said out loud rather than silently downgraded: the person asked for
+        // the daemon and would otherwise never learn they did not get it.
+        console.error('cc-mode: 目标 ' + id + ' 写了 daemon:true 但没有 ssh —— daemon 靠 ssh 隧道才连得上（容器里跑个 sshd 即可），这次按普通档走')
+      }
       return {
         id: id,
         label: typeof raw.label === 'string' && raw.label.length > 0 ? raw.label : id,
@@ -491,6 +533,23 @@ return {
         // a PATH routinely lacks, and the spawn then fails with no output at
         // all. Resolved once at load; `dockerBin` overrides.
         dockerBin: typeof raw.dockerBin === 'string' && raw.dockerBin.length > 0 ? raw.dockerBin : '',
+        // This target picks its own model, so the plugin must not push one.
+        //
+        // The model list here is claude.ai's. A target whose Claude Code talks
+        // to a third-party Anthropic-compatible gateway has a completely
+        // different one, and `--model claude-opus-5` against such a gateway
+        // does not fail loudly — it comes back in zero milliseconds having
+        // burned zero tokens, with `stop_reason: stop_sequence` and an empty
+        // answer. A conversation that says nothing, costs nothing, and reports
+        // no error is the hardest kind of broken to notice. So when the target
+        // says the model is its business, `--model` and `set_model` are left
+        // out entirely and whatever that machine's own settings choose stands.
+        ownModel: raw.ownModel === true,
+        // One connection to a daemon over there instead of a shell command
+        // per question — see the cc-daemon hop. It requires ssh: the tunnel is
+        // what keeps an endpoint that can start processes off the network, and
+        // `docker exec` gives us no socket to tunnel through.
+        daemon: raw.daemon === true && host.length > 0,
         // How this target reaches dsh's web server to call back into it.
         // Everything dsh hands a Claude process as a callback URL is built from
         // dsh's own loopback address — correct while the process runs beside
@@ -602,6 +661,370 @@ return {
       return sshArgvPrefix(remote).concat([local.map(shellQuote).join(' ')])
     }
 
+    // ---------- the cc-daemon hop ----------
+    //
+    // A target declared with `"daemon": true` is not reached with a shell
+    // command per question. It gets ONE connection, to a small daemon this
+    // plugin installs and starts over there, and every question rides that.
+    //
+    // Why: `shArgv` is correct and it is still the wrong shape over a slow
+    // hop. One turn asks that machine dozens of small questions — stat the
+    // transcript, read meta.json, is the broker's pid alive — and over
+    // `docker exec` or ssh each is a fresh process and, worse, an answer that
+    // cannot say how it failed. `runCapture` never rejects: a timeout, a spawn
+    // that failed, and "the answer really is empty" all come back as the same
+    // empty string, and the caller reads that as a definite NO. The NO branch
+    // is always the destructive one. That is how a 30MB transcript was
+    // declared missing and its conversation restarted with an empty Claude,
+    // and how a state file became a 153-byte stub.
+    //
+    // The daemon ends that: every call comes back decided — an exit code, or
+    // `timedOut`, or an HTTP error — and a connection is either up or down,
+    // with no third state. It does NOT own Claude processes: the broker still
+    // does, one per conversation, with all of its hard-won exit behaviour
+    // intact. The daemon is the machine's front door, nothing more.
+    const DAEMON_SOURCE = '@@DAEMON_SOURCE@@'
+    /** Must match the daemon's own PROTOCOL_VERSION; a mismatch reinstalls. */
+    const DAEMON_PROTOCOL = 2
+    // Shell words, not quoted paths: `$HOME` has to expand over there.
+    const DAEMON_DIR_WORD = '"$HOME"/.cache/cc-daemon'
+    const DAEMON_FILE_WORD = DAEMON_DIR_WORD + '/cc-daemon.mjs'
+    // The tunnel's local end. ssh itself says whether a port is free
+    // (ExitOnForwardFailure), so this walks the range rather than guessing —
+    // a bind check here would be a race against every other process anyway.
+    const DAEMON_PORT_BASE = 39321
+    const DAEMON_PORT_TRIES = 40
+    const DAEMON_OPEN_MS = 45000
+
+    /** remote.id → Promise<{ base, token, proc, port }>, one per target. */
+    const daemons = new Map()
+
+    /**
+     * Why a tunnel at all, when the daemon could bind a public port?
+     *
+     * Because a port that answers is a port anyone on that network can reach,
+     * and this one starts processes. The daemon binds loopback on its own
+     * machine and the only way in is a connection that machine already
+     * authenticates — ssh. `-N` carries no command, so the far side runs
+     * nothing but the forward; ServerAlive turns a dead peer into a dead
+     * process here (which the next call rebuilds) instead of a socket that
+     * accepts forever and answers never.
+     *
+     * NO ControlMaster here, and that is the opposite of what the one-off
+     * commands want. `ControlPersist` makes ssh fork a background master and
+     * EXIT THE FOREGROUND PROCESS once the connection is up — so the process
+     * this plugin holds resolves immediately while the forward keeps working
+     * in a process nobody owns. Measured: the plugin read that exit as "the
+     * tunnel died", walked all forty candidate ports, and left forty orphaned
+     * masters holding them. A tunnel has to BE the process we are holding.
+     */
+    function tunnelArgv(remote, localPort, remotePort) {
+      const argv = ['ssh', '-N',
+        '-o', 'BatchMode=yes',
+        '-o', 'ConnectTimeout=10',
+        '-o', 'ServerAliveInterval=15',
+        '-o', 'ServerAliveCountMax=4',
+        '-o', 'ExitOnForwardFailure=yes',
+        '-o', 'ControlMaster=no',
+        '-L', '127.0.0.1:' + localPort + ':127.0.0.1:' + remotePort]
+      if (remote.port !== '') argv.push('-p', remote.port)
+      if (remote.identityFile !== '') argv.push('-o', 'IdentitiesOnly=yes', '-i', remote.identityFile)
+      for (const option of remote.options) argv.push('-o', option)
+      argv.push(remote.host)
+      return argv
+    }
+
+    /** One request to a target's daemon. Rejects on anything but a reply. */
+    async function daemonRequest(link, route, init, timeoutMs) {
+      const controller = new AbortController()
+      const timer = armTimeout(() => controller.abort(), timeoutMs || 30000)
+      try {
+        const response = await fetch(link.base + route, {
+          ...init,
+          signal: controller.signal,
+          headers: { ...(init.headers || {}), authorization: 'Bearer ' + link.token },
+        })
+        const text = await response.text()
+        let body = null
+        try { body = JSON.parse(text) } catch (error) { body = null }
+        if (!response.ok) {
+          throw new Error('cc-daemon ' + route + ' → ' + response.status
+            + (body !== null && body.error !== undefined ? ': ' + body.error : ''))
+        }
+        return body
+      } finally { try { timer() } catch (error) { /* already fired */ } }
+    }
+
+    /** Install the daemon source over there and start it. Idempotent by design. */
+    async function openDaemon(remote) {
+      // The source is written through the ordinary shell hop — the ONLY time
+      // this plugin talks to the target that way once a daemon exists. It is
+      // one `cat`, so it is one thing that can be half-done instead of two.
+      const install = silenceStdin(subprocess.spawn({
+        argv: shArgv('mkdir -p ' + DAEMON_DIR_WORD + ' && cat > ' + DAEMON_FILE_WORD + '.tmp'
+          + ' && mv ' + DAEMON_FILE_WORD + '.tmp ' + DAEMON_FILE_WORD, remote),
+        cwd: '/',
+        stdio: { stdin: 'pipe', stdout: 'ignore', stderr: 'ignore' },
+        graceMs: 5000,
+      }))
+      if (install.stdin !== undefined) { install.stdin.write(DAEMON_SOURCE); install.stdin.end() }
+      await install.done
+
+      // `ensure` is idempotent on the target's side: a healthy daemon of this
+      // protocol is reused, an older one is replaced, and either way the JSON
+      // line names the port and token. Asking "is it up?" and then starting it
+      // would be two round trips with a race in the middle.
+      // The bootstrap runs BEFORE there is a daemon, so it goes through the
+      // ordinary shell hop by hand rather than through captureOn (which would
+      // try to reach the daemon this call is about to start).
+      const raw = await runCapture(shArgv(
+        shellQuote(remote.nodeBin) + ' ' + DAEMON_FILE_WORD + ' ensure --state ' + DAEMON_DIR_WORD, remote), 40000)
+      let info = null
+      try { info = JSON.parse(String(raw).trim().split('\n').pop() || '') } catch (error) { info = null }
+      if (info === null || info.ready !== true) {
+        throw new Error('cc-daemon 起不来 on ' + remote.id + ': ' + (String(raw).trim() || '目标机没有任何回应'))
+      }
+      if (info.protocol !== DAEMON_PROTOCOL) {
+        throw new Error('cc-daemon 协议不匹配 on ' + remote.id + ': 目标机是 ' + info.protocol + '，插件要 ' + DAEMON_PROTOCOL)
+      }
+
+      // Walk the local port range until ssh accepts one. ExitOnForwardFailure
+      // means a busy port kills the ssh immediately rather than leaving a
+      // tunnel that silently forwards nothing.
+      let lastComplaint = ''
+      for (let step = 0; step < DAEMON_PORT_TRIES; step += 1) {
+        const localPort = DAEMON_PORT_BASE + step
+        const proc = silenceStdin(subprocess.spawn({
+          argv: tunnelArgv(remote, localPort, info.port),
+          cwd: '/',
+          // ssh's stderr is the only place that says WHY a tunnel refused to
+          // come up (a busy port, a rejected key, a host that moved). Throwing
+          // it away left "本机 39321–39360 全都不行" as the whole diagnosis —
+          // the same "we lost the reason" this daemon exists to stop.
+          stdio: { stdin: 'ignore', stdout: 'ignore', stderr: 'pipe' },
+          graceMs: 1000,
+        }))
+        let complaint = ''
+        ;(async () => {
+          try {
+            for await (const chunk of proc.stderr) {
+              const text = String(chunk).trim()
+              if (text.length > 0) complaint = (complaint + ' ' + text).trim().slice(-400)
+            }
+          } catch (error) { /* closed with the process */ }
+        })()
+        let dead = false
+        proc.done.then(() => { dead = true }, () => { dead = true })
+        const link = { base: 'http://127.0.0.1:' + localPort, token: info.token, proc: proc, port: localPort, remotePort: info.port }
+        const deadline = Date.now() + 8000
+        while (Date.now() < deadline) {
+          await sleep(120)
+          if (dead) break
+          let health = null
+          try { health = await daemonRequest(link, '/health', { method: 'GET' }, 3000) } catch (error) { health = null }
+          if (health !== null && health.ok === true) {
+            console.log('cc-mode: cc-daemon 已连上', remote.id,
+              '（目标机 127.0.0.1:' + info.port + ' ← 隧道 → 本机 ' + localPort + '，', info.reused ? '复用' : '新起', '）')
+            return link
+          }
+        }
+        try { proc.terminate() } catch (error) { /* already gone */ }
+        if (complaint.length > 0) lastComplaint = complaint
+      }
+      throw new Error('cc-daemon 隧道建不起来 on ' + remote.id + '：本机 '
+        + DAEMON_PORT_BASE + '–' + (DAEMON_PORT_BASE + DAEMON_PORT_TRIES - 1) + ' 全都不行'
+        + (lastComplaint.length > 0 ? '；ssh 说：' + lastComplaint : '；ssh 一个字都没说'))
+    }
+
+    /**
+     * This target's daemon connection, opening it if needed.
+     *
+     * A link whose tunnel died is dropped and rebuilt rather than reported as
+     * an error: ssh going away is a transport event, and the caller asked a
+     * question about a machine, not about a socket.
+     */
+    function ensureDaemon(remote) {
+      const pending = daemons.get(remote.id)
+      if (pending !== undefined) return pending
+      const opening = openDaemon(remote).then(
+        (link) => {
+          // When the tunnel ends, forget it — but only if this is still the
+          // link on file, or a rebuild that already happened would be undone.
+          link.proc.done.then(
+            () => { if (daemons.get(remote.id) === opening) daemons.delete(remote.id) },
+            () => { if (daemons.get(remote.id) === opening) daemons.delete(remote.id) },
+          )
+          return link
+        },
+        (error) => { daemons.delete(remote.id); throw error },
+      )
+      daemons.set(remote.id, opening)
+      return opening
+    }
+
+    /** Tear down a target's daemon link (the daemon over there keeps running). */
+    function closeDaemon(remoteId) {
+      const pending = daemons.get(remoteId)
+      if (pending === undefined) return
+      daemons.delete(remoteId)
+      pending.then((link) => { try { link.proc.terminate() } catch (error) { /* gone */ } }, () => undefined)
+    }
+
+    function usesDaemon(remote) {
+      return remote !== null && remote !== undefined && remote.daemon === true
+    }
+
+    /**
+     * Run one command where this conversation's Claude lives, and come back
+     * with a DECIDED outcome.
+     *
+     *   { decided: true,  code, stdout, stderr, timedOut }
+     *   { decided: false, reason }          — we never found out
+     *
+     * The second shape is the whole point. A caller that cannot tell "the file
+     * is not there" from "nobody answered" will eventually act on the wrong
+     * one, and the wrong one is always destructive.
+     *
+     * Targets without a daemon keep the old behaviour exactly: one spawn, and
+     * an answer that cannot distinguish those two. That is not an oversight —
+     * it is the behaviour every existing deployment is running today, and this
+     * change must not alter it.
+     */
+    async function execOn(command, remote, timeoutMs, options) {
+      const settings = options === undefined || options === null ? {} : options
+      if (usesDaemon(remote)) {
+        let link = null
+        try { link = await ensureDaemon(remote) } catch (error) {
+          return { decided: false, reason: errorText(error), stdout: '', stderr: '', code: null, timedOut: false }
+        }
+        try {
+          const body = await daemonRequest(link, '/exec', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              cmd: command,
+              timeoutMs: timeoutMs || 20000,
+              stdin: typeof settings.stdin === 'string' ? settings.stdin : undefined,
+              idemKey: typeof settings.idemKey === 'string' ? settings.idemKey : undefined,
+            }),
+            // Past the command's own deadline: the daemon kills it at
+            // `timeoutMs` and still answers, and that answer (timedOut: true)
+            // is worth more than us giving up on the connection.
+          }, (timeoutMs || 20000) + 10000)
+          return {
+            decided: true,
+            code: body.code === undefined ? null : body.code,
+            stdout: typeof body.stdout === 'string' ? body.stdout : '',
+            stderr: typeof body.stderr === 'string' ? body.stderr : '',
+            timedOut: body.timedOut === true,
+            duplicate: body.duplicate === true,
+          }
+        } catch (error) {
+          // The tunnel may have died under us; the next call rebuilds it.
+          closeDaemon(remote.id)
+          return { decided: false, reason: errorText(error), stdout: '', stderr: '', code: null, timedOut: false }
+        }
+      }
+      // No daemon: one spawn, as before.
+      if (typeof settings.stdin === 'string') {
+        const proc = silenceStdin(subprocess.spawn({
+          argv: shArgv(command, remote),
+          cwd: '/',
+          stdio: { stdin: 'pipe', stdout: 'ignore', stderr: 'ignore' },
+          graceMs: 2000,
+        }))
+        if (proc.stdin !== undefined) { proc.stdin.write(settings.stdin); proc.stdin.end() }
+        try { await proc.done } catch (error) { /* the caller's next read reports it */ }
+        return { decided: true, code: null, stdout: '', stderr: '', timedOut: false }
+      }
+      // runCapture, never captureOn: captureOn is built ON this function, and
+      // calling it here is an infinite recursion. (It was, once — the批量
+      // rewrite that moved forty call sites onto captureOn moved this one too,
+      // and dsh crash-looped on a stack overflow before a single turn ran.)
+      const output = await runCapture(shArgv(command, remote), timeoutMs)
+      return { decided: true, code: null, stdout: output, stderr: '', timedOut: false }
+    }
+
+    /**
+     * `execOn`, reduced to the stdout string the old call sites expect.
+     *
+     * An undecided call still answers '' here, because that is what forty call
+     * sites are written against and changing all of them at once would be a
+     * bigger risk than the bug. What it does NOT do is stay quiet about it:
+     * the failure is logged with the command that caused it, and the handful
+     * of call sites where '' is genuinely destructive (does this transcript
+     * exist, is this broker alive, how big is this file) ask `execOn`
+     * themselves and branch on `decided`.
+     */
+    async function captureOn(command, remote, timeoutMs) {
+      const result = await execOn(command, remote, timeoutMs)
+      if (result.decided !== true) {
+        console.error('cc-mode: 目标机没问出来（' + result.reason + '）：', command.slice(0, 120))
+        return ''
+      }
+      if (result.timedOut === true) {
+        console.error('cc-mode: 目标机上这条命令超时了（' + timeoutMs + 'ms）：', command.slice(0, 120))
+        return ''
+      }
+      return result.stdout
+    }
+
+    /**
+     * Follow a file on the target from a byte offset, as an object shaped like
+     * the subprocess this replaces: `.stdout` is an async iterable of decoded
+     * text and `.terminate()` lets go.
+     *
+     * The decoding is done here with a streaming decoder rather than left to
+     * the consumer, because a chunk boundary lands mid-character often enough
+     * to matter and a per-chunk `String(bytes)` would corrupt one silently.
+     */
+    function daemonTail(link, filePath, from) {
+      const controller = new AbortController()
+      const route = link.base + '/tail?path=' + encodeURIComponent(filePath) + '&from=' + from
+      let started = false
+      const stdout = {
+        // `pumpAttached` asks for utf8; the decoder below always speaks it.
+        setEncoding: () => undefined,
+        async *[Symbol.asyncIterator]() {
+          started = true
+          let response
+          try {
+            response = await fetch(route, {
+              method: 'GET',
+              headers: { authorization: 'Bearer ' + link.token },
+              signal: controller.signal,
+            })
+          } catch (error) {
+            if (controller.signal.aborted !== true) console.error('cc-mode: tail 连不上 cc-daemon:', errorText(error))
+            return
+          }
+          if (!response.ok) {
+            // A 404 here is a fact about the log, not an empty stream — say it
+            // out loud, because the caller's silence would look like a quiet
+            // Claude rather than a missing file.
+            console.error('cc-mode: cc-daemon tail', filePath, '→', response.status, (await response.text()).slice(0, 200))
+            return
+          }
+          const decoder = new TextDecoder('utf-8')
+          try {
+            for await (const chunk of response.body) {
+              const text = decoder.decode(chunk, { stream: true })
+              if (text.length > 0) yield text
+            }
+            const rest = decoder.decode()
+            if (rest.length > 0) yield rest
+          } catch (error) {
+            if (controller.signal.aborted !== true) console.error('cc-mode: tail 断了:', errorText(error))
+          }
+        },
+      }
+      return {
+        stdout: stdout,
+        terminate: () => { try { controller.abort() } catch (error) { /* already gone */ } },
+        done: Promise.resolve(),
+      }
+    }
+
     /**
      * The remote account's home, asked once per target and remembered.
      *
@@ -612,7 +1035,7 @@ return {
      */
     async function remoteHome(remote) {
       if (typeof remote.home !== 'string') {
-        const answer = await runCapture(shArgv('printf %s "$HOME"', remote), 8000)
+        const answer = await captureOn('printf %s "$HOME"', remote, 8000)
         remote.home = String(answer).trim() || '/'
       }
       return remote.home
@@ -712,7 +1135,7 @@ return {
           // The directory belongs to the target, so it is inherited from what
           // that target was last worked in rather than from the last
           // conversation, which may have been on another machine entirely.
-          remoteCwd: lastDirs.get(defaults.remote) || '',
+          remoteCwd: lookupDir(workspaceOf(sessionId), defaults.remote),
           route: undefined,
         }
         states.set(sessionId, state)
@@ -1249,6 +1672,13 @@ return {
        */
       function closeStep() {
         if (open === undefined) return
+        // A step that streamed but never settled into an assistant/message —
+        // interrupted, failed, retried — still has to put its stream somewhere,
+        // or those bytes leave no trace at all. That is what `assistant/attempt`
+        // is: a settled attempt that committed no surface message.
+        if (open.assistantLogged !== true && open.stream.length > 0) {
+          session.append('assistant/attempt', { turn: turn, step: open.step, stream: open.stream })
+        }
         session.append('step/end', { turn: turn, step: open.step })
         open = undefined
       }
@@ -1294,15 +1724,102 @@ return {
         closeStep()
         stepNumber += 1
         session.append('step/start', { turn: turn, step: stepNumber })
-        open = { step: stepNumber, chunkSeqs: [], blocks: new Map(), assistantLogged: false }
+        open = { step: stepNumber, blocks: new Map(), assistantLogged: false, stream: [], streamAt: 0 }
         return open
       }
 
       function currentStep() { return open === undefined ? beginStep() : open }
 
+      // ---- the step's embedded model stream ----
+      //
+      // Up to dsh 0.1.5-rc.1 each chunk was its own `assistant/chunk` event.
+      // rc.2 removed that type outright: a step's stream is now EMBEDDED in the
+      // `assistant/message` it settles into (or in an `assistant/attempt` when
+      // it settles into nothing). A log still carrying `assistant/chunk` is
+      // refused wholesale — "unknown to this harness … refusing to interpret
+      // the log" — which is why every Claude turn stopped the day dsh updated.
+      //
+      // The embedded form is compacted: consecutive deltas of the SAME block
+      // pack into one run that stores the first chunk's absolute time and then
+      // only the gaps between the rest. Everything else rides as a raw record.
+      // dsh validates this on read (`expandAssistantStream`), so the shapes
+      // below are exact: `dt` is one shorter than its members, a run's keys are
+      // exactly the ones listed, and a raw record carries only type/time/chunk.
+
+      /**
+       * 这条 assistant 消息该落在哪一步，并且让它的流跟着它走。
+       *
+       * 一步只落一条消息，所以上一步已经落过时这条要开新的一步。但此刻攒着的
+       * 流还在旧的那一步里：`currentStep()` 只问「有没有开着的步」，不问那一步
+       * 是不是已经落过消息，于是第二条消息的增量全进了第一条的兜里。结果是
+       * 第一条带着不属于它的流，第二条 `stream` 为空——回放时正文一个字的逐字
+       * 过程都没有。实测过：reasoning 那条 stream=2，正文那条 stream=0。
+       *
+       * 所以开新的一步时把攒着的流交接过去；它本来就属于将要写的这条消息。
+       * 交接用 splice 清空旧的那一步，这样 closeStep 也不会再为它补一条
+       * assistant/attempt。
+       */
+      function stepForAssistant(open, beginStep) {
+        if (open !== undefined && open.assistantLogged !== true) return open
+        const carried = open === undefined ? [] : open.stream.splice(0)
+        const carriedAt = open === undefined ? 0 : open.streamAt
+        const step = beginStep()
+        step.stream = carried
+        step.streamAt = carriedAt
+        return step
+      }
+
+      /** Which run a delta belongs in, or '' when the chunk is not a delta. */
+      function runKindOf(chunk) {
+        if (chunk.type === 'text-delta') return 'text-chunks'
+        if (chunk.type === 'reasoning-delta') return 'reasoning-chunks'
+        if (chunk.type === 'tool-call-delta') return 'tool-call-chunks'
+        return ''
+      }
+
+      /** The string this delta contributes to its run. */
+      function runMemberOf(chunk) {
+        const value = chunk.type === 'tool-call-delta' ? chunk.argumentsDelta : chunk.text
+        return typeof value === 'string' ? value : ''
+      }
+
+      /**
+       * May this chunk extend that run?
+       *
+       * Only when it is the same kind and the same block. A tool call also has
+       * to be the same call: `name` arrives on the opening delta and is absent
+       * from the rest, so its absence is not a mismatch.
+       */
+      function extendsRun(record, chunk, kind) {
+        if (record === undefined || record.type !== kind || record.index !== chunk.index) return false
+        if (kind !== 'tool-call-chunks') return true
+        if (record.id !== chunk.id) return false
+        return chunk.name === undefined || record.name === chunk.name
+      }
+
       function appendChunk(step, chunk) {
-        const event = session.append('assistant/chunk', { turn: turn, step: step.step, chunk: chunk })
-        step.chunkSeqs.push(event.seq)
+        const time = Date.now()
+        const kind = runKindOf(chunk)
+        const last = step.stream.length > 0 ? step.stream[step.stream.length - 1] : undefined
+        if (kind !== '' && extendsRun(last, chunk, kind)) {
+          last.dt.push(time - step.streamAt)
+          ;(kind === 'tool-call-chunks' ? last.args : last.texts).push(runMemberOf(chunk))
+        } else if (kind === 'text-chunks' || kind === 'reasoning-chunks') {
+          step.stream.push({ type: kind, time0: time, index: chunk.index, dt: [], texts: [runMemberOf(chunk)] })
+        } else if (kind === 'tool-call-chunks') {
+          step.stream.push({
+            type: kind,
+            time0: time,
+            index: chunk.index,
+            dt: [],
+            id: chunk.id,
+            ...(typeof chunk.name === 'string' && chunk.name.length > 0 ? { name: chunk.name } : {}),
+            args: [runMemberOf(chunk)],
+          })
+        } else {
+          step.stream.push({ type: 'chunk', time: time, chunk: chunk })
+        }
+        step.streamAt = time
       }
 
       function streamEvent(event) {
@@ -1356,7 +1873,7 @@ return {
       }
 
       function assistantMessage(message) {
-        const step = (open === undefined || open.assistantLogged) ? beginStep() : open
+        const step = stepForAssistant(open, beginStep)
         step.assistantLogged = true
         loggedAssistant = true
         const content = assistantBlocksOf(message.content)
@@ -1373,8 +1890,21 @@ return {
               source: { kind: 'model', provider: PROVIDER, model: message.model || 'claude-code' },
             },
             ...(usage === undefined ? {} : { usage: usage }),
+            // 写入时就把流从这一步里取走，而不是把数组借给它。
+            // 借的话有两处会咬人：这条事件和这一步共用同一个数组，之后任何一次
+            // 追加或清空都会改到已经写下去的历史；而且这一步之后新来的增量属于
+            // 下一条消息，留在同一个数组里就成了这条的。取走之后，这一步归零，
+            // 新增量自然是下一条的（由 stepForAssistant 交接过去）。
+            stream: step.stream.splice(0),
           },
-          { surfaceOp: 'append', sourceEventSeqs: step.chunkSeqs.slice() },
+          // No `sourceEventSeqs` here, deliberately. It only ever means
+          // something for a `replace` op — it declares which surface nodes the
+          // replacement shadows — and this is an `append`, which shadows
+          // nothing. dsh 0.1.5-rc.2 made that explicit and now REJECTS the
+          // pair outright ("assistant/message embeds its source stream and
+          // cannot carry sourceEventSeqs"), which took every Claude turn down,
+          // local and remote alike, the moment dsh updated itself.
+          { surfaceOp: 'append' },
         )
         const calls = []
         for (const block of content) {
@@ -1437,6 +1967,9 @@ return {
             content: [{ type: 'text', text: text }],
             source: { kind: 'model', provider: PROVIDER, model: NOTICE_MODEL },
           },
+          // 这条消息不是模型产出的，没有流；但 dsh 0.1.5-rc.2 要求每条
+          // assistant/message 都带 stream，缺了就判整份日志损坏。
+          stream: [],
         }, { surfaceOp: 'append' })
       }
 
@@ -1695,7 +2228,7 @@ return {
       if (remote !== null && remote !== undefined && remote.dshHost === '') return
       shadowChecked.add(key)
       const where = key === '' ? 'this machine' : key
-      runCapture(shArgv('cat "$HOME"/.claude.json 2>/dev/null', remote), 8000).then((raw) => {
+      captureOn('cat "$HOME"/.claude.json 2>/dev/null', remote, 8000).then((raw) => {
         let config = null
         try { config = JSON.parse(String(raw)) } catch (error) { return }
         const found = []
@@ -1736,24 +2269,21 @@ return {
       const done = brokerReady.get(key)
       if (done !== undefined) return done
       const started = (async () => {
-        const proc = silenceStdin(subprocess.spawn({
-          argv: shArgv('mkdir -p ' + shellQuote(BROKER_ROOT) + ' && cat > ' + shellQuote(BROKER_PATH), remote),
-          cwd: '/',
-          stdio: { stdin: 'pipe', stdout: 'ignore', stderr: 'ignore' },
-          graceMs: 2000,
-        }))
-        if (proc.stdin !== undefined) {
-          proc.stdin.write(BROKER_SOURCE)
-          proc.stdin.end()
+        const result = await execOn('mkdir -p ' + shellQuote(BROKER_ROOT) + ' && cat > ' + shellQuote(BROKER_PATH),
+          remote, 20000, { stdin: BROKER_SOURCE })
+        // A broker source that did not land means every launch after this one
+        // fails with "the broker never showed up". Say which it was.
+        if (result.decided !== true) console.error('cc-mode: broker 源码没写过去（' + result.reason + '）')
+        else if (result.code !== null && result.code !== 0) {
+          console.error('cc-mode: broker 源码写入失败，退出码', result.code, result.stderr.trim())
         }
-        try { await proc.done } catch (error) { /* reported by the first attach */ }
       })()
       brokerReady.set(key, started)
       return started
     }
 
     async function readJsonFile(path, remote) {
-      const raw = await runCapture(shArgv('cat ' + shellQuote(path) + ' 2>/dev/null', remote), 5000)
+      const raw = await captureOn('cat ' + shellQuote(path) + ' 2>/dev/null', remote, 5000)
       try { return JSON.parse(raw) } catch (error) { return null }
     }
 
@@ -1773,18 +2303,18 @@ return {
      */
     async function isAlive(pid, remote) {
       if (typeof pid !== 'number' || pid <= 0) return false
-      const answer = await runCapture(shArgv(
+      const answer = await captureOn(
         'state=$(ps -o stat= -p ' + pid + ' 2>/dev/null | head -1 | tr -d " "); '
         + 'if [ -n "$state" ]; then case "$state" in Z*) echo no;; *) echo yes;; esac; '
-        + 'else kill -0 ' + pid + ' 2>/dev/null && echo yes || echo no; fi', remote), 5000)
+        + 'else kill -0 ' + pid + ' 2>/dev/null && echo yes || echo no; fi', remote, 5000)
       return String(answer).trim().indexOf('yes') === 0
     }
 
     // `stat -c` is GNU; macOS ships BSD stat (`-f`). Every stat goes through
     // the pair, first flavour that answers wins.
     async function fileSize(path, remote) {
-      const answer = await runCapture(shArgv(
-        'stat -c %s ' + shellQuote(path) + ' 2>/dev/null || stat -f %z ' + shellQuote(path) + ' 2>/dev/null || echo 0', remote), 5000)
+      const answer = await captureOn(
+        'stat -c %s ' + shellQuote(path) + ' 2>/dev/null || stat -f %z ' + shellQuote(path) + ' 2>/dev/null || echo 0', remote, 5000)
       const size = parseInt(String(answer).trim(), 10)
       return isNaN(size) ? 0 : size
     }
@@ -1796,8 +2326,8 @@ return {
      * which is how an import once recorded offset 0 and re-mirrored history.
      */
     async function fileSizeOfShellWord(word, remote) {
-      const answer = await runCapture(shArgv(
-        'stat -c %s ' + word + ' 2>/dev/null || stat -f %z ' + word + ' 2>/dev/null || echo 0', remote), 5000)
+      const answer = await captureOn(
+        'stat -c %s ' + word + ' 2>/dev/null || stat -f %z ' + word + ' 2>/dev/null || echo 0', remote, 5000)
       const size = parseInt(String(answer).trim(), 10)
       return isNaN(size) ? 0 : size
     }
@@ -1816,8 +2346,8 @@ return {
      * words, and anything else is 'unknown' — never 'no'.
      */
     async function fileExistsOfShellWord(word, remote) {
-      const answer = await runCapture(shArgv(
-        'if [ -f ' + word + ' ]; then echo yes; else echo no; fi', remote), 20000)
+      const answer = await captureOn(
+        'if [ -f ' + word + ' ]; then echo yes; else echo no; fi', remote, 20000)
       const text = String(answer).trim()
       if (text === 'yes') return 'yes'
       if (text === 'no') return 'no'
@@ -1911,6 +2441,10 @@ return {
      * ignore what the selector says.
      */
     function applyModel(run, state) {
+      // Same reason as the launch flag: on a target that owns its model, a
+      // `set_model` would re-point a working conversation at a model its
+      // gateway has never heard of.
+      if (run.remote !== null && run.remote !== undefined && run.remote.ownModel === true) return
       if (state.model.length === 0 || run.appliedModel === state.model) return
       run.appliedModel = state.model
       try { run.control({ subtype: 'set_model', model: state.model }) } catch (error) {
@@ -2038,9 +2572,9 @@ return {
         // Bytes from the mark through the end of the first `result` line.
         // LC_ALL=C because awk's `length` counts characters otherwise, and a
         // Chinese answer would then measure shorter than it is on disk.
-        const raw = await runCapture(shArgv(
+        const raw = await captureOn(
           'tail -c +' + (pending.from + 1) + ' ' + shellQuote(dir + '/out.log')
-          + ' | LC_ALL=C awk \'{ n += length($0) + 1 } /"type":"result"/ { print n; exit }\'', remote), 15000)
+          + ' | LC_ALL=C awk \'{ n += length($0) + 1 } /"type":"result"/ { print n; exit }\'', remote, 15000)
         const span = parseInt(String(raw).trim(), 10)
         if (isNaN(span) || span <= 0) return undefined
         state.pendingCommand = undefined
@@ -2059,25 +2593,65 @@ return {
       if (run.checkpointing === true) return
       run.checkpointing = true
       const offset = typeof run.consumed === 'number' ? run.consumed : run.offset
-      const writer = silenceStdin(subprocess.spawn({
-        argv: shArgv('cat > ' + shellQuote(run.dir + '/attach.json'), run.remote),
-        cwd: '/',
-        stdio: { stdin: 'pipe', stdout: 'ignore', stderr: 'ignore' },
-        graceMs: 1000,
-      }))
-      if (writer === undefined || writer === null || writer.stdin === undefined) {
-        run.checkpointing = false
-        return
+      execOn('cat > ' + shellQuote(run.dir + '/attach.json'), run.remote, 10000,
+        { stdin: JSON.stringify({ offset: offset }) })
+        .then(() => { run.checkpointing = false }, () => { run.checkpointing = false })
+    }
+
+    /**
+     * `deliverLine` over a daemon.
+     *
+     * The one hop that can fail ambiguously is this one: the connection drops
+     * and we cannot know whether the line reached the fifo. Retrying blind
+     * would risk sending the same prompt twice; not retrying turns a blip in
+     * the tunnel into a turn the person has to notice and redo. So the write
+     * carries an idempotency key, the daemon records it before answering, and
+     * the retry is free — a second attempt either performs the write or is
+     * told the first one already did.
+     *
+     * The key is minted PER CALL and means nothing outside it. That is not
+     * laziness — a derived key is what broke this the first time. The key was
+     * `sessionId:deliverSeq:byteLength`, and `deliverSeq` is a counter on the
+     * run object: re-attaching to a live Claude builds a new run and resets it
+     * to zero. A permission answer is a fixed-shape JSON whose length is always
+     * the same (`{"behavior":"allow"}` plus a 36-character request id), so the
+     * second run's second write computed the SAME key as the first run's —
+     * the daemon recognised a duplicate, returned the cached result, and never
+     * wrote to the fifo. Claude sat waiting for an approval that had been
+     * granted, the tool never ran, and the turn span forever with nothing in
+     * any log saying why.
+     *
+     * A fresh id per call cannot collide, and a retry inside this call reuses
+     * it — which is the entire scope the guarantee was ever needed for.
+     */
+    async function deliverLineViaDaemon(run, line) {
+      const key = 'deliver-' + uuid()
+      const payload = run.pipeDirty === true ? '\n' + line : line
+      let last = ''
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const result = await execOn('cat > ' + shellQuote(run.dir + '/in'), run.remote, 10000,
+          { stdin: payload, idemKey: key })
+        if (result.decided === true && result.timedOut !== true) {
+          if (result.code !== null && result.code !== 0) {
+            run.pipeDirty = true
+            throw new Error('cc-mode: 写入 Claude 的输入管道失败（退出码 ' + result.code + '）' + result.stderr.trim())
+          }
+          run.pipeDirty = false
+          return
+        }
+        // A write that timed out may have left half a line in the fifo; the
+        // next one prefixes a newline so the stump dies as its own unparseable
+        // line instead of corrupting the front of the next message.
+        if (result.timedOut === true) { run.pipeDirty = true; break }
+        last = result.reason
       }
-      try {
-        writer.stdin.write(JSON.stringify({ offset: offset }))
-        writer.stdin.end()
-      } catch (error) { /* the next checkpoint tries again */ }
-      writer.done.then(() => { run.checkpointing = false }, () => { run.checkpointing = false })
+      run.pipeDirty = true
+      throw new Error('cc-mode: 写入 Claude 的输入管道没成功' + (last.length > 0 ? '（' + last + '）' : '（10 秒超时）'))
     }
 
     /** Put one line into a run's fifo and wait until it is actually in. */
     async function deliverLine(run, line) {
+      if (usesDaemon(run.remote)) return deliverLineViaDaemon(run, line)
       const writer = silenceStdin(subprocess.spawn({
         argv: shArgv('cat > ' + shellQuote(run.dir + '/in'), run.remote),
         cwd: '/',
@@ -2108,13 +2682,27 @@ return {
     /** Attach this plugin to a live broker: one tail in, one cat out. */
     async function attach(run) {
       run.consumed = run.offset
-      run.reader = subprocess.spawn({
-        // `exec` so no shell lingers around the tail for the life of the run.
-        argv: shArgv('exec tail -c +' + (run.offset + 1) + ' -f ' + shellQuote(run.dir + '/out.log'), run.remote),
-        cwd: '/',
-        stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'ignore' },
-        graceMs: 1000,
-      })
+      if (usesDaemon(run.remote)) {
+        // One long response instead of a `tail -f` at the end of a shell hop.
+        // The offset is the same number either way — `tail -c +N` counts from
+        // one, the daemon counts from zero, and this is the zero.
+        let link = null
+        try { link = await ensureDaemon(run.remote) } catch (error) {
+          console.error('cc-mode: 连不上 cc-daemon，这一轮没有读取端:', errorText(error))
+          run.readerDead = true
+          run.push(undefined)
+          return
+        }
+        run.reader = daemonTail(link, run.dir + '/out.log', run.offset)
+      } else {
+        run.reader = subprocess.spawn({
+          // `exec` so no shell lingers around the tail for the life of the run.
+          argv: shArgv('exec tail -c +' + (run.offset + 1) + ' -f ' + shellQuote(run.dir + '/out.log'), run.remote),
+          cwd: '/',
+          stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'ignore' },
+          graceMs: 1000,
+        })
+      }
       pumpAttached(run)
     }
 
@@ -2139,15 +2727,11 @@ return {
         // consumed mark, not run.offset: the raw offset can include half a
         // line still sitting in the pump's buffer.
         const patch = JSON.stringify({ offset: typeof run.consumed === 'number' ? run.consumed : run.offset })
+        // Not awaited and never allowed to throw: this runs inside a cordis
+        // disposer, where anything thrown escapes into the runtime.
         try {
-          const proc = silenceStdin(subprocess.spawn({
-            argv: shArgv('cat > ' + shellQuote(run.dir + '/attach.json'), run.remote),
-            cwd: '/',
-            stdio: { stdin: 'pipe', stdout: 'ignore', stderr: 'ignore' },
-            graceMs: 1000,
-          }))
-          if (proc.stdin !== undefined) { proc.stdin.write(patch); proc.stdin.end() }
-          proc.done.catch(() => undefined)
+          execOn('cat > ' + shellQuote(run.dir + '/attach.json'), run.remote, 10000, { stdin: patch })
+            .catch(() => undefined)
         } catch (error) { /* the offset falls back to EOF */ }
       }
       // The mirror follows the run: pending subagent children are persisted as
@@ -2254,9 +2838,9 @@ return {
       }
 
       // Nothing usable is running: retire whatever is left and start fresh.
-      if (meta !== null) await runCapture(shArgv(
+      if (meta !== null) await captureOn(
         'kill ' + (typeof meta.brokerPid === 'number' ? meta.brokerPid : 0) + ' 2>/dev/null; '
-        + 'kill ' + (typeof meta.childPid === 'number' ? meta.childPid : 0) + ' 2>/dev/null; true', remote), 5000)
+        + 'kill ' + (typeof meta.childPid === 'number' ? meta.childPid : 0) + ' 2>/dev/null; true', remote, 5000)
 
       // A remote's `claude` is resolved by ITS login shell, not by our PATH —
       // resolveExecutable would answer with a path on this machine.
@@ -2309,7 +2893,9 @@ return {
         '--permission-prompt-tool', 'stdio',
         '--permission-mode', state.permissionMode,
       ]
-      if (state.model.length > 0) argv.push('--model', state.model)
+      if (state.model.length > 0 && !(remote !== null && remote !== undefined && remote.ownModel === true)) {
+        argv.push('--model', state.model)
+      }
       if (state.effort.length > 0) argv.push('--effort', state.effort)
       // Multi-agent: hand this conversation the tools that open and drive OTHER
       // dsh conversations. The endpoint is addressed per conversation, so the
@@ -2385,26 +2971,42 @@ return {
       // the spawn on purpose: taking it afterwards races the child's own
       // `init` line, and losing that line loses the model and session binding.
       const priorLog = await fileSize(dir + '/out.log', remote)
-      const started = subprocess.spawn({
-        argv: shArgv(remote === null || env === undefined
-          ? launch
-          : Object.keys(env).map((name) => name + '=' + shellQuote(env[name])).join(' ') + ' ' + launch, remote),
-        cwd: remote === null ? cwd : '/',
-        stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
-        graceMs: 3000,
-        ...(env === undefined || remote !== null ? {} : { env: env }),
-      })
-      ;(async () => {
-        try { for await (const chunk of started.stderr) console.error('cc-mode [launch]', String(chunk).trim()) } catch (error) { /* closed */ }
-      })()
-      // A launch that never started at all — argv[0] missing, most often —
-      // fails HERE, asynchronously and with nothing on stderr. Swallowing it
-      // left the operator with only "the broker never showed up", which names
-      // the symptom and hides the cause.
-      try {
-        await started.done
-      } catch (error) {
-        console.error('cc-mode [launch] could not start ' + shArgv('…', remote)[0] + ':', errorText(error))
+      const launchCommand = remote === null || env === undefined
+        ? launch
+        : Object.keys(env).map((name) => name + '=' + shellQuote(env[name])).join(' ') + ' ' + launch
+      if (usesDaemon(remote)) {
+        // The script detaches the broker and returns; one exec is the whole of
+        // it, and — unlike the spawn below — a launch that never ran says so
+        // with a reason instead of an empty stream.
+        const result = await execOn(launchCommand, remote, 60000)
+        if (result.decided !== true) {
+          console.error('cc-mode [launch] 目标机没答复:', result.reason)
+        } else {
+          const noise = result.stderr.trim()
+          if (noise.length > 0) console.error('cc-mode [launch]', noise)
+          if (result.timedOut === true) console.error('cc-mode [launch] 启动脚本超时了（60 秒）')
+          else if (result.code !== null && result.code !== 0) console.error('cc-mode [launch] 启动脚本退出码', result.code)
+        }
+      } else {
+        const started = subprocess.spawn({
+          argv: shArgv(launchCommand, remote),
+          cwd: remote === null ? cwd : '/',
+          stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
+          graceMs: 3000,
+          ...(env === undefined || remote !== null ? {} : { env: env }),
+        })
+        ;(async () => {
+          try { for await (const chunk of started.stderr) console.error('cc-mode [launch]', String(chunk).trim()) } catch (error) { /* closed */ }
+        })()
+        // A launch that never started at all — argv[0] missing, most often —
+        // fails HERE, asynchronously and with nothing on stderr. Swallowing it
+        // left the operator with only "the broker never showed up", which names
+        // the symptom and hides the cause.
+        try {
+          await started.done
+        } catch (error) {
+          console.error('cc-mode [launch] could not start ' + shArgv('…', remote)[0] + ':', errorText(error))
+        }
       }
 
       const run = createRun(sessionId, dir, snapshot, claudeSessionId, remote)
@@ -2412,7 +3014,7 @@ return {
       // Durable, because a cold conversation has no run to ask and still needs
       // to find its own transcript.
       state.launchCwd = cwd
-      rememberDir(remote, cwd)
+      rememberDir(remote, cwd, workspaceOf(sessionId))
       run.offset = priorLog
       // A fresh Claude starts reading at the end of the log, which is already
       // past anything an abandoned probe left behind.
@@ -2479,11 +3081,11 @@ return {
     }
 
     async function reapIdleBrokersOn(remote) {
-      const listing = await runCapture(shArgv(
+      const listing = await captureOn(
         'for d in ' + shellQuote(BROKER_ROOT) + '/session-*; do '
         + '[ -d "$d" ] || continue; '
         + 'echo "$d|$(stat -c %Y "$d/out.log" 2>/dev/null || stat -f %m "$d/out.log" 2>/dev/null || echo 0)'
-        + '|$(cat "$d/owner" 2>/dev/null)"; done', remote), 8000)
+        + '|$(cat "$d/owner" 2>/dev/null)"; done', remote, 8000)
       const now = Date.now()
       // Sessions dsh still knows about. A broker for a conversation that no
       // longer exists (deleted, or from an older dsh state) is pure waste and
@@ -2529,11 +3131,11 @@ return {
         if (activeTurns.has(sessionId)) continue
         const meta = await readJsonFile(dir + '/meta.json', remote)
         if (meta !== null) {
-          await runCapture(shArgv(
+          await captureOn(
             'kill ' + (typeof meta.childPid === 'number' ? meta.childPid : 0) + ' 2>/dev/null; '
-            + 'kill ' + (typeof meta.brokerPid === 'number' ? meta.brokerPid : 0) + ' 2>/dev/null; true', remote), 5000)
+            + 'kill ' + (typeof meta.brokerPid === 'number' ? meta.brokerPid : 0) + ' 2>/dev/null; true', remote, 5000)
         }
-        await runCapture(shArgv('rm -rf ' + shellQuote(dir), remote), 5000)
+        await captureOn('rm -rf ' + shellQuote(dir), remote, 5000)
         console.log('cc-mode: reaped a Claude broker for', sessionId,
           '— idle', Math.round(idleMs / 60000), 'min'
           + (orphaned ? ', no live dsh session' : '') + (remote === null ? '' : ' @ ' + remote.id))
@@ -2547,10 +3149,10 @@ return {
       detach(sessionId, false)
       const meta = await readJsonFile(dir + '/meta.json', remote)
       if (meta === null) return false
-      await runCapture(shArgv(
+      await captureOn(
         'kill ' + (typeof meta.childPid === 'number' ? meta.childPid : 0) + ' 2>/dev/null; '
         + 'kill ' + (typeof meta.brokerPid === 'number' ? meta.brokerPid : 0) + ' 2>/dev/null; '
-        + 'rm -f ' + shellQuote(dir + '/meta.json') + '; true', remote), 5000)
+        + 'rm -f ' + shellQuote(dir + '/meta.json') + '; true', remote, 5000)
       console.log('cc-mode: stopped Claude for', sessionId)
       return true
     }
@@ -2600,19 +3202,8 @@ return {
         sessionId: claudeSessionId,
       })
       try {
-        const proc = silenceStdin(subprocess.spawn({
-          argv: shArgv('mkdir -p "$HOME/.claude" && cat >> "$HOME/.claude/history.jsonl"', remote),
-          // The cwd is a directory over there when this is a remote target;
-          // the append does not need it, so only a local spawn takes it.
-          cwd: remote === null || remote === undefined ? cwd : '/',
-          stdio: { stdin: 'pipe', stdout: 'ignore', stderr: 'ignore' },
-          graceMs: 2000,
-        }))
-        if (proc.stdin !== undefined) {
-          proc.stdin.write(row + '\n')
-          proc.stdin.end()
-        }
-        proc.done.catch(() => undefined)
+        execOn('mkdir -p "$HOME/.claude" && cat >> "$HOME/.claude/history.jsonl"', remote, 10000, { stdin: row + '\n' })
+          .catch(() => undefined)
       } catch (error) {
         console.error('cc-mode: could not record the prompt in Claude history:', errorText(error))
       }
@@ -2652,8 +3243,8 @@ return {
     const REMOTE_USAGE_PROBE = '(async()=>{const fs=require("fs");const out=(v)=>process.stdout.write(JSON.stringify(v));let c=null;try{c=JSON.parse(fs.readFileSync(process.env.HOME+"/.claude/.credentials.json","utf8"))}catch(e){}const o=c&&c.claudeAiOauth;if(!o||typeof o.accessToken!=="string"||typeof o.subscriptionType!=="string")return out({skip:"no-oauth-subscription"});if(((process.env.ANTHROPIC_BASE_URL||"")+(process.env.ANTHROPIC_AUTH_TOKEN||"")+(process.env.ANTHROPIC_API_KEY||"")).length>0)return out({skip:"gateway-override"});try{const r=await fetch("https://api.anthropic.com/api/oauth/usage",{headers:{Authorization:"Bearer "+o.accessToken,"anthropic-beta":"oauth-2025-04-20",Accept:"application/json"}});out({subscription:o.subscriptionType,tier:typeof o.rateLimitTier==="string"?o.rateLimitTier:null,body:await r.text()})}catch(e){out({subscription:o.subscriptionType,tier:null,error:String((e&&e.message)||e)})}})()'
 
     async function remoteUsageSource(remote) {
-      const raw = await runCapture(shArgv(
-        shellQuote(remote.nodeBin) + ' -e ' + shellQuote(REMOTE_USAGE_PROBE), remote), 25000)
+      const raw = await captureOn(
+        shellQuote(remote.nodeBin) + ' -e ' + shellQuote(REMOTE_USAGE_PROBE), remote, 25000)
       let answer = null
       try { answer = JSON.parse(String(raw).trim()) } catch (error) { answer = null }
       if (answer === null) {
@@ -3093,8 +3684,8 @@ return {
       const run = runs.get(sessionId)
       if (run !== undefined && run.init !== undefined) return run.init
       const path = sessionDir(sessionId) + '/out.log'
-      const raw = await runCapture(shArgv(
-        'grep -a \'"subtype":"init"\' ' + shellQuote(path) + ' 2>/dev/null | tail -1', remoteOf(stateOf(sessionId))), 8000)
+      const raw = await captureOn(
+        'grep -a \'"subtype":"init"\' ' + shellQuote(path) + ' 2>/dev/null | tail -1', remoteOf(stateOf(sessionId)), 8000)
       const line = String(raw).trim()
       if (line.length === 0) return undefined
       try { return JSON.parse(line) } catch (error) { return undefined }
@@ -3105,7 +3696,7 @@ return {
      * the project's own entry in ~/.claude.json versus the user-wide one.
      */
     async function mcpScopes(cwd, remote) {
-      const raw = await runCapture(shArgv('cat "$HOME"/.claude.json 2>/dev/null', remote), 8000)
+      const raw = await captureOn('cat "$HOME"/.claude.json 2>/dev/null', remote, 8000)
       let config = null
       try { config = JSON.parse(raw) } catch (error) { config = null }
       const scopes = {}
@@ -3368,14 +3959,14 @@ return {
       const dir = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd))
       const needle = String(query || '').trim()
       if (needle.length === 0) return { hits: [] }
-      const matched = await runCapture(shArgv(
-        'cd ' + dir + ' 2>/dev/null && grep -liF -- ' + shellQuote(needle) + ' *.jsonl 2>/dev/null | head -20', remote), 15000)
+      const matched = await captureOn(
+        'cd ' + dir + ' 2>/dev/null && grep -liF -- ' + shellQuote(needle) + ' *.jsonl 2>/dev/null | head -20', remote, 15000)
       const hits = []
       for (const name of String(matched).split('\n')) {
         const file = name.trim()
         if (file.length === 0 || !file.endsWith('.jsonl')) continue
-        const line = await runCapture(shArgv(
-          'grep -iF -m1 -- ' + shellQuote(needle) + ' ' + dir + '/' + shellQuote(file) + ' 2>/dev/null | head -c 200000', remote), 10000)
+        const line = await captureOn(
+          'grep -iF -m1 -- ' + shellQuote(needle) + ' ' + dir + '/' + shellQuote(file) + ' 2>/dev/null | head -c 200000', remote, 10000)
         hits.push({
           claudeSessionId: file.replace(/\.jsonl$/, ''),
           snippet: snippetAround(String(line), needle),
@@ -3400,9 +3991,9 @@ return {
 
     async function listClaudeConversations(cwd, remote) {
       const dir = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd))
-      const listing = await runCapture(shArgv(
+      const listing = await captureOn(
         'for f in ' + dir + '/*.jsonl; do [ -f "$f" ] || continue; '
-        + 'echo "$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f")|$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f")|$f"; done | sort -rn | head -40', remote), 10000)
+        + 'echo "$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f")|$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f")|$f"; done | sort -rn | head -40', remote, 10000)
       const rows = []
       for (const line of String(listing).split('\n')) {
         const parts = line.trim().split('|')
@@ -3418,9 +4009,9 @@ return {
       }
       // One pass per file for the title and the opening prompt.
       for (const row of rows) {
-        const head = await runCapture(shArgv(
+        const head = await captureOn(
           'grep -m 3 -E \'"type":"(ai-title|custom-title)"\' ' + shellQuote(row.path) + ' 2>/dev/null; '
-          + 'grep -m 1 -F \'"type":"user"\' ' + shellQuote(row.path) + ' 2>/dev/null', remote), 8000)
+          + 'grep -m 1 -F \'"type":"user"\' ' + shellQuote(row.path) + ' 2>/dev/null', remote, 8000)
         row.title = ''
         row.firstPrompt = ''
         for (const line of String(head).split('\n')) {
@@ -3495,8 +4086,8 @@ return {
         const size = await fileSizeOfShellWord(path, remoteOf(state))
         if (size <= state.jsonlOffset) return 0
 
-        const raw = await runCapture(shArgv(
-          'tail -c +' + (state.jsonlOffset + 1) + ' ' + path + ' | head -c 3000000', remoteOf(state)), 20000)
+        const raw = await captureOn(
+          'tail -c +' + (state.jsonlOffset + 1) + ' ' + path + ' | head -c 3000000', remoteOf(state), 20000)
         const text = String(raw)
         // Only whole lines advance the offset — a line the terminal is mid-way
         // through writing stays for the next pass.
@@ -3664,12 +4255,12 @@ return {
             }
           }
           if (callId.length === 0) return 0
-          const lineNoRaw = await runCapture(shArgv(
-            'grep -n -m1 -F ' + shellQuote('"tool_use_id":"' + callId + '"') + ' ' + shellQuote(dir + '/out.log') + ' | cut -d: -f1', remote), 15000)
+          const lineNoRaw = await captureOn(
+            'grep -n -m1 -F ' + shellQuote('"tool_use_id":"' + callId + '"') + ' ' + shellQuote(dir + '/out.log') + ' | cut -d: -f1', remote, 15000)
           const lineNo = parseInt(String(lineNoRaw).trim(), 10)
           if (isNaN(lineNo) || lineNo < 1) return 0
-          const offsetRaw = await runCapture(shArgv(
-            'head -n ' + (lineNo - 1) + ' ' + shellQuote(dir + '/out.log') + ' | wc -c', remote), 15000)
+          const offsetRaw = await captureOn(
+            'head -n ' + (lineNo - 1) + ' ' + shellQuote(dir + '/out.log') + ' | wc -c', remote, 15000)
           offset = parseInt(String(offsetRaw).trim(), 10)
           if (isNaN(offset)) return 0
         }
@@ -3680,8 +4271,8 @@ return {
         const size = await fileSize(dir + '/out.log', remote)
         if (size <= offset) return 0
 
-        const raw = await runCapture(shArgv(
-          'tail -c +' + (offset + 1) + ' ' + shellQuote(dir + '/out.log') + ' | head -c 3000000', remote), 20000)
+        const raw = await captureOn(
+          'tail -c +' + (offset + 1) + ' ' + shellQuote(dir + '/out.log') + ' | head -c 3000000', remote, 20000)
         const rows = []
         let sawResult = false
         for (const line of String(raw).split('\n')) {
@@ -3727,16 +4318,9 @@ return {
         const written = queueProjection(sessionId, fresh,
           '（dsh 重启期间 Claude 继续完成了这一轮，以下是断档期间的内容。）')
         await new Promise((resolve) => {
-          const writer = silenceStdin(subprocess.spawn({
-            argv: shArgv('cat > ' + shellQuote(dir + '/attach.json'), remote),
-            cwd: '/',
-            stdio: { stdin: 'pipe', stdout: 'ignore', stderr: 'ignore' },
-            graceMs: 1000,
-          }))
-          if (writer === undefined || writer.stdin === undefined) { resolve(); return }
-          writer.stdin.write(JSON.stringify({ offset: size }))
-          writer.stdin.end()
-          writer.done.then(() => resolve(), () => resolve())
+          execOn('cat > ' + shellQuote(dir + '/attach.json'), remote, 10000,
+            { stdin: JSON.stringify({ offset: size }) })
+            .then(() => resolve(), () => resolve())
         })
         console.log('cc-mode:', sessionId, 'drained', written, 'message(s) Claude produced while detached')
         return written
@@ -3799,9 +4383,9 @@ return {
      * wakes Claude up.
      */
     async function lastBackgroundTaskCount(dir, remote) {
-      const raw = await runCapture(shArgv(
+      const raw = await captureOn(
         'tail -c 2000000 ' + shellQuote(dir + '/out.log')
-        + ' | grep -F \'"background_tasks_changed"\' | tail -1', remote), 10000)
+        + ' | grep -F \'"background_tasks_changed"\' | tail -1', remote, 10000)
       const line = String(raw).trim()
       if (line.length === 0) return 0
       try {
@@ -3828,8 +4412,8 @@ return {
       if (typeof claudeSessionId !== 'string' || claudeSessionId.length === 0) return ''
       const path = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd))
         + '/' + shellQuote(claudeSessionId + '.jsonl')
-      const raw = await runCapture(shArgv(
-        'tail -c 2000000 ' + path + ' 2>/dev/null | grep -F ' + shellQuote('{"type":"ai-title"') + ' | tail -5', remote), 10000)
+      const raw = await captureOn(
+        'tail -c 2000000 ' + path + ' 2>/dev/null | grep -F ' + shellQuote('{"type":"ai-title"') + ' | tail -5', remote, 10000)
       const lines = String(raw).split('\n')
       for (let index = lines.length - 1; index >= 0; index -= 1) {
         const line = lines[index].trim()
@@ -3952,9 +4536,9 @@ return {
         console.error('cc-mode:', sessionId, 'idle stretch is', Math.round(span / 1024),
           'KB — projecting the first', Math.round(IDLE_STRETCH_MAX / 1024), 'KB of it')
       }
-      const raw = await runCapture(shArgv(
+      const raw = await captureOn(
         'tail -c +' + (from + 1) + ' ' + shellQuote(run.dir + '/out.log')
-        + ' | head -c ' + Math.min(span, IDLE_STRETCH_MAX), run.remote), 20000)
+        + ' | head -c ' + Math.min(span, IDLE_STRETCH_MAX), run.remote, 20000)
 
       const rows = []
       for (const line of String(raw).split('\n')) {
@@ -4325,7 +4909,7 @@ return {
           id: uuid(), role: 'assistant',
           content: [{ type: 'text', text: notice }],
           source: { kind: 'model', provider: PROVIDER, model: NOTICE_MODEL },
-        } })
+        }, stream: [] })
       }
 
       let written = 0
@@ -4383,10 +4967,11 @@ return {
           .filter((block) => block.type !== 'tool-call' || !knownCallIds.has(block.id))
         if (blocks.length === 0) continue
         openStep()
+        // 这些是从 out.log 的字节区间补投出来的消息，原始流没有留在手边。
         append('assistant/message', { turn: turn, step: step, message: {
           id: uuid(), role: 'assistant', content: blocks,
           source: { kind: 'model', provider: PROVIDER, model: message.model || 'claude-code' },
-        } })
+        }, stream: [] })
         written += 1
         for (const block of blocks) {
           if (block.type !== 'tool-call') continue
@@ -4436,8 +5021,8 @@ return {
       // sync's business, never lost between the two.
       const remote = remoteOf(stateOf(sessionId))
       const sizeAtImport = await fileSizeOfShellWord(path, remote)
-      const raw = await runCapture(shArgv(
-        'grep -E \'"type":"(user|assistant)"\' ' + path + ' 2>/dev/null', remote), 120000)
+      const raw = await captureOn(
+        'grep -E \'"type":"(user|assistant)"\' ' + path + ' 2>/dev/null', remote, 120000)
 
       const rows = []
       for (const line of String(raw).split('\n')) {
@@ -4453,9 +5038,9 @@ return {
       // 「Claude 默认」) even though its transcript says otherwise — and the
       // next turn would then run under a posture the user never chose.
       const state0 = stateOf(sessionId, session)
-      const settings = await runCapture(shArgv(
+      const settings = await captureOn(
         'grep -o \'"permissionMode":"[a-zA-Z]*"\' ' + path + ' 2>/dev/null | tail -1; '
-        + 'grep -o \'"model":"[^"]*"\' ' + path + ' 2>/dev/null | tail -1', remote), 20000)
+        + 'grep -o \'"model":"[^"]*"\' ' + path + ' 2>/dev/null | tail -1', remote, 20000)
       const posture = (String(settings).match(/"permissionMode":"([a-zA-Z]+)"/) || [])[1]
       const model = (String(settings).match(/"model":"([^"]+)"/) || [])[1]
       if (posture !== undefined && PERMISSION_MODES.some((entry) => entry.id === posture)) {
@@ -4484,8 +5069,8 @@ return {
       // outcome the fallback used to produce.
       try {
         let text = ''
-        const titled = await runCapture(shArgv(
-          'grep -E \'"type":"(ai-title|custom-title)"\' ' + path + ' 2>/dev/null | tail -5', remote), 8000)
+        const titled = await captureOn(
+          'grep -E \'"type":"(ai-title|custom-title)"\' ' + path + ' 2>/dev/null | tail -5', remote, 8000)
         for (const line of String(titled).split('\n')) {
           if (line.trim().length === 0) continue
           let event = null
@@ -4527,8 +5112,8 @@ return {
      */
     async function previewClaudeConversation(cwd, claudeSessionId, limit, remote) {
       const path = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd)) + '/' + shellQuote(claudeSessionId + '.jsonl')
-      const raw = await runCapture(shArgv(
-        'grep -E \'"type":"(user|assistant)"\' ' + path + ' 2>/dev/null | tail -' + (limit || 60), remote), 15000)
+      const raw = await captureOn(
+        'grep -E \'"type":"(user|assistant)"\' ' + path + ' 2>/dev/null | tail -' + (limit || 60), remote, 15000)
 
       const items = []
       const byCallId = new Map()
@@ -5188,6 +5773,8 @@ return {
           content: blocks,
           source: { kind: 'model', provider: PROVIDER, model: typeof message.model === 'string' ? message.model : 'claude-code' },
         },
+        // 子 agent 的镜像会话是按消息重放的，它这一侧没有独立的流。
+        stream: [],
       })
       const text = blocks.filter((block) => block.type === 'text').map((block) => block.text).join('\n\n').trim()
       if (text.length > 0) record.lastText = text
@@ -5347,6 +5934,7 @@ return {
             content: [{ type: 'text', text: summary.slice(0, 4000) }],
             source: { kind: 'model', provider: PROVIDER, model: '<synthetic>' },
           },
+          stream: [],
         })
       }
       ccChildCloseStep(record)
@@ -5702,7 +6290,7 @@ return {
             console.error(ignoredInterrupt
               ? 'cc-mode: 中断后 10 秒没有收到 result，松开这一轮（Claude 进程保留）'
               : 'cc-mode: 提交后 120 秒没有任何回应，判定输入没有送达；保留进程并松开这一轮')
-            runCapture(shArgv('rm -f ' + shellQuote(run.dir + '/attach.json'), run.remote), 3000).catch(() => undefined)
+            captureOn('rm -f ' + shellQuote(run.dir + '/attach.json'), run.remote, 3000).catch(() => undefined)
             detach(sessionId, false)
           })
         }, 2000)
@@ -6001,6 +6589,7 @@ return {
                 content: [{ type: 'text', text: '⚠ Claude Code 这一轮失败了：' + errorText(error) }],
                 source: { kind: 'model', provider: PROVIDER, model: NOTICE_MODEL },
               },
+              stream: [],
             }, { surfaceOp: 'append' })
             agent.session.append('step/end', { turn: payload.turn, step: step })
           } catch (appendError) {
@@ -6130,9 +6719,9 @@ return {
               if (typeof cwd === 'string' && cwd.length > 0) {
                 const path = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd)) + '/'
                   + shellQuote(state.claudeSessionId + '.jsonl')
-                const settings = await runCapture(shArgv(
+                const settings = await captureOn(
                   'grep -o \'"permissionMode":"[a-zA-Z]*"\' ' + path + ' 2>/dev/null | tail -1; '
-                  + 'grep -o \'"model":"[^"]*"\' ' + path + ' 2>/dev/null | tail -1', remoteOf(state)), 20000)
+                  + 'grep -o \'"model":"[^"]*"\' ' + path + ' 2>/dev/null | tail -1', remoteOf(state), 20000)
                 const posture = (String(settings).match(/"permissionMode":"([a-zA-Z]+)"/) || [])[1]
                 const model = (String(settings).match(/"model":"([^"]+)"/) || [])[1]
                 let changed = false
@@ -6314,7 +6903,7 @@ return {
             state.remoteCwd || '（目标的默认目录）')
         } else if (wanted !== (state.remoteCwd || '')) {
           state.remoteCwd = wanted
-          rememberDir(remoteOf(state), wanted)
+          rememberDir(remoteOf(state), wanted, workspaceOf(sessionId))
           persistStates()
           console.log('cc-mode:', sessionId, 'works in', wanted || '（目标的默认目录）')
         }
@@ -6326,10 +6915,10 @@ return {
         if (remote === undefined) return { ok: false, reason: 'no-remote' }
         const asked = String((args && args.path) || '').trim()
         const base = asked.length > 0 ? asked : await remoteCwdOf({}, remote)
-        const raw = await runCapture(shArgv(
+        const raw = await captureOn(
           'cd ' + shellQuote(base) + ' 2>/dev/null || exit 0; pwd; '
           + 'for d in */ .*/; do case "$d" in ./|../) continue;; esac; '
-          + '[ -d "$d" ] || continue; printf "%s\\n" "${d%/}"; done', remote), 15000)
+          + '[ -d "$d" ] || continue; printf "%s\\n" "${d%/}"; done', remote, 15000)
         const lines = String(raw).split('\n').map((line) => line.trim()).filter((line) => line.length > 0)
         if (lines.length === 0) return { ok: false, reason: 'unreadable', path: base }
         const path = lines[0]
@@ -6350,8 +6939,8 @@ return {
           return { ok: false, reason: 'bad-name' }
         }
         const full = (at === '/' ? '' : at) + '/' + name
-        const raw = await runCapture(shArgv(
-          'mkdir -p ' + shellQuote(full) + ' 2>&1 && cd ' + shellQuote(full) + ' && pwd', remote), 15000)
+        const raw = await captureOn(
+          'mkdir -p ' + shellQuote(full) + ' 2>&1 && cd ' + shellQuote(full) + ' && pwd', remote, 15000)
         const path = String(raw).trim().split('\n').pop()
         if (typeof path !== 'string' || path.indexOf('/') !== 0) return { ok: false, reason: 'mkdir-failed' }
         return { ok: true, path: path }
@@ -6592,11 +7181,11 @@ return {
           stopRun(id).catch(() => undefined)
           state.remote = wanted
           // A directory on the old machine means nothing on the new one.
-          state.remoteCwd = lastDirs.get(wanted) || ''
+          state.remoteCwd = lookupDir(workspaceOf(id), wanted)
         }
         if (typeof remoteCwd === 'string' && remoteCwd.trim().length > 0) {
           state.remoteCwd = remoteCwd.trim()
-          rememberDir(remoteOf(state), state.remoteCwd)
+          rememberDir(remoteOf(state), state.remoteCwd, workspaceOf(id))
         }
         persistStates()
         return publicState(id)

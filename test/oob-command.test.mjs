@@ -70,6 +70,10 @@ function build(options) {
       error: (...args) => { calls.errors.push(args.join(' ')) },
     },
   }
+  // captureOn 是插件里唯一的远端执行入口（命令串 + 目标 → stdout）。daemon 档
+  // 下它走一条常驻连接，其余档下就是这里拼出来的 runCapture(shArgv(...))——
+  // 断言的仍然是同一条命令串。
+  deps.captureOn = (command, remote, timeoutMs) => deps.runCapture(deps.shArgv(command, remote), timeoutMs)
   const names = Object.keys(deps)
   const body = `${sliceFunction('pastPendingCommand')}\n${sliceFunction('endPendingCommand')}\n`
     + 'return { pastPendingCommand, endPendingCommand }'

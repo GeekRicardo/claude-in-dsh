@@ -36,12 +36,12 @@ function sliceFunction(name) {
   throw new Error(`${name} 的花括号没有配平`)
 }
 
-const liveness = new Function('runCapture', 'shArgv', `${sliceFunction('isAlive')}\nreturn isAlive`)(
-  async (argv) => {
+const liveness = new Function('captureOn', `${sliceFunction('isAlive')}\nreturn isAlive`)(
+  // captureOn(命令串, 目标, 超时)：插件里唯一的远端执行入口。本机档就是 /bin/sh -c。
+  async (command) => {
     const { execFileSync: run } = await import('node:child_process')
-    return run(argv[0], argv.slice(1), { encoding: 'utf8' })
+    return run('/bin/sh', ['-c', command], { encoding: 'utf8' })
   },
-  (command) => ['/bin/sh', '-c', command],
 )
 
 function waitFor(check, timeoutMs = 6000) {
