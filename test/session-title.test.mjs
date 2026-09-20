@@ -15,7 +15,7 @@ const source = fs.readFileSync(path.join(root, 'src/host.dynamic.js'), 'utf8')
 
 /**
  * 按花括号配平切出函数源码，但要跳过字符串和注释里的花括号——被切的
- * `lastAiTitle` 里就有个 grep 模式 `{"type":"ai-title"`，只数字符会当场数错，
+ * 标题那几个常量里就有 `{"type":"ai-title"`，只数字符会当场数错，
  * 切出半截函数。（认识 '' "" `` 和两种注释；不认识正则字面量，将来往这些
  * 函数里写 /.../ 时要留意。）
  */
@@ -53,6 +53,21 @@ function sliceFunction(name) {
   throw new Error(`${name} 的花括号没有配平`)
 }
 
+
+/** 按名字切出一条 `const X = ...` 声明（到行尾续行为止）。 */
+function sliceConst(name) {
+  const key = 'const ' + name + ' = '
+  const at = source.indexOf(key)
+  assert.notEqual(at, -1, `找不到 ${name}`)
+  let end = at
+  for (;;) {
+    const nl = source.indexOf('\n', end)
+    const next = source.slice(nl + 1).match(/^\s*\+/)
+    if (next === null) return source.slice(at, nl)
+    end = nl + 1
+  }
+}
+
 /** 造一个 Claude transcript，返回 (cwd, sessionId) 让被测函数照常去找它。 */
 function transcript(lines) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ccmode-title-'))
@@ -84,8 +99,12 @@ function buildRead(home) {
   deps.captureOn = (command, remote, timeoutMs) => deps.runCapture(deps.shArgv(command, remote), timeoutMs)
   return new Function('deps', `
     const { ${Object.keys(deps).join(', ')} } = deps
-    ${sliceFunction('lastAiTitle')}
-    return lastAiTitle
+    ${sliceConst('TITLE_RULES')}
+    ${sliceConst('TITLE_PICK')}
+    ${sliceConst('TITLE_AWK')}
+    ${sliceFunction('titleOfLine')}
+    ${sliceFunction('lastClaudeTitle')}
+    return lastClaudeTitle
   `)(deps)
 }
 
@@ -95,8 +114,8 @@ test('读出 Claude 写下的最后一个标题', async () => {
     { type: 'user', message: { role: 'user', content: '继续' } },
     { type: 'ai-title', aiTitle: 'Claude.md p0 cluster login rule', sessionId: 'x' },
   ])
-  const lastAiTitle = buildRead(t.home)
-  assert.equal(await lastAiTitle(t.cwd, t.id), 'Claude.md p0 cluster login rule')
+  const lastClaudeTitle = buildRead(t.home)
+  assert.equal(await lastClaudeTitle(t.cwd, t.id), 'Claude.md p0 cluster login rule')
 })
 
 test('对话里"提到" ai-title 不算标题', async () => {
@@ -120,21 +139,45 @@ test('对话里"提到" ai-title 不算标题', async () => {
       },
     },
   ])
-  const lastAiTitle = buildRead(t.home)
-  assert.equal(await lastAiTitle(t.cwd, t.id), '真正的标题')
+  const lastClaudeTitle = buildRead(t.home)
+  assert.equal(await lastClaudeTitle(t.cwd, t.id), '真正的标题')
+})
+
+test('人手改的名字压过 Claude 自己起的——哪怕 Claude 后来又起了好几次', async () => {
+  // 实测现场：zhongxin 那个 109MB 的对话，用户早就改名叫「微调示例」，之后
+  // Claude 又写了几百条 ai-title。旧代码只看最后几条 title 事件，于是导入列表
+  // 里一直显示着它最早的自动名字，用户以为这个对话根本没被列出来。
+  const lines = [{ type: 'custom-title', customTitle: '微调示例', sessionId: 'x' }]
+  for (let i = 0; i < 40; i += 1) lines.push({ type: 'ai-title', aiTitle: '自动名字 ' + i, sessionId: 'x' })
+  const t = transcript(lines)
+  const lastClaudeTitle = buildRead(t.home)
+  assert.equal(await lastClaudeTitle(t.cwd, t.id), '微调示例')
+})
+
+test('读标题是整趟扫，不是看最后几行', () => {
+  // 「最后 N 行」这个取法是上面那个 bug 的根，锁住它。整趟扫 109MB 实测
+  // ~90ms，比 tail -n 4000（297ms）还快——这些日志的行特别长。
+  const awk = sliceConst('TITLE_AWK') + sliceConst('TITLE_RULES')
+  assert.equal(/tail\s+-/.test(awk), false, '取标题不许再靠 tail 猜')
+  assert.ok(awk.indexOf(String.raw`^\\{"type":"custom-title"`) !== -1,
+    '要锚在行首，否则对话正文里引用的那行会赢')
+  for (const name of ['lastClaudeTitle']) {
+    const body = sliceFunction(name)
+    assert.equal(/tail\s+-\s*\d/.test(body), false, name + ' 里不该再有 tail -N')
+  }
 })
 
 test('还没起名字就返回空', async () => {
   const t = transcript([{ type: 'user', message: { role: 'user', content: '你好' } }])
-  const lastAiTitle = buildRead(t.home)
-  assert.equal(await lastAiTitle(t.cwd, t.id), '')
+  const lastClaudeTitle = buildRead(t.home)
+  assert.equal(await lastClaudeTitle(t.cwd, t.id), '')
 })
 
 test('transcript 不存在也不炸', async () => {
   const t = transcript([])
-  const lastAiTitle = buildRead(t.home)
-  assert.equal(await lastAiTitle(t.cwd, 'no-such-session'), '')
-  assert.equal(await lastAiTitle('', t.id), '')
+  const lastClaudeTitle = buildRead(t.home)
+  assert.equal(await lastClaudeTitle(t.cwd, 'no-such-session'), '')
+  assert.equal(await lastClaudeTitle('', t.id), '')
 })
 
 // —— 写入这半 ——
@@ -149,7 +192,7 @@ function buildWrite(world) {
     runs: new Map(),
     titleRefreshed: new Set(),
     persistStates: () => { calls.persisted += 1 },
-    lastAiTitle: async () => world.claudeTitle,
+    lastClaudeTitle: async () => world.claudeTitle,
     sessionTitle: world.noService === true ? undefined : {
       get: () => world.snapshot,
       rename: (session, title) => {

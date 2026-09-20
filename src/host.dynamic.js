@@ -4033,41 +4033,77 @@ return {
         .slice(0, 140)
     }
 
+    /** 一次列多少份对话。40 曾经把一个只有 49 份的目录切掉了 9 份。 */
+    const CONVERSATION_LIST_LIMIT = 120
+
+    /**
+     * 列出一个目录下的 Claude 对话。
+     *
+     * 标题这件事上有两个坑，都踩过：
+     *
+     * 1. **人工改的名要赢**。`ai-title` 是 Claude 自己起的，每轮都可能重写一条；
+     *    `custom-title` 是人用 /rename 定的。两者在文件里交替出现，谁在最后纯属
+     *    巧合——所以不能按出现顺序覆盖，必须让 custom-title 优先。
+     * 2. **要看最后一条，不是最前**。这里曾经写的是 `grep -m 3`（取最前三条），
+     *    于是一份 109MB 的对话在列表里顶着它最早的自动名字，而人在终端里
+     *    `claude --resume` 看到的是自己改的那个名字。同一份对话，两个名字，
+     *    找不到的人只会以为它没被列出来。
+     *
+     * 取标题用一趟 awk 而不是 grep：awk 顺序扫完 109MB 只要 ~90ms，比 `tail -n`
+     * 从尾部回溯还快（这种日志行很长，tail 找 N 个换行反而吃亏）。
+     * 而且一条命令把所有文件都扫了——之前是每个文件一次 captureOn，一个目录
+     * 就是四十次 docker exec 往返。
+     */
     async function listClaudeConversations(cwd, remote) {
       const dir = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd))
       const listing = await captureOn(
         'for f in ' + dir + '/*.jsonl; do [ -f "$f" ] || continue; '
-        + 'echo "$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f")|$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f")|$f"; done | sort -rn | head -40', remote, 10000)
+        + 'echo "$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f")|$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f")|$f"; done '
+        + '| sort -rn | head -' + CONVERSATION_LIST_LIMIT, remote, 15000)
       const rows = []
+      const byPath = new Map()
       for (const line of String(listing).split('\n')) {
         const parts = line.trim().split('|')
         if (parts.length < 3) continue
         const path = parts.slice(2).join('|')
         const name = path.slice(path.lastIndexOf('/') + 1)
-        rows.push({
+        const row = {
           claudeSessionId: name.replace(/\.jsonl$/, ''),
           path: path,
           updatedAt: parseInt(parts[0], 10) * 1000,
           bytes: parseInt(parts[1], 10),
-        })
-      }
-      // One pass per file for the title and the opening prompt.
-      for (const row of rows) {
-        const head = await captureOn(
-          'grep -m 3 -E \'"type":"(ai-title|custom-title)"\' ' + shellQuote(row.path) + ' 2>/dev/null; '
-          + 'grep -m 1 -F \'"type":"user"\' ' + shellQuote(row.path) + ' 2>/dev/null', remote, 8000)
-        row.title = ''
-        row.firstPrompt = ''
-        for (const line of String(head).split('\n')) {
-          if (line.trim().length === 0) continue
-          let event = null
-          try { event = JSON.parse(line) } catch (error) { continue }
-          if (event.type === 'ai-title' && typeof event.aiTitle === 'string') row.title = event.aiTitle
-          else if (event.type === 'custom-title' && typeof event.customTitle === 'string') row.title = event.customTitle
-          else if (event.type === 'user' && row.firstPrompt === '') {
-            row.firstPrompt = textOfClaudeMessage(event.message).slice(0, 120)
-          }
+          title: '',
+          firstPrompt: '',
         }
+        rows.push(row)
+        byPath.set(path, row)
+      }
+      if (rows.length === 0) return rows
+
+      // 每个文件吐三行，各带一个前缀字母：F=路径、T=最终标题那条 JSON、
+      // U=第一条用户消息。不用「一行三列」是因为这些日志里混着控制字符，
+      // 一列里带个换行就会把整行撑开、后面按位置解析全部串位；前缀行则怎么
+      // 撑都只会多出几行认不出的杂行，跳过即可。
+      const awkProgram = 'awk \'' + TITLE_RULES
+        + '/"type":"user"/{if(u=="" && length($0)<4000){u=$0}} '
+        + 'END{' + TITLE_PICK + 'gsub(/[[:cntrl:]]/," ",u); '
+        + 'print "F " FILENAME; if(t!="") print "T " t; if(u!="") print "U " u}\' '
+      const script = rows.map((row) => awkProgram + shellQuote(row.path) + ' 2>/dev/null').join('; ')
+      const answer = await captureOn(script, remote, 60000)
+
+      let current = null
+      for (const line of String(answer).split('\n')) {
+        const tag = line.slice(0, 2)
+        const body = line.slice(2)
+        if (tag === 'F ') { current = byPath.get(body) || null; continue }
+        if (current === null) continue
+        if (tag === 'T ') { current.title = titleOfLine(body); continue }
+        if (tag !== 'U ') continue
+        let event = null
+        try { event = JSON.parse(body) } catch (error) { continue }
+        if (event.type === 'user') current.firstPrompt = textOfClaudeMessage(event.message).slice(0, 120)
+      }
+      for (const row of rows) {
         if (row.title === '') row.title = row.firstPrompt || row.claudeSessionId.slice(0, 8)
       }
       return rows
@@ -4439,7 +4475,33 @@ return {
     }
 
     /**
-     * The name Claude gave this conversation, if it has gotten around to it.
+     * 从一份 Claude transcript 里挑出「这个对话叫什么」的那一行 JSON。
+     *
+     * 用整趟 awk 而不是 `grep | tail -n`：改名事件是追加的，用户很早改过名、
+     * 之后 Claude 又写了几十条 ai-title 的对话，在「最后几条」里根本看不见
+     * custom-title——实测 zhongxin 那个 109MB 的对话就是这样，列表里一直显示
+     * 着它最早的自动名字。整趟扫 109MB 实测 ~90ms，比 `tail -n 4000`（297ms）
+     * 还快，因为这些日志的行特别长。
+     */
+    // 锚在行首：一个讨论标题同步的对话，会把 {"type":"ai-title"…} 原样写进自己
+    // 的正文和工具输出里，而这些 title 事件本身永远是独立的一行（实测这批日志
+    // 6635 条无一例外）。不锚定的话，最后留下的是对话里的那句闲聊。
+    const TITLE_RULES = '/^\\{"type":"custom-title"/{c=$0} /^\\{"type":"ai-title"/{if(c==""){a=$0}} '
+    const TITLE_PICK = 't=(c!=""?c:a); gsub(/[[:cntrl:]]/," ",t); '
+    const TITLE_AWK = 'awk \'' + TITLE_RULES + 'END{' + TITLE_PICK + 'if(t!="") print t}\' '
+
+    /** 一行 title JSON → 标题文本。认不出来就是空串。 */
+    function titleOfLine(line) {
+      let event = null
+      try { event = JSON.parse(String(line).trim()) } catch (error) { return '' }
+      if (event === null || typeof event !== 'object') return ''
+      if (event.type === 'custom-title' && typeof event.customTitle === 'string') return event.customTitle.trim()
+      if (event.type === 'ai-title' && typeof event.aiTitle === 'string') return event.aiTitle.trim()
+      return ''
+    }
+
+    /**
+     * 这个对话的名字：用户改过的优先，否则用 Claude 自己起的。
      *
      * Claude records it in its OWN transcript as an `ai-title` row. It is not
      * in the stream — verified across the brokers' logs, which hold zero
@@ -4451,25 +4513,13 @@ return {
      * its own transcript, inside tool output and assistant prose. Matching on
      * the string alone reads a conversation's chatter as its title.
      */
-    async function lastAiTitle(cwd, claudeSessionId, remote) {
+    async function lastClaudeTitle(cwd, claudeSessionId, remote) {
       if (typeof cwd !== 'string' || cwd.length === 0) return ''
       if (typeof claudeSessionId !== 'string' || claudeSessionId.length === 0) return ''
       const path = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd))
         + '/' + shellQuote(claudeSessionId + '.jsonl')
-      const raw = await captureOn(
-        'tail -c 2000000 ' + path + ' 2>/dev/null | grep -F ' + shellQuote('{"type":"ai-title"') + ' | tail -5', remote, 10000)
-      const lines = String(raw).split('\n')
-      for (let index = lines.length - 1; index >= 0; index -= 1) {
-        const line = lines[index].trim()
-        if (line.length === 0) continue
-        let value = null
-        try { value = JSON.parse(line) } catch (error) { continue }
-        if (value === null || value.type !== 'ai-title') continue
-        if (typeof value.aiTitle !== 'string') continue
-        const title = value.aiTitle.trim()
-        if (title.length > 0) return title
-      }
-      return ''
+      const raw = await captureOn(TITLE_AWK + path + ' 2>/dev/null', remote, 15000)
+      return titleOfLine(raw)
     }
 
     /**
@@ -4499,7 +4549,7 @@ return {
       const cwd = run !== undefined && typeof run.cwd === 'string' && run.cwd.length > 0
         ? run.cwd
         : (session.header ? session.header.cwd : '')
-      const title = await lastAiTitle(cwd, state.claudeSessionId, remoteOf(state))
+      const title = await lastClaudeTitle(cwd, state.claudeSessionId, remoteOf(state))
 
       let snapshot
       try { snapshot = sessionTitle.get(session) } catch (error) { return false }
@@ -5121,20 +5171,8 @@ return {
       // outcome the fallback used to produce.
       try {
         let text = ''
-        const titled = await captureOn(
-          'grep -E \'"type":"(ai-title|custom-title)"\' ' + path + ' 2>/dev/null | tail -5', remote, 8000)
-        for (const line of String(titled).split('\n')) {
-          if (line.trim().length === 0) continue
-          let event = null
-          try { event = JSON.parse(line) } catch (error) { continue }
-          // A custom title is the user's own rename and outranks the AI one.
-          if (event.type === 'custom-title' && typeof event.customTitle === 'string' && event.customTitle.trim().length > 0) {
-            text = event.customTitle
-            break
-          }
-          if (event.type === 'ai-title' && typeof event.aiTitle === 'string' && text.length === 0) text = event.aiTitle
-        }
-        text = text.replace(/\s+/g, ' ').trim().slice(0, 60)
+        const titled = await captureOn(TITLE_AWK + path + ' 2>/dev/null', remote, 15000)
+        text = titleOfLine(titled).replace(/\s+/g, ' ').slice(0, 60)
         if (text.length > 0) {
           // Through the title service, not a bare append: dsh names sessions
           // asynchronously with an LLM, and a raw session/title event written
