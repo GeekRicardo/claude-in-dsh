@@ -2414,7 +2414,9 @@ return {
       }
 
       run.push = (value) => {
-        if (value !== undefined) run.sawAnyMessage = true
+        // 计数而不是布尔：看门狗要分辨「这一轮有没有回音」，而不是「这个 run
+        // 这辈子收过东西没有」。
+        if (value !== undefined) { run.sawAnyMessage = true; run.heard = (run.heard || 0) + 1 }
         run.queue.push(value)
         const waiter = run.waiter
         run.waiter = null
@@ -2737,6 +2739,25 @@ return {
     }
 
     /** Let go of the process without ending it. */
+    /**
+     * 还听得见这个 run 吗。
+     *
+     * broker 活着不等于我们还听得见它：读取器会单独死掉——隧道断了、daemon 那
+     * 头关了连接、轮次之间的读取器静默超时后主动把流放掉——而 run 对象还留在
+     * `runs` 里。拿到这样一个空壳，prompt 照样写得进 fifo（Claude 真的开始干
+     * 活了），但回来的路是断的：这一轮永远等不到 result，页面上一个字都没有，
+     * 日志里也没有，因为什么都没出错。
+     *
+     * 实测现场：一轮跑完后读取器静默释放了流，下一条消息拿到空壳 run，Claude
+     * 在那头输出了 700KB，dsh 这边二十分钟一片空白。`runs.has` 还会因此挡住
+     * `resumeIdleFollow`，连自愈的路也堵上。
+     */
+    function hearsRun(run) {
+      if (run === undefined || run === null) return false
+      if (run.detached === true || run.readerDead === true) return false
+      return run.reader !== null && run.reader !== undefined
+    }
+
     function detach(sessionId, remember) {
       return safely('detach', () => detachInner(sessionId, remember)) === true
     }
@@ -2813,7 +2834,7 @@ return {
       if (remote !== null) cwd = await remoteCwdOf(state, remote)
       const snapshot = launchSnapshot(state)
       const live = runs.get(sessionId)
-      if (live !== undefined && !live.closed && live.snapshot === snapshot) {
+      if (live !== undefined && !live.closed && live.snapshot === snapshot && hearsRun(live)) {
         // The broker can disappear underneath a run: the reaper collects an
         // idle one, or somethingexternal kills it. The run object survives with a
         // reader tailing a deleted log and a writer whose `cat > .../in`
@@ -4846,7 +4867,14 @@ return {
 
     function resumeIdleFollow(sessionId, session) {
       if (session === undefined || shuttingDown) return Promise.resolve(false)
-      if (runs.has(sessionId) || activeTurns.has(sessionId)) return Promise.resolve(false)
+      // 一个听不见的 run 不算「已经有人在跟了」——否则它会把自愈的路也堵上。
+      if (activeTurns.has(sessionId)) return Promise.resolve(false)
+      const held = runs.get(sessionId)
+      if (held !== undefined) {
+        if (hearsRun(held)) return Promise.resolve(false)
+        console.log('cc-mode:', sessionId, '手上那个 run 已经听不见了 — 放掉它，重新挂上去')
+        detach(sessionId)
+      }
       if (followInFlight.has(sessionId)) return Promise.resolve(false)
       const state = stateOf(sessionId, session)
       if (state.mode !== 'claude') return Promise.resolve(false)
@@ -6416,10 +6444,17 @@ return {
         // process. Dropping attach.json first makes the next attach resume at
         // the end of the log, so an abandoned tail is skipped, not replayed.
         const submittedAt = Date.now()
+        // 这一轮开始时它已经收过多少条。看门狗要问的是「这一轮有没有回音」，
+        // 而 run.sawAnyMessage 记的是「这个 run 有没有收过」——一个被复用的
+        // run 上一轮收过，这个标记就永远是 true，于是「提交后 120 秒毫无回
+        // 应」这条守卫永远不会响。空壳 run 加上哑掉的看门狗，合起来就是实测
+        // 里那个「卡住、没输出、日志里也没有」：Claude 在那头输出了 700KB，
+        // dsh 这边二十分钟一片空白，而没有任何一处认为出了错。
+        const heardAtStart = run.heard || 0
         const stallWatch = ctx.interval(() => {
           safely('turn watchdog', () => {
             if (done) return
-            const silentTooLong = run.sawAnyMessage !== true && Date.now() - submittedAt > 120000
+            const silentTooLong = (run.heard || 0) === heardAtStart && Date.now() - submittedAt > 120000
             const ignoredInterrupt = interrupted && Date.now() - abortedAt > 10000
             if (!silentTooLong && !ignoredInterrupt) return
             console.error(ignoredInterrupt

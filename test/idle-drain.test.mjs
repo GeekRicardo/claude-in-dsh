@@ -263,7 +263,7 @@ test('流断了就干净退出，不去动队列', async () => {
 // —— 打开会话时重新跟上一个还活着的 Claude ——
 
 function buildFollow(world) {
-  const calls = { attached: [], followed: [] }
+  const calls = { attached: [], followed: [], detached: [], logged: [] }
   const state = { mode: 'claude', ...(world.state || {}) }
   const deps = {
     shuttingDown: false,
@@ -288,9 +288,12 @@ function buildFollow(world) {
     createRun: (sessionId, dir, snapshot, claudeSessionId, remote) => ({ sessionId, dir, snapshot, claudeSessionId, remote: remote === undefined ? null : remote }),
     attach: async (run) => { calls.attached.push(run.offset) },
     startIdleDrain: (sessionId, run, offset) => { calls.followed.push(offset) },
+    detach: (sessionId) => { calls.detached.push(sessionId); deps.runs.delete(sessionId); return true },
+    console: { log: (...args) => calls.logged.push(args.join(' ')), error: () => undefined },
   }
   const fn = new Function('deps', `
     const { ${Object.keys(deps).join(', ')} } = deps
+    ${sliceFunction('hearsRun')}
     ${sliceFunction('resumeIdleFollow')}
     return resumeIdleFollow
   `)(deps)
@@ -328,10 +331,28 @@ test('启动参数变了就交给下一轮的 ensureRun', async () => {
 })
 
 test('已经有人在读这条流就不插一脚', async () => {
-  const runs = new Map([['s', { sessionId: 's' }]])
+  const runs = new Map([['s', { sessionId: 's', reader: { terminate: () => undefined } }]])
   const rig = buildFollow({ meta: LIVE_META, alivePids: [4242], runs: runs })
   assert.equal(await rig.resumeIdleFollow('s', SESSION), false)
   assert.deepEqual(rig.calls.attached, [], '两个读取器抢一个队列会丢消息')
+})
+
+test('手上那个 run 已经听不见了，就放掉它重新挂——否则自愈的路也被它堵着', async () => {
+  // 实测现场：一轮跑完后读取器静默释放了流，run 却留在 runs 里。下一条消息
+  // 拿到这个空壳，prompt 照样写进 fifo（Claude 真的开始干活了），但回来的路
+  // 是断的：Claude 在那头输出了 700KB，dsh 这边二十分钟一片空白。而 runs.has
+  // 为真，resumeIdleFollow 也就不肯重新挂上去。
+  for (const dead of [
+    { sessionId: 's', reader: null },
+    { sessionId: 's', reader: { terminate: () => undefined }, readerDead: true },
+    { sessionId: 's', reader: { terminate: () => undefined }, detached: true },
+  ]) {
+    const runs = new Map([['s', dead]])
+    const rig = buildFollow({ meta: LIVE_META, alivePids: [4242], runs: runs, attach: { offset: 77 } })
+    assert.equal(await rig.resumeIdleFollow('s', SESSION), true, JSON.stringify(Object.keys(dead)) + ' 应该重新挂上')
+    assert.deepEqual(rig.calls.detached, ['s'], '先把听不见的那个放掉')
+    assert.deepEqual(rig.calls.attached, [77])
+  }
 })
 
 test('DSH 引擎的会话不碰', async () => {
@@ -347,4 +368,27 @@ test('同一个 run 不会有两个读取器', async () => {
   rig.startIdleDrain('s', run)
   assert.equal(run.idleTask, first, '两个消费者会抢同一个队列')
   await rig.stopIdleDrain(run)
+})
+
+test('看门狗问的是「这一轮有没有回音」，不是「这个 run 收过东西没有」', () => {
+  // run.sawAnyMessage 是 run 级别的：一个被复用的 run 上一轮收过，这个标记就
+  // 永远是 true，于是「提交后 120 秒毫无回应」那条守卫永远不响。空壳 run 加
+  // 上哑掉的看门狗，合起来就是那个「卡住、没输出、日志里也没有」。
+  const body = source.slice(source.indexOf('const submittedAt = Date.now()'))
+  const watch = body.slice(0, body.indexOf('while (true)'))
+  assert.match(watch, /const heardAtStart = run\.heard/, '要记下这一轮开始时的计数')
+  assert.match(watch, /\(run\.heard \|\| 0\) === heardAtStart/, '比的是计数有没有变')
+  assert.equal(/run\.sawAnyMessage !== true && Date\.now\(\) - submittedAt/.test(watch), false,
+    '不能再用 run 级别的布尔当这一轮的判据')
+  // 计数必须真的在涨，否则上面那个判据永远成立，看门狗会错杀正常的长轮次。
+  const push = source.slice(source.indexOf('run.push = (value) => {'))
+  assert.match(push.slice(0, 300), /run\.heard = \(run\.heard \|\| 0\) \+ 1/)
+})
+
+test('ensureRun 不复用一个听不见的 run', () => {
+  const body = sliceFunction('ensureRun')
+  const at = body.indexOf('live.snapshot === snapshot')
+  assert.notEqual(at, -1)
+  assert.match(body.slice(at, at + 120), /hearsRun\(live\)/,
+    'broker 活着不等于还听得见它——拿到空壳，prompt 写得进去，回音永远等不到')
 })
