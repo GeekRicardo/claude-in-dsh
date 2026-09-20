@@ -4351,8 +4351,23 @@ return {
         const size = await fileSize(dir + '/out.log', remote)
         if (size <= offset) return 0
 
+        // 断线期间攒下的东西可以很大——实测一轮 6.6MB（一个跑了二十多分钟、
+        // 四十多次工具调用的回合）。这里原本固定读 3MB，而后果不是「少读一
+        // 点」：读不到 result 就整段判成「还在流，不算历史」，于是一个字都不
+        // 补，offset 又被别处推到了末尾，那段内容再没人来读。所以先问清楚
+        // 「不超过 DRAIN_MAX 的最后一个完整轮次结束在哪个字节」，按那个边界
+        // 读。剩下的留给下一趟——每趟都补到一个 result 上，多补几次就补完。
+        const spanRaw = await captureOn(
+          'tail -c +' + (offset + 1) + ' ' + shellQuote(dir + '/out.log')
+          + ' | LC_ALL=C awk -v LIMIT=' + DRAIN_MAX
+          + ' \'{ n += length($0) + 1 } /"type":"result"/ { if (n <= LIMIT) last = n } END { print last + 0 }\'',
+          remote, 30000)
+        const span = parseInt(String(spanRaw).trim(), 10)
+        // 没有一个完整轮次躺在这儿，就没有历史可补：还在流的那部分归实时读取器。
+        if (isNaN(span) || span <= 0) return 0
         const raw = await captureOn(
-          'tail -c +' + (offset + 1) + ' ' + shellQuote(dir + '/out.log') + ' | head -c 3000000', remote, 20000)
+          'tail -c +' + (offset + 1) + ' ' + shellQuote(dir + '/out.log')
+          + ' | head -c ' + span, remote, 30000)
         const rows = []
         let sawResult = false
         for (const line of String(raw).split('\n')) {
@@ -4397,9 +4412,11 @@ return {
 
         const written = queueProjection(sessionId, fresh,
           '（dsh 重启期间 Claude 继续完成了这一轮，以下是断档期间的内容。）')
+        // 记的是「补到哪儿」，不是文件末尾：这一趟只补到了最后一个 result，
+        // 后面若还有内容，下一趟才好接着补。记成 size 等于宣布那段不存在。
         await new Promise((resolve) => {
           execOn('cat > ' + shellQuote(dir + '/attach.json'), remote, 10000,
-            { stdin: JSON.stringify({ offset: size }) })
+            { stdin: JSON.stringify({ offset: offset + span }) })
             .then(() => resolve(), () => resolve())
         })
         console.log('cc-mode:', sessionId, 'drained', written, 'message(s) Claude produced while detached')
@@ -4447,6 +4464,9 @@ return {
     const IDLE_TASK_QUIET_MS = 30 * 60 * 1000
     // One stretch of out.log per projection, matching the drain path's cap.
     const IDLE_STRETCH_MAX = 3000000
+
+    // 一趟断线补录最多读这么多，并且只读到边界上的最后一个 result。
+    const DRAIN_MAX = 8000000
     // A permission asked between turns has no turn to be cancelled with; it
     // stands until answered, or until the reader lets go of the run.
     const idleSignal = new AbortController().signal
