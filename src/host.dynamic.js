@@ -6300,22 +6300,36 @@ return {
       // usually does this through state.get, but a user who reopens and types
       // immediately never gives it that chance — and the live attach below
       // starts at EOF, silently skipping the tail forever.
-      await drainDetachedOutput(sessionId, session)
-      // A one-shot command may be reading this session's stream right now;
-      // the lock is the queue both sides stand in.
-      const lock = acquireSessionLock(sessionId)
-      let run
+      // 这一段每一步都在 await，而第一条日志要到 ensureRun 之后才打。一个停在
+      // 这里的 turn 于是完全没有痕迹：页面等着，日志空白，连「它在等谁」都无从
+      // 说起——实测有过一轮在这里停了二十多分钟，除了「卡着没动」什么线索都
+      // 没有。所以先记下走到了哪一步，超时就把它喊出来。
+      let stage = 'drain'
+      const stuckWatch = armTimeout(() => {
+        console.error('cc-mode: turn', turn, 'on', sessionId, '在', stage, '这一步停了 60 秒以上——'
+          + '这一轮不会有任何输出，除非它自己醒过来')
+      }, 60000)
       try {
-        await lock.acquired
-        // Only one consumer of the stream at a time: the reader that has been
-        // following Claude between turns has to let go — and finish handing
-        // over what it saw — before this turn starts shifting the same queue.
-        await stopIdleDrain(runs.get(sessionId))
-        run = await ensureRun(sessionId, cwd, signal)
-      } catch (error) {
-        lock.release()
-        throw error
-      }
+        await drainDetachedOutput(sessionId, session)
+        // A one-shot command may be reading this session's stream right now;
+        // the lock is the queue both sides stand in.
+        stage = 'lock'
+        var lock = acquireSessionLock(sessionId)
+        var run
+        try {
+          await lock.acquired
+          // Only one consumer of the stream at a time: the reader that has been
+          // following Claude between turns has to let go — and finish handing
+          // over what it saw — before this turn starts shifting the same queue.
+          stage = 'stop-idle-drain'
+          await stopIdleDrain(runs.get(sessionId))
+          stage = 'ensure-run'
+          run = await ensureRun(sessionId, cwd, signal)
+        } catch (error) {
+          lock.release()
+          throw error
+        }
+      } finally { try { stuckWatch() } catch (error) { /* already fired */ } }
       const transcript = createTranscript(session, turn)
       activeTurns.set(sessionId, { turn: turn, run: run, transcript: transcript })
 
