@@ -6,6 +6,8 @@
 
 ### 修复
 
+- **发一句话，回来的是一张没人问过的「Context Usage」表格，真正的回答再也不来**。插件自己发的带外命令（`/context`、`/mcp`）本来由发它的那一趟在锁内读完，不会漏给别人。但命令写进 fifo 之后，Claude 可能在答完之前被换掉（上一轮失败、换档重启）——那条命令并没有消失，它还躺在 fifo 里，**新进程一起来就读到并回答了**，而那个回答产生在新进程启动之后，根本不在旧日志里。起新进程那段却按「新 Claude 从日志末尾读起，已经越过了废弃探测留下的东西」把欠账标记清掉了；标记又只挂在旧 run 对象上，新 run 无从知道。于是那个回合成了下一轮的开场白：页面上一张 Context Usage 表格，而用户真正的回答被这一轮的 `result` 关在门外——实测连着两轮都是这样，而 Claude 那头一直在正常干活。现在欠账跟着会话走，由新 run 接手吞掉那一个回合；接手的那次带 90 秒时限，万一命令其实已被旧进程吃掉，不至于把用户的下一轮也吞了。`pendingCommand` 也分了「打算写」和「确实写出去了」——没送出去的命令不该让任何人去吞。
+
 - **在输入框里粘一张图，Claude 看不到它**。dsh 自己的 prompt RPC 在会话的 dsh 模型没有视觉能力时会拒收图片——那道闸门不知道这条对话其实是 Claude 在驱动——所以客户端抢在 dsh 的附件流程之前把粘贴截下来，存到插件这边，下一轮 prompt 带过去。而拦截的第一道判断是「事件目标是不是 `<textarea>`」，dsh 0.1.5 起 composer 换成了绑 Lexical 编辑器的 contenteditable div（`ComposerContentEditable`，带 `role="textbox"` 和 `data-composer-input`）：那句判断永远成立，**整个拦截一次都没跑过**。图片照常走 dsh 自己的附件流程，进了 dsh 的 store 却从没进到给 Claude 的那一份里，表现就是「图片贴上了，cc 读不到」。现在认 dsh 给输入框打的 `data-composer-input` 标记（`role="textbox"` 兜底，`textarea` 留着兼容旧版 dsh），并且用 `closest` 往上找——事件目标可能是编辑器内部的节点。
 
 - **一个听不见的 run 被当成好的接着用，于是 Claude 在那头干活，页面上二十分钟一片空白**。`ensureRun` 复用现成的 run 时只检查 broker 进程活没活，不检查读取器还在不在。而读取器会单独死掉——轮次之间的读取器静默超时后会主动把流放掉，隧道会断，daemon 那头会关连接——run 对象却还留在 `runs` 里。拿到这个空壳：prompt 照样写进 fifo（**Claude 真的开始干活**，实测那头输出了 700KB），但回来的路是断的，这一轮永远等不到 `result`。`runs.has` 还会因此挡住 `resumeIdleFollow`，连自愈的路一起堵上。现在多一道 `hearsRun`：听不见就不复用，`resumeIdleFollow` 也会先把它放掉再重新挂。

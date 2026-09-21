@@ -191,3 +191,33 @@ test('泵在等一个被放弃的 result 时，把那一轮咽下去而不是交
   assert.match(pump.slice(guard, push), /endPendingCommand\(run\)/,
     '看见 result 就该松开，否则下一轮真的会被吃掉')
 })
+
+test('换了进程，欠着的那个命令回合要由新进程这边吞掉', () => {
+  // 实测现场：一轮失败后插件重启了 Claude，而它自己发的 /context 还躺在
+  // fifo 里没人答。新进程一起来就读到并回答了，可那条「我还欠一个回合」的
+  // 标记挂在旧 run 上——新 run 不知道，于是把这个回合当成了用户的回答：页
+  // 面上一张没人问过的「## Context Usage」表格，真正的回答被这一轮的
+  // result 关在门外。连着两轮都是这样。
+  const spawn = source.slice(source.indexOf('run.offset = priorLog'))
+  const head = spawn.slice(0, spawn.indexOf('runs.set(sessionId, run)'))
+  assert.match(head, /state\.pendingCommand\.written === true/,
+    '只接手确实送出去过的命令——没送出去的回合不属于任何人')
+  assert.match(head, /run\.awaitingCommandResult = true/, '新 run 要接手吞掉它')
+  assert.match(head, /awaitingCommandUntil/, '要有时限，否则命令早被旧进程吃掉时会连用户的下一轮一起吞')
+})
+
+test('只有写成功的命令才算欠着一个回合', () => {
+  const at = source.indexOf('marked.pendingCommand = {')
+  assert.notEqual(at, -1)
+  assert.match(source.slice(at, at + 400), /written: false/, '先记「打算写」')
+  const after = source.slice(source.indexOf('commandWritten = true'))
+  assert.match(after.slice(0, 300), /pendingCommand\.written = true/, '写成了才翻成 true')
+})
+
+test('接手的那次有时限，普通的吞噬没有', () => {
+  const pump = source.slice(source.indexOf('if (run.awaitingCommandResult === true) {'))
+  const body = pump.slice(0, pump.indexOf('run.push(value)'))
+  assert.match(body, /typeof run\.awaitingCommandUntil === 'number'/,
+    '时限只对跨进程接手的那次生效——正常的带外命令该等多久等多久')
+  assert.match(body, /endPendingCommand\(run\)/)
+})
