@@ -1022,8 +1022,17 @@ return {
       if (document.body.getAttribute('data-ccmode') !== 'claude') return
       const sessionId = currentClaudeSessionId
       if (sessionId.length === 0) return
+      // 认 dsh 给输入框打的标记，不认元素名。
+      //
+      // 0.1.5 起 composer 不再是 <textarea>：它是一个绑了 Lexical 编辑器的
+      // contenteditable div（ComposerContentEditable，带 role="textbox" 和
+      // data-composer-input）。原来那句 tagName !== 'textarea' 于是永远成立，
+      // 整个拦截一次都没跑过——粘贴的图片照常走 dsh 自己的附件流程，进了
+      // dsh 的 store 却从没进到给 Claude 的那一份里，表现就是「图片贴上了，
+      // cc 读不到」。textarea 留着，是为了旧版 dsh 上装同一个插件。
       const target = event.target
-      if (target === null || target === undefined || String(target.tagName).toLowerCase() !== 'textarea') return
+      if (target === null || target === undefined || typeof target.closest !== 'function') return
+      if (target.closest('[data-composer-input], [role="textbox"], textarea') === null) return
       const items = event.clipboardData && event.clipboardData.items ? Array.from(event.clipboardData.items) : []
       const images = items.filter((item) => item.kind === 'file' && item.type.indexOf('image/') === 0)
       if (images.length === 0) return

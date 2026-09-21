@@ -6,6 +6,8 @@
 
 ### 修复
 
+- **在输入框里粘一张图，Claude 看不到它**。dsh 自己的 prompt RPC 在会话的 dsh 模型没有视觉能力时会拒收图片——那道闸门不知道这条对话其实是 Claude 在驱动——所以客户端抢在 dsh 的附件流程之前把粘贴截下来，存到插件这边，下一轮 prompt 带过去。而拦截的第一道判断是「事件目标是不是 `<textarea>`」，dsh 0.1.5 起 composer 换成了绑 Lexical 编辑器的 contenteditable div（`ComposerContentEditable`，带 `role="textbox"` 和 `data-composer-input`）：那句判断永远成立，**整个拦截一次都没跑过**。图片照常走 dsh 自己的附件流程，进了 dsh 的 store 却从没进到给 Claude 的那一份里，表现就是「图片贴上了，cc 读不到」。现在认 dsh 给输入框打的 `data-composer-input` 标记（`role="textbox"` 兜底，`textarea` 留着兼容旧版 dsh），并且用 `closest` 往上找——事件目标可能是编辑器内部的节点。
+
 - **一个听不见的 run 被当成好的接着用，于是 Claude 在那头干活，页面上二十分钟一片空白**。`ensureRun` 复用现成的 run 时只检查 broker 进程活没活，不检查读取器还在不在。而读取器会单独死掉——轮次之间的读取器静默超时后会主动把流放掉，隧道会断，daemon 那头会关连接——run 对象却还留在 `runs` 里。拿到这个空壳：prompt 照样写进 fifo（**Claude 真的开始干活**，实测那头输出了 700KB），但回来的路是断的，这一轮永远等不到 `result`。`runs.has` 还会因此挡住 `resumeIdleFollow`，连自愈的路一起堵上。现在多一道 `hearsRun`：听不见就不复用，`resumeIdleFollow` 也会先把它放掉再重新挂。
 
 - **那条「提交后 120 秒毫无回应」的守卫，在复用的 run 上永远不会响**。它问的是 `run.sawAnyMessage`——「这个 run 收过东西没有」，而不是「这一轮有没有回音」。一个上一轮收过消息的 run，这个标记就永远是 true。空壳 run 加上哑掉的看门狗，合起来才是那个「卡住、没输出、日志里也没有」：没有任何一处认为出了错。改成按轮计数（`run.heard` 在这一轮内有没有变），守卫恢复作用。
