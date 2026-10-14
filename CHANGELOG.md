@@ -6,6 +6,8 @@
 
 ### 变化
 
+- **cc 会话里前台 Bash 的输出实时可见**。Claude Code 的 stream-json 在前台命令运行期间什么都不给（每 30 秒一条只带耗时的 `tool_progress`），所以 tool 卡片以前总要等命令跑完才一次性出结果——`for i in $(seq 1 10); do echo $i; sleep 1; done` 要干等 10 秒。但 CLI 其实一直把输出实时写进 `/tmp/claude-<uid>/<cwd slug>/<session>/tasks/<task>.output`，而 `task_started` 里带着这两个 id（`task_type: "local_bash"`、`is_backgrounded: false`）。现在镜像在登记 `claude-task` 行之后，若命令 1 秒后还在跑，就跟读这个文件、把增量 append 进该行的 ring；`task_notification` 或 run 收尾时放手。读取复用 out.log 那套跟读（本机 / ssh 走 `tail -f`，cc-daemon 走它的 `/tail` 流，抽成 `followOn`）。亚秒命令不发起跟读；两个 id 只放行 `[A-Za-z0-9-]`，因为要拼进远端 shell 的 glob。页面这一侧由 dsh-better-tool-ui ≥ 2.5.0 经 `ctx.jobs` 订阅显示。依赖的是 CLI 的内部约定（文件位置、事件字段），哪天变了也只是退回「跑完才出结果」，不会出错。
+
 - **模型清单落后了一代：补上 5.5 代和 Fable 5.1，默认改成 Opus 5.5**。清单里最新的 Opus 还是 Opus 5，所以 Opus 5.5 发布之后在选择器里**根本列不出来**，想选也选不到；更隐蔽的是另一头——`routeLabel` / 状态恢复都按 `claude-opus-5-5[1m]` 去掉后缀后的 id **精确**匹配清单（不是前缀匹配），清单里没有这一行，座位上就只能显示那串原始 route 字符串。根因是这份清单按设计是手工维护的（Claude Code 没有模型清单命令），而手工维护的副本必然悄悄过期，和当年 broker 那份手工粘贴的源码一个道理。补齐 `claude-opus-5-5`、`claude-sonnet-5-5`、`claude-haiku-5-5`、`claude-fable-5-1`；`DEFAULT_MODEL` 从 `claude-opus-5` 改成 `claude-opus-5-5`（产品自己的默认，同样 1M 窗口，只影响**新**会话——存过模型的会话照旧保留自己的选择）。Haiku 5.5 标成 `reasoning: true`：它和 Haiku 4.5 不一样，是吃 `--effort` 的（`low`–`max`），所以 effort 座位该对它亮起来。
 
   这一版的 id、显示名和家族不是凭记忆写的，是从装好的 `claude`（2.1.296）自己带的模型表里逐行核对的；新增的一条测试就拿那张表对账，**哪个家族落后一代就会直接报出来**（查不到 CLI 的机器上整条 skip）。

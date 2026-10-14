@@ -95,6 +95,11 @@ function build(overrides) {
         ? { type: 'text', text: block.text }
         : { type: 'tool-call', id: block.id, name: block.name, arguments: JSON.stringify(block.input || {}) }),
     resultBlocksOf: (content) => typeof content === 'string' ? [{ type: 'text', text: content }] : [],
+    CC_BASH_FOLLOW_DELAY_MS: 1000,
+    CC_TASK_ID_PATTERN: /^[A-Za-z0-9-]+$/,
+    armTimeout: () => () => undefined,
+    captureOn: async () => '',
+    followOn: async () => { throw new Error('本用例不该跟读') },
     ...overrides,
   }
   const names = [
@@ -102,7 +107,7 @@ function build(overrides) {
     'ccChildAppend', 'ccChildCloseStep', 'ccChildStep',
     'mirrorParentedAssistant', 'mirrorParentedResult',
     'findCcSubagentByLabel', 'ccTaskStarted', 'finalizeCcSubagent', 'ccTaskNotification',
-    'cleanupCcMirror', 'toolResultMessage',
+    'cleanupCcMirror', 'toolResultMessage', 'followCcBashOutput', 'stopCcTaskFollow',
   ]
   const made = new Function('deps', `
     const SURFACE_EVENT_TYPES = new Set(['user/message', 'assistant/message', 'tool/result'])
@@ -321,4 +326,103 @@ test('子代理里的并行调用：一条消息拆成两条事件，第二个�
   assert.equal(ends, steps - 1, '只有最后一步还开着，中间没有带着未结调用关掉的步')
   const calls = child.events.filter((event) => event.type === 'tool/call').map((event) => event.data.step)
   assert.equal(calls[0], calls[1], '两个并行调用在同一步')
+})
+
+/**
+ * 前台 Bash 的跟读装置：jobs.start 会真的调 run(handle)，计时器手动触发，
+ * followOn 回一个可推送分块、记录 terminate 的假读取器。
+ */
+function followRig() {
+  const appended = []
+  const timers = []
+  const captures = []
+  const follows = []
+  let push = null
+  let finish = null
+  const reader = {
+    terminated: 0,
+    terminate() { this.terminated += 1; if (finish !== null) finish() },
+    stdout: {
+      async *[Symbol.asyncIterator]() {
+        const queue = []
+        let wake = null
+        push = (text) => { queue.push(text); if (wake !== null) wake() }
+        let ended = false
+        finish = () => { ended = true; if (wake !== null) wake() }
+        while (true) {
+          while (queue.length > 0) yield queue.shift()
+          if (ended) return
+          await new Promise((resolve) => { wake = resolve })
+          wake = null
+        }
+      },
+    },
+  }
+  const rig = build({
+    jobs: {
+      start: (spec) => { spec.run({ append: (text) => appended.push(text) }); return 'claude-task-1' },
+      wait: async () => undefined,
+    },
+    armTimeout: (fn, ms) => { timers.push({ fn, ms }); return () => undefined },
+    captureOn: async (command) => { captures.push(command); return '/tmp/claude-502/-x/sess-1/tasks/t1.output\n' },
+    followOn: async (filePath, from) => { follows.push({ filePath, from }); return reader },
+  })
+  const settle = () => new Promise((resolve) => setImmediate(resolve))
+  return { rig, appended, timers, captures, follows, reader, push: (text) => push(text), settle }
+}
+
+const LOCAL_BASH = {
+  task_id: 't1', session_id: 'sess-1', task_type: 'local_bash', is_backgrounded: false,
+  description: 'for i in $(seq 1 10); do echo $i; sleep 1; done',
+}
+
+test('前台 Bash：延迟一秒后跟读 .output，输出逐块写进 job 行；通知到达时放手', async () => {
+  const t = followRig()
+  const run = { ...makeRun(), remote: { id: 'local' } }
+  t.rig.ccTaskStarted(run, { id: 'session-main' }, LOCAL_BASH)
+  assert.equal(t.timers.length, 1, '不立刻跟读，先挂一个延迟')
+  assert.equal(t.timers[0].ms, 1000)
+
+  t.timers[0].fn()
+  await t.settle()
+  assert.match(t.captures[0], /\/tmp\/claude-"\$\(id -u\)"\/\*\/sess-1\/tasks\/t1\.output/)
+  assert.deepEqual(t.follows, [{ filePath: '/tmp/claude-502/-x/sess-1/tasks/t1.output', from: 0 }])
+
+  t.push('1\n')
+  t.push('2\n')
+  await t.settle()
+  assert.deepEqual(t.appended, ['1\n', '2\n'])
+
+  t.rig.ccTaskNotification(run, { id: 'session-main' }, { task_id: 't1', summary: 'done' })
+  assert.equal(t.reader.terminated, 1, '任务结算时读取器被释放')
+})
+
+test('前台 Bash 在一秒内结束：从不发起跟读', async () => {
+  const t = followRig()
+  const run = { ...makeRun(), remote: { id: 'local' } }
+  t.rig.ccTaskStarted(run, { id: 'session-main' }, LOCAL_BASH)
+  t.rig.ccTaskNotification(run, { id: 'session-main' }, { task_id: 't1', summary: '' })
+  t.timers[0].fn()
+  await t.settle()
+  assert.equal(t.captures.length, 0, '已结算的任务不再去目标机找文件')
+  assert.equal(t.follows.length, 0)
+})
+
+test('后台 Bash、非 Bash 任务、可疑 id：都不跟读', () => {
+  const t = followRig()
+  const run = { ...makeRun(), remote: { id: 'local' } }
+  t.rig.ccTaskStarted(run, { id: 'session-main' }, { ...LOCAL_BASH, task_id: 'b1', is_backgrounded: true })
+  t.rig.ccTaskStarted(run, { id: 'session-main' }, { ...LOCAL_BASH, task_id: 'm1', task_type: 'monitor' })
+  t.rig.ccTaskStarted(run, { id: 'session-main' }, { ...LOCAL_BASH, task_id: 'x;rm -rf ~' })
+  assert.equal(t.timers.length, 0)
+})
+
+test('run 收尾时释放仍在跟读的读取器', async () => {
+  const t = followRig()
+  const run = { ...makeRun(), remote: { id: 'local' } }
+  t.rig.ccTaskStarted(run, { id: 'session-main' }, LOCAL_BASH)
+  t.timers[0].fn()
+  await t.settle()
+  t.rig.cleanupCcMirror(run)
+  assert.equal(t.reader.terminated, 1)
 })

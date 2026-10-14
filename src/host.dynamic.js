@@ -3037,15 +3037,26 @@ return {
         }
         run.reader = daemonTail(link, run.dir + '/out.log', run.offset)
       } else {
-        run.reader = subprocess.spawn({
-          // `exec` so no shell lingers around the tail for the life of the run.
-          argv: shArgv('exec tail -c +' + (run.offset + 1) + ' -f ' + shellQuote(run.dir + '/out.log'), run.remote),
-          cwd: '/',
-          stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'ignore' },
-          graceMs: 1000,
-        })
+        run.reader = spawnTail(run.dir + '/out.log', run.offset, run.remote)
       }
       pumpAttached(run)
+    }
+
+    /** `tail -f` a file on `remote` from byte `from`, shaped like `daemonTail`'s reader. */
+    function spawnTail(filePath, from, remote) {
+      return subprocess.spawn({
+        // `exec` so no shell lingers around the tail for the life of the run.
+        argv: shArgv('exec tail -c +' + (from + 1) + ' -f ' + shellQuote(filePath), remote),
+        cwd: '/',
+        stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'ignore' },
+        graceMs: 1000,
+      })
+    }
+
+    /** Follow a file on `remote` through its daemon when it has one; throws when that daemon is unreachable. */
+    async function followOn(filePath, from, remote) {
+      if (usesDaemon(remote)) return daemonTail(await ensureDaemon(remote), filePath, from)
+      return spawnTail(filePath, from, remote)
     }
 
     // How long a turn waits, after a result it skipped for an owed echo, before
@@ -6615,7 +6626,9 @@ return {
       // path, so readOutput sees the latest summary (it is never a bare local).
       const entry = {
         job: null,
+        handle: null,
         settle: null,
+        stopFollow: null,
         label: ccTaskLabel(message, 'claude task'),
         summary: '',
       }
@@ -6627,18 +6640,21 @@ return {
           // dsh 0.2 names the owner (and every caller) by session id; an agent
           // object here stringifies to "[object Object]" and the row is refused.
           owner: String(agent.id),
-          run: () => ({
-            cancel: () => {
-              // Best-effort: ask the running CLI to stop the task. The broker
-              // is per-session, so this resolves through the live run.
-              const live = runs.get(String(agent.id))
-              if (live !== undefined) {
-                try { live.control({ subtype: 'stop_task', task_id: taskId }) } catch (error) { /* best effort */ }
-              }
-            },
-            done: done,
-            readOutput: () => entry.summary,
-          }),
+          run: (handle) => {
+            entry.handle = handle
+            return {
+              cancel: () => {
+                // Best-effort: ask the running CLI to stop the task. The broker
+                // is per-session, so this resolves through the live run.
+                const live = runs.get(String(agent.id))
+                if (live !== undefined) {
+                  try { live.control({ subtype: 'stop_task', task_id: taskId }) } catch (error) { /* best effort */ }
+                }
+              },
+              done: done,
+              readOutput: () => entry.summary,
+            }
+          },
         })
       } catch (error) {
         console.error('cc-mode: 后台任务入账失败:', errorText(error))
@@ -6650,6 +6666,63 @@ return {
       // finished" user message would steer a duplicate turn into the product.
       try { void jobs.wait(entry.job, 24 * 3600 * 1000, String(agent.id)).catch(() => undefined) } catch (error) { /* best effort */ }
       run.ccTasks.set(taskId, entry)
+      if (message.task_type === 'local_bash' && message.is_backgrounded !== true) followCcBashOutput(run, entry, message)
+    }
+
+    // A foreground Bash that settles inside this window never pays for a
+    // follower: most commands are sub-second, and their card is filled by the
+    // tool_result anyway.
+    const CC_BASH_FOLLOW_DELAY_MS = 1000
+    // Ids are interpolated into a remote shell glob; anything else is refused.
+    const CC_TASK_ID_PATTERN = /^[A-Za-z0-9-]+$/
+
+    /**
+     * Stream a running foreground Bash's output into its jobs row.
+     *
+     * Claude Code's stream-json says nothing while a foreground command runs
+     * (one `tool_progress` per 30 s, elapsed time only), but the CLI writes the
+     * command's output live to `/tmp/claude-<uid>/<cwd slug>/<session>/tasks/
+     * <task>.output` on the machine it runs on — the same file a later Ctrl+B
+     * keeps reading from. Following that file into the row's ring is what lets
+     * the web tool card (which observes the row through `ctx.jobs`) show the
+     * output as it is produced, the way it does for dsh's own bash jobs.
+     *
+     * Best effort throughout: a missing file or a dead link leaves the row as
+     * it was before, and the tool_result still delivers the full output.
+     */
+    function followCcBashOutput(run, entry, message) {
+      const sessionId = String(message.session_id || '')
+      const taskId = String(message.task_id || '')
+      if (!CC_TASK_ID_PATTERN.test(sessionId) || !CC_TASK_ID_PATTERN.test(taskId)) return
+      let stopped = false
+      let reader = null
+      entry.stopFollow = () => {
+        stopped = true
+        if (reader !== null) { try { reader.terminate() } catch (error) { /* already gone */ } }
+      }
+      armTimeout(() => {
+        if (stopped || entry.handle === null) return
+        void (async () => {
+          const found = await captureOn('ls /tmp/claude-"$(id -u)"/*/' + sessionId + '/tasks/' + taskId + '.output 2>/dev/null | head -1',
+            run.remote, 8000)
+          const filePath = String(found).trim()
+          if (stopped || filePath.length === 0) return
+          reader = await followOn(filePath, 0, run.remote)
+          if (stopped) { reader.terminate(); return }
+          if (typeof reader.stdout.setEncoding === 'function') reader.stdout.setEncoding('utf8')
+          for await (const chunk of reader.stdout) {
+            if (stopped) break
+            entry.handle.append(String(chunk))
+          }
+        })().catch((error) => {
+          if (!stopped) console.error('cc-mode: 跟读前台命令输出失败:', errorText(error))
+        })
+      }, CC_BASH_FOLLOW_DELAY_MS)
+    }
+
+    /** Release a task's output follower, if it has one. */
+    function stopCcTaskFollow(entry) {
+      if (typeof entry.stopFollow === 'function') entry.stopFollow()
     }
 
     /**
@@ -6702,6 +6775,7 @@ return {
       const summary = typeof message.summary === 'string' ? message.summary.trim() : ''
       const entry = taskId.length > 0 ? run.ccTasks.get(taskId) : undefined
       if (entry !== undefined) {
+        stopCcTaskFollow(entry)
         if (entry.summary !== undefined) entry.summary = summary
         if (entry.settle !== undefined) {
           try {
@@ -6741,6 +6815,7 @@ return {
         finalizeCcSubagent(run, record, '', { kind: 'interrupted' })
       }
       run.ccSubagents.clear()
+      for (const entry of run.ccTasks.values()) stopCcTaskFollow(entry)
       run.ccTasks.clear()
     }
 
