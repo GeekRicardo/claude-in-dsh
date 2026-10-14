@@ -286,12 +286,14 @@ test('两次不同的写入，即使内容一模一样，也必须是两次真�
     assert.equal(Buffer.byteLength(first), Buffer.byteLength(second), '前提：两条长度相同')
 
     const deliver = new Function('execOn', 'shellQuote', 'uuid', 'usesDaemon', 'BYTES',
+      'LINK_RETRY_WAITS_MS', 'armTimeout', 'shuttingDown', 'console',
       `${sliceFunction('deliverLineViaDaemon')}\nreturn deliverLineViaDaemon`)(
       rig.execOn,
       (v) => "'" + String(v).replace(/'/g, "'\\''") + "'",
       (() => { let n = 0; return () => 'id-' + (n += 1) })(),
       () => true,
       new TextEncoder(),
+      [1, 1], (fn) => { setImmediate(fn); return () => {} }, false, { log: () => {}, error: () => {} },
     )
 
     // 两个「不同的 run」——第二个的计数器从头开始，正是当初的现场。
@@ -305,4 +307,25 @@ test('两次不同的写入，即使内容一模一样，也必须是两次真�
     await deliver({ sessionId: 's1', remote: REMOTE, dir: dir, deliverSeq: 1 }, second)
     assert.equal(fs.readFileSync(fifoish, 'utf8'), second, '第二条必须真的写进去，而不是被当成重复吞掉')
   } finally { await daemon.close() }
+})
+
+test('链路正在重建时的写入：同一个幂等键等着重试，超时也重试，直到送达', async () => {
+  const keys = []
+  const outcomes = [
+    { decided: false, reason: 'fetch failed' },
+    { decided: false, timedOut: true, reason: '' },
+    { decided: true, code: 0, stderr: '' },
+  ]
+  const deliver = new Function('execOn', 'shellQuote', 'uuid', 'usesDaemon', 'BYTES',
+    'LINK_RETRY_WAITS_MS', 'armTimeout', 'shuttingDown', 'console',
+    `${sliceFunction('deliverLineViaDaemon')}\nreturn deliverLineViaDaemon`)(
+    async (cmd, remote, ms, opts) => { keys.push(opts.idemKey); return outcomes.shift() },
+    (v) => "'" + v + "'", () => 'k1', () => true, new TextEncoder(),
+    [1, 1, 1], (fn) => { setImmediate(fn); return () => {} }, false, { log: () => {}, error: () => {} },
+  )
+  const run = { sessionId: 's', remote: REMOTE, dir: '/x', pipeDirty: false }
+  await deliver(run, 'hello\n')
+  assert.equal(keys.length, 3)
+  assert.equal(new Set(keys).size, 1, '三次用的是同一个键：daemon 认得出是同一次写入')
+  assert.equal(run.pipeDirty, false)
 })

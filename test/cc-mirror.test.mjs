@@ -8,6 +8,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { v4Lifecycle } from './helpers/v4-checker.mjs'
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
 const source = fs.readFileSync(path.join(root, 'src/host.dynamic.js'), 'utf8')
@@ -53,11 +54,16 @@ function makeSession(events) {
 }
 
 function makeChildSession(events) {
+  // 子会话是一份独立的 v4 日志：它自己的轮次、步号、调用都要合规。
+  const lifecycle = v4Lifecycle()
   return {
     id: 'session-child',
     header: { origin: 'subagent', parentSession: 'session-main', cwd: '/root/code/zx' },
     events,
-    append(type, data, opts) { appendChecked(events, type, data, opts) },
+    append(type, data, opts) {
+      lifecycle.check({ type, seq: events.length, data })
+      appendChecked(events, type, data, opts)
+    },
   }
 }
 
@@ -96,7 +102,7 @@ function build(overrides) {
     'ccChildAppend', 'ccChildCloseStep', 'ccChildStep',
     'mirrorParentedAssistant', 'mirrorParentedResult',
     'findCcSubagentByLabel', 'ccTaskStarted', 'finalizeCcSubagent', 'ccTaskNotification',
-    'cleanupCcMirror',
+    'cleanupCcMirror', 'toolResultMessage',
   ]
   const made = new Function('deps', `
     const SURFACE_EVENT_TYPES = new Set(['user/message', 'assistant/message', 'tool/result'])
@@ -129,7 +135,7 @@ test('普通后台任务入账成 ctx.jobs 行，通知到达时结算', () => {
   const spec = rig.calls.starts[0]
   assert.equal(spec.kind, 'claude-task')
   assert.equal(spec.label, 'sleep 600', 'label 取描述首行')
-  assert.equal(spec.owner, agent)
+  assert.equal(spec.owner, agent.id, 'dsh 0.2 按会话 id 认 owner')
   assert.equal(typeof spec.run, 'function')
   const hooks = spec.run()
   assert.equal(typeof hooks.cancel, 'function')
@@ -256,7 +262,10 @@ test('run 断了也不留悬空的工具卡片：未答复的调用补一个中�
 
   const result = child.events.find((event) => event.type === 'tool/result')
   assert.ok(result, '没等到结果的调用必须自己有个结果，否则卡片永远转下去')
-  assert.equal(result.data.message.content[0].isError, true)
+  // 会话格式 v4：结果是一等的 tool 角色消息，不再包一层 tool-result 块。
+  assert.equal(result.data.message.role, 'tool')
+  assert.equal(result.data.message.toolCallId, 'toolu_sub_1')
+  assert.equal(result.data.message.isError, true)
   assert.deepEqual(child.events.at(-1).data, { turn: 1, reason: { kind: 'interrupted' } })
 })
 
@@ -294,4 +303,22 @@ test('非 Agent 工具（Bash 前台调用）不镜像子会话', () => {
     content: [{ type: 'tool_use', id: 'toolu_bash_1', name: 'Bash', input: { command: 'ls' } }],
   })
   assert.equal(rig.sessions.prepares.length, 0, '只有 Agent/Task 才建子会话')
+})
+
+test('子代理里的并行调用：一条消息拆成两条事件，第二个调用不另开一步（否则第一步带着没结的调用关掉）', () => {
+  const rig = build()
+  const run = makeRun()
+  rig.spawnCcSubagentsFrom(run, makeSession([]), AGENT_TOOL_USE)
+  const child = run.ccSubagents.get('toolu_agent_1').child
+  // 子会话的 append 每一条都过 v4 检查（makeChildSession）；违规会被 ccChildAppend 吞进日志，
+  // 所以这里直接看事件形状。
+  rig.mirrorParentedAssistant(run, 'toolu_agent_1', { id: 'm1', content: [{ type: 'tool_use', id: 's1', name: 'Bash', input: {} }] })
+  rig.mirrorParentedAssistant(run, 'toolu_agent_1', { id: 'm1', content: [{ type: 'tool_use', id: 's2', name: 'Bash', input: {} }] })
+  rig.mirrorParentedResult(run, 'toolu_agent_1', { content: [{ type: 'tool_result', tool_use_id: 's1', content: 'a' }] })
+  rig.mirrorParentedResult(run, 'toolu_agent_1', { content: [{ type: 'tool_result', tool_use_id: 's2', content: 'b' }] })
+  const steps = child.events.filter((event) => event.type === 'step/start').length
+  const ends = child.events.filter((event) => event.type === 'step/end').length
+  assert.equal(ends, steps - 1, '只有最后一步还开着，中间没有带着未结调用关掉的步')
+  const calls = child.events.filter((event) => event.type === 'tool/call').map((event) => event.data.step)
+  assert.equal(calls[0], calls[1], '两个并行调用在同一步')
 })

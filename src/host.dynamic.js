@@ -107,17 +107,32 @@ return {
     // loadPersistedStates): its process is already running on Claude's own
     // default, and quietly re-pointing an ongoing conversation at another
     // model is not a display change.
+    // Checked against the CLI's own table rather than from memory: the ids,
+    // display names and families below are the `{id,family,display_name,…}`
+    // rows inside the installed `claude` binary (2.1.296). `reasoning` is the
+    // only field of our own — it gates the effort seat, and Haiku 4.5 is the
+    // one current row that takes no `--effort` at all.
     const MODELS = [
+      { id: 'claude-fable-5-1', name: 'Claude Fable 5.1', reasoning: true },
       { id: 'claude-fable-5', name: 'Claude Fable 5', reasoning: true },
+      { id: 'claude-opus-5-5', name: 'Claude Opus 5.5', reasoning: true },
       { id: 'claude-opus-5', name: 'Claude Opus 5', reasoning: true },
       { id: 'claude-opus-4-8', name: 'Claude Opus 4.8', reasoning: true },
       { id: 'claude-opus-4-5', name: 'Claude Opus 4.5', reasoning: true },
+      { id: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5', reasoning: true },
       { id: 'claude-sonnet-5', name: 'Claude Sonnet 5', reasoning: true },
       { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', reasoning: true },
+      { id: 'claude-haiku-5-5', name: 'Claude Haiku 5.5', reasoning: true },
       { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', reasoning: false },
     ]
-    /** What a brand-new Claude conversation runs, absent any choice. */
-    const DEFAULT_MODEL = 'claude-opus-5'
+    /**
+     * What a brand-new Claude conversation runs, absent any choice.
+     *
+     * Opus 5.5 rather than Opus 5: it is the current Opus and the product's own
+     * default, on the same 1M window. A conversation that already SAVED a model
+     * keeps it (loadPersistedStates), so this only decides new ones.
+     */
+    const DEFAULT_MODEL = 'claude-opus-5-5'
 
     // How much context each model actually has. Claude Code advertises the 1M
     // window as a model suffix (`claude-opus-5[1m]`), which is why the route
@@ -137,6 +152,14 @@ return {
      */
     function announceContextWindow(sessionId, session) {
       if (session === undefined) return
+      // Format v4 admits request/context only inside an open turn, and a log
+      // with one outside is refused whole on the next load ("request/context
+      // is outside an open turn" — the conversation will not open at all).
+      // The /context probe answers after its turn has closed, so between
+      // turns this waits: the next turn publishes it as it starts.
+      let agent
+      try { agent = agents === undefined ? undefined : agents.get(sessionId) } catch (error) { agent = undefined }
+      if (agent === undefined || agent.status !== 'running') return
       const state = stateOf(sessionId)
       const route = String(state.route || state.model || '')
       if (route.length === 0) return
@@ -183,30 +206,12 @@ return {
       return DEFAULT_CONTEXT_WINDOW
     }
 
-    /**
-     * How big this process's context window really is, asked of the CLI.
-     *
-     * The model string cannot answer it. Claude Code's handshake echoes the id
-     * it was *given*: launched with `--model claude-opus-5` it reports exactly
-     * that, while the same install left on its default reports
-     * `claude-opus-5[1m]` — same process, same 1M window, two different strings.
-     * Guessing from the string is what reported this conversation as 100% full
-     * at 243k tokens when it was at 24%. `/context` states the denominator
-     * outright ("Tokens: 19.8k / 1m"), costs no model call, and the answer is
-     * cached per model choice.
-     */
-    const windowProbes = new Set()
-    // Model choices whose `/context` answer could not be parsed: asking again
-    // every turn would cost a round trip per turn for no new information.
-    const windowProbeFailures = new Set()
-
-    function parseContextWindow(text) {
-      const match = String(text || '').match(/\/\s*([\d.]+)\s*([kmKM])\b/)
-      if (match === null) return 0
-      const value = parseFloat(match[1])
-      if (!isFinite(value) || value <= 0) return 0
-      return Math.round(value * (match[2].toLowerCase() === 'k' ? 1000 : 1000000))
-    }
+    // The model string cannot say how big the window is: Claude Code echoes
+    // the id it was GIVEN (`claude-opus-5`) while the same install left on its
+    // default reports `claude-opus-5[1m]` — same process, same 1M window.
+    // Guessing from the string once reported a conversation 100% full at 243k
+    // when it was at 24%. The real figure arrives with every `result`
+    // (noteContextWindow); contextWindowOf is only the guess until then.
 
     /** "4.1k" / "167.4K" / "912" -> tokens. 0 when it is not a figure. */
     function tokensOf(text) {
@@ -274,6 +279,9 @@ return {
         // 4.1k+15.2k+4k+1.9k+167.4k = 192.6k = 1M − the 807.5k it calls free,
         // with both deferred rows (24.4k) outside that sum.
         if (label.indexOf('deferred') !== -1) continue
+        // Space held back for auto-compaction: reserved, not held. Counting it
+        // made "system" 33k bigger than the whole report's own total.
+        if (label.indexOf('autocompact') !== -1) continue
         if (label.indexOf('tool') !== -1) { tools += row.tokens; continue }
         if (label.indexOf('message') !== -1) { messages += row.tokens; continue }
         // System prompt, memory files, skills, agents — everything Claude
@@ -288,50 +296,113 @@ return {
       return String(state.route || '') + '|' + String(state.model || '')
     }
 
-    // The last `/context` composition per session, for the panel. Not
-    // persisted: it goes stale with every turn, and re-asking costs one round
-    // trip to a process that is already running.
-    const contextReports = new Map()
+    // Nothing here writes into the conversation's own Claude any more.
+    //
+    // This used to send `/context` down the live process after every turn (and
+    // every fifteen seconds while the context panel was open). Claude Code
+    // records a local command "as context for later messages": the command,
+    // a caveat and its whole ~5KB table, each time, sent along with every
+    // later request. One conversation had collected 27 of them — 132KB the
+    // model re-read on every turn, about nothing it was asked.
+    //
+    // So the two numbers come from places that do not touch it:
+    //   * the window — every `result` carries modelUsage[model].contextWindow;
+    //   * the composition — system prompt and tool schemas depend on the
+    //     model, the directory and its config, not on the conversation, so a
+    //     throwaway `claude -p /context` (no session persisted, no model call,
+    //     nothing sent to the API) measures them; the conversation's share is
+    //     what the last real request carried minus those two.
+
+    /** Window size a `result` reports for the conversation's model; 0 if none. */
+    function contextWindowFromResult(message, state) {
+      const usage = message !== null && typeof message === 'object' ? message.modelUsage : undefined
+      if (usage === null || typeof usage !== 'object') return 0
+      const wanted = [state.route, state.model].filter((name) => typeof name === 'string' && name.length > 0)
+      for (const name of wanted) {
+        const entry = usage[name]
+        if (entry && Number(entry.contextWindow) > 0) return Number(entry.contextWindow)
+      }
+      let best = 0
+      for (const entry of Object.values(usage)) {
+        if (entry && Number(entry.contextWindow) > best) best = Number(entry.contextWindow)
+      }
+      return best
+    }
+
+    /** Record the window a turn's result reported; publish it if it moved. */
+    function noteContextWindow(sessionId, session, message) {
+      const state = stateOf(sessionId)
+      const found = contextWindowFromResult(message, state)
+      if (found <= 0) return
+      const key = contextWindowKeyOf(state)
+      if (state.contextWindow === found && state.contextWindowKey === key) return
+      state.contextWindow = found
+      state.contextWindowKey = key
+      persistStates()
+      announceContextWindow(sessionId, session)
+      console.log('cc-mode: context window from the result —', found, 'for', sessionId)
+    }
 
     /**
-     * Ask the live process for its context report.
-     *
-     * One probe serves both readers: the window (the panel's denominator,
-     * cached per model choice because it cannot change without one) and the
-     * composition (which changes every turn, so it is kept fresh instead).
-     * @param force - ask even when the window is already known, because the
-     *   composition may have moved.
+     * Tokens the last top-level request carried (in + cached + out), read from
+     * the log — the same `usage` dsh's own ring reads, so the two always agree,
+     * and it survives a restart (an in-memory copy left the panel on dsh's
+     * blind guess until the next turn). Only main-thread messages carry usage.
      */
-    async function probeContextWindow(sessionId, cwd, force) {
-      const state = stateOf(sessionId)
-      const key = contextWindowKeyOf(state)
-      const windowKnown = state.contextWindowKey === key && Number(state.contextWindow) > 0
-      if (windowKnown && force !== true) return
-      if (windowProbes.has(sessionId) || activeTurns.has(sessionId)) return
-      if (windowProbeFailures.has(sessionId + '|' + key) && force !== true) return
-      windowProbes.add(sessionId)
-      try {
-        const work = await runCommandForPlugin(sessionId, cwd, '/context')
-        if (work === undefined) return
-        const answer = await work
-        const text = answer === undefined ? '' : answer.text
-        const report = parseContextReport(text)
-        if (report !== undefined) contextReports.set(sessionId, report)
-        const found = parseContextWindow(text)
-        if (found <= 0) { windowProbeFailures.add(sessionId + '|' + key); return }
-        windowProbeFailures.delete(sessionId + '|' + key)
-        if (state.contextWindow !== found || state.contextWindowKey !== key) {
-          state.contextWindow = found
-          state.contextWindowKey = key
-          persistStates()
-          announceContextWindow(sessionId, sessionOf(sessionId))
-          console.log('cc-mode: context window measured —', found, 'for', sessionId)
-        }
-      } catch (error) {
-        console.error('cc-mode: could not read the context window:', errorText(error))
-      } finally {
-        windowProbes.delete(sessionId)
+    function contextTokensOf(session) {
+      const events = sessionEvents(session)
+      for (let index = events.length - 1; index >= 0; index -= 1) {
+        const event = events[index]
+        if (event.type !== 'assistant/message') continue
+        const usage = event.data === null || event.data === undefined ? undefined : event.data.usage
+        if (usage === null || typeof usage !== 'object') continue
+        const total = (Number(usage.inputTokens) || 0) + (Number(usage.cacheReadTokens) || 0)
+          + (Number(usage.cacheWriteTokens) || 0) + (Number(usage.outputTokens) || 0)
+        if (total > 0) return total
       }
+      return 0
+    }
+
+    // model|cwd|target → { system, tools, at } from a side-channel `/context`.
+    const compositions = new Map()
+    const compositionProbes = new Map()
+    const COMPOSITION_TTL_MS = 10 * 60 * 1000
+
+    /**
+     * System prompt and tool tokens for this conversation's model and
+     * directory, measured by a separate, throwaway Claude process. Never the
+     * conversation's own: see above.
+     */
+    async function probeComposition(sessionId, cwd) {
+      const state = stateOf(sessionId)
+      const remote = remoteOf(state)
+      const key = String(state.model || '') + '|' + cwd + '|' + (remote === null ? '' : remote.id)
+      const cached = compositions.get(key)
+      if (cached !== undefined && Date.now() - cached.at < COMPOSITION_TTL_MS) return cached
+      const pending = compositionProbes.get(key)
+      if (pending !== undefined) return pending
+      const work = (async () => {
+        const executable = remote === null ? await subprocess.resolveExecutable('claude') : remote.claudeBin
+        const argv = [executable, '-p', '--output-format', 'json']
+        if (state.model.length > 0 && !(remote !== null && remote.ownModel === true)) argv.push('--model', state.model)
+        // A boolean flag right before the positional: the prompt cannot be
+        // swallowed by a variadic option.
+        argv.push('--no-session-persistence', '/context')
+        const raw = String(await captureOn('cd ' + shellQuote(cwd) + ' && ' + argv.map(shellQuote).join(' ') + ' 2>/dev/null',
+          remote, 60000)).trim()
+        let text = ''
+        try { text = String(JSON.parse(raw).result || '') } catch (error) { text = '' }
+        const report = parseContextReport(text)
+        if (report === undefined) {
+          console.error('cc-mode: could not measure the context composition for', sessionId, '(' + raw.slice(0, 120) + ')')
+          return undefined
+        }
+        const measured = { system: report.system, tools: report.tools, at: Date.now() }
+        compositions.set(key, measured)
+        return measured
+      })()
+      compositionProbes.set(key, work)
+      try { return await work } finally { compositionProbes.delete(key) }
     }
 
     const EFFORTS = [
@@ -461,17 +532,16 @@ return {
     }
 
     /**
-     * Where this (workspace, target) pair was last worked in.
+     * Where this (workspace, target) pair was last worked in; '' when never.
      *
-     * Falls back to the target's own older memory — entries written before the
-     * key carried a workspace — so an upgrade does not look like every target
-     * forgetting where it works.
+     * No fallback to another project's directory: a project that never used
+     * this target gets the chip's "选目录" and the target's own default, not
+     * a silent launch in whatever some other project last chose.
      */
     function lookupDir(workspace, remoteId) {
+      if (String(workspace || '').length === 0) return ''
       const scoped = lastDirs.get(dirKey(workspace, remoteId))
-      if (typeof scoped === 'string' && scoped.length > 0) return scoped
-      const legacy = lastDirs.get(String(remoteId || ''))
-      return typeof legacy === 'string' ? legacy : ''
+      return typeof scoped === 'string' ? scoped : ''
     }
 
     /** Record where a target was last worked in; empty values never overwrite. */
@@ -846,6 +916,10 @@ return {
     function ensureDaemon(remote) {
       const pending = daemons.get(remote.id)
       if (pending !== undefined) return pending
+      // A tunnel opened during teardown outlives this dsh: its parent exits,
+      // nothing ever terminates it, and it holds the port for good (one was
+      // found doing exactly that, opened by a turn's cleanup mid-shutdown).
+      if (shuttingDown) return Promise.reject(new Error('cc-mode: 插件正在停止，不新开隧道'))
       const opening = openDaemon(remote).then(
         (link) => {
           // When the tunnel ends, forget it — but only if this is still the
@@ -1289,6 +1363,8 @@ return {
       const savedDirs = stored['#lastDirs']
       if (savedDirs !== null && typeof savedDirs === 'object' && !Array.isArray(savedDirs)) {
         for (const id of Object.keys(savedDirs)) {
+          // Keys without a workspace predate per-project memory; nothing reads them.
+          if (!id.includes('\u0000') || id.startsWith('\u0000')) continue
           if (typeof savedDirs[id] === 'string' && savedDirs[id].length > 0) lastDirs.set(id, savedDirs[id])
         }
       }
@@ -1458,17 +1534,7 @@ return {
           session.append('tool/result', {
             turn: at.turn,
             step: at.step,
-            message: {
-              id: uuid(),
-              role: 'user',
-              source: { kind: 'tool', callId: callId },
-              content: [{
-                type: 'tool-result',
-                toolCallId: callId,
-                content: [{ type: 'text', text: '这次调用没有等到结果（上一次运行被中断）。' }],
-                isError: true,
-              }],
-            },
+            message: toolResultMessage(callId, [{ type: 'text', text: '这次调用没有等到结果（上一次运行被中断）。' }], true),
           }, { surfaceOp: 'append' })
           repaired += 1
         } catch (error) {
@@ -1614,6 +1680,24 @@ return {
       return blocks
     }
 
+    /**
+     * The message of a tool/result event. Session format v4 (dsh 0.2) made it
+     * a first-class tool-role message; the old shape — a user-role message
+     * wrapping one 'tool-result' block — appends fine but makes the whole log
+     * unreadable on the next load ("requires a tool-role message"), so every
+     * write goes through here.
+     */
+    function toolResultMessage(callId, content, isError) {
+      return {
+        id: uuid(),
+        role: 'tool',
+        source: { kind: 'tool', callId: callId },
+        toolCallId: callId,
+        content: content,
+        isError: isError === true,
+      }
+    }
+
     function resultBlocksOf(content) {
       if (typeof content === 'string') return [{ type: 'text', text: content }]
       if (!Array.isArray(content)) return [{ type: 'text', text: '' }]
@@ -1643,15 +1727,18 @@ return {
     // One turn's steps. A dsh step = one product assistant message plus the
     // results of the tools it asked for — the built-in loop's own bracket.
     function createTranscript(session, turn) {
-      let stepNumber = 0
+      // Seeded from the log at the first step, not here: whatever was rendered
+      // into this turn before it (a drain, a relieved half round) owns 1..n.
+      let stepNumber
       let open
-      // Every call id this turn has already answered. Parallel tool calls make
-      // the CLI emit the first finished result on its own and then again inside
-      // the complete tool_result array it sends to the API, so the same id
-      // arrives twice. dsh's chat node treats a second result for one call as a
-      // protocol error — the card breaks and the transcript stops rendering
-      // from there. One result per call, whoever writes it.
-      const answered = new Set()
+      // Every call id already answered. Parallel tool calls make the CLI emit
+      // the first finished result on its own and then again inside the complete
+      // tool_result array it sends to the API, so the same id arrives twice.
+      // dsh's chat node treats a second result for one call as a protocol
+      // error — the card breaks and the transcript stops rendering from there.
+      // One result per call, whoever writes it — and "whoever" is why this is
+      // seeded from the log rather than starting empty: see settledCallIds.
+      const answered = settledCallIds(session)
       // Calls announced but not yet answered, and the step each was announced
       // in — so a result that arrives after its step closed still lands on the
       // card it belongs to instead of the step that happens to be open.
@@ -1672,6 +1759,7 @@ return {
        */
       function closeStep() {
         if (open === undefined) return
+        flushAssistant()
         // A step that streamed but never settled into an assistant/message —
         // interrupted, failed, retried — still has to put its stream somewhere,
         // or those bytes leave no trace at all. That is what `assistant/attempt`
@@ -1696,24 +1784,16 @@ return {
        * only once the turn is over, when that is actually true.
        */
       function finish(reason) {
+        flushAssistant()
         for (const entry of pending) {
           const call = entry[0]
           if (answered.has(call)) continue
           answered.add(call)
+          // Into an open step (format v4), not the one the call was made in.
           session.append('tool/result', {
             turn: turn,
-            step: entry[1],
-            message: {
-              id: uuid(),
-              role: 'user',
-              source: { kind: 'tool', callId: call },
-              content: [{
-                type: 'tool-result',
-                toolCallId: call,
-                content: [{ type: 'text', text: reason || '这次调用没有等到结果（轮次被中断）。Claude 侧可能已经执行完成。' }],
-                isError: true,
-              }],
-            },
+            step: currentStep().step,
+            message: toolResultMessage(call, [{ type: 'text', text: reason || '这次调用没有等到结果（轮次被中断）。Claude 侧可能已经执行完成。' }], true),
           }, { surfaceOp: 'append' })
         }
         pending.clear()
@@ -1724,7 +1804,12 @@ return {
       }
 
       function beginStep() {
+        // A step with an unanswered call cannot close (format v4). Should the
+        // next message start before that answer, it goes into the same step —
+        // several messages in one step is allowed; an unpaired close is not.
+        if (open !== undefined && hasOpenCallsIn(open.step)) { flushAssistant(); return open }
         closeStep()
+        if (stepNumber === undefined) stepNumber = lastStepOf(session, turn)
         stepNumber += 1
         session.append('step/start', { turn: turn, step: stepNumber })
         open = { step: stepNumber, blocks: new Map(), assistantLogged: false, stream: [], streamAt: 0 }
@@ -1828,6 +1913,7 @@ return {
       function streamEvent(event) {
         if (event === null || typeof event !== 'object') return
         if (event.type === 'message_start') { beginStep(); return }
+        if (event.type === 'message_stop') { flushAssistant(); return }
         if (event.type === 'content_block_start') {
           const blockType = blockTypeOf(event.content_block ? event.content_block.type : '')
           if (blockType === undefined) return
@@ -1875,12 +1961,42 @@ return {
         }
       }
 
+      /**
+       * One API message lands as ONE assistant/message, in one step.
+       *
+       * The CLI emits a message block by block — thinking, text, each
+       * tool_use — as separate `assistant` events sharing one message id, all
+       * before its message_stop. Writing each as its own step put two parallel
+       * tool calls in two steps, and the first step then closed with its call
+       * still unanswered: format v4 refuses that ("step/end leaves unresolved
+       * tool call"), so the conversation stopped loading. The blocks are held
+       * on the step and written together when the message is over — its
+       * message_stop, the next message, its first tool result, or the step
+       * closing for any other reason.
+       */
       function assistantMessage(message) {
+        const id = typeof message.id === 'string' ? message.id : ''
+        if (open !== undefined && open.pendingMessage && (id === '' || open.pendingMessage.id !== id)) flushAssistant()
         const step = stepForAssistant(open, beginStep)
-        step.assistantLogged = true
+        if (!step.pendingMessage) step.pendingMessage = { id: id, model: message.model, usage: undefined, content: [] }
+        for (const block of (Array.isArray(message.content) ? message.content : [])) step.pendingMessage.content.push(block)
+        if (message.usage) step.pendingMessage.usage = message.usage
+        if (message.model) step.pendingMessage.model = message.model
         loggedAssistant = true
-        const content = assistantBlocksOf(message.content)
-        const usage = tokenUsageOf(message.usage)
+        // The caller needs the calls now (subagent mirrors, main-call
+        // bookkeeping); their tool/call rows are written with the message.
+        return assistantBlocksOf(message.content).filter((block) => block.type === 'tool-call')
+      }
+
+      /** Write the held API message, if any, and its tool calls. */
+      function flushAssistant() {
+        if (open === undefined || !open.pendingMessage) return
+        const held = open.pendingMessage
+        open.pendingMessage = null
+        const step = open
+        step.assistantLogged = true
+        const content = assistantBlocksOf(held.content)
+        const usage = tokenUsageOf(held.usage)
         session.append(
           'assistant/message',
           {
@@ -1890,7 +2006,7 @@ return {
               id: uuid(),
               role: 'assistant',
               content: content,
-              source: { kind: 'model', provider: PROVIDER, model: message.model || 'claude-code' },
+              source: { kind: 'model', provider: PROVIDER, model: held.model || 'claude-code' },
             },
             ...(usage === undefined ? {} : { usage: usage }),
             // 写入时就把流从这一步里取走，而不是把数组借给它。
@@ -1909,7 +2025,6 @@ return {
           // local and remote alike, the moment dsh updated itself.
           { surfaceOp: 'append' },
         )
-        const calls = []
         for (const block of content) {
           if (block.type !== 'tool-call') continue
           session.append('tool/call', {
@@ -1920,9 +2035,10 @@ return {
             arguments: block.arguments,
           })
           pending.set(block.id, step.step)
-          calls.push(block)
         }
-        return calls
+        // The message an interjection was waiting behind has landed (unless it
+        // opened tool calls, which hold it until their results pair up).
+        flushDeferredUserMessages()
       }
 
       // 插话（steering）在工具跑到一半时到达，就不能当场写进转录：那一刻
@@ -1932,14 +2048,25 @@ return {
 
       function hasOpenCalls() { return pending.size > 0 }
 
+      function hasOpenCallsIn(step) {
+        for (const entry of pending) if (entry[1] === step) return true
+        return false
+      }
+
+      // Same for a message still streaming: it lands as one assistant/message
+      // when it completes, so an interjection written now sits ABOVE the very
+      // text it interrupted (measured: a steer during a 2,500-character
+      // answer rendered before all of it).
+      function midMessage() { return open !== undefined && (open.stream.length > 0 || Boolean(open.pendingMessage)) }
+
       function deferUserMessage(write) {
-        if (!hasOpenCalls()) { write(); return }
+        if (!hasOpenCalls() && !midMessage()) { write(); return }
         deferredUserMessages.push(write)
       }
 
       function flushDeferredUserMessages(force) {
         if (deferredUserMessages.length === 0) return
-        if (pending.size > 0 && force !== true) return
+        if ((pending.size > 0 || midMessage()) && force !== true) return
         for (const write of deferredUserMessages.splice(0)) {
           try { write() } catch (error) { console.error('cc-mode: 补写插话失败:', errorText(error)) }
         }
@@ -1947,32 +2074,22 @@ return {
 
       function toolResults(message) {
         if (typeof message.content === 'string') return
+        // A result names a call: the message carrying that call goes first.
+        flushAssistant()
         for (const block of message.content || []) {
           if (block.type !== 'tool_result') continue
-          const announcedIn = pending.get(block.tool_use_id)
           pending.delete(block.tool_use_id)
           if (answered.has(block.tool_use_id)) continue
           answered.add(block.tool_use_id)
-          // The step number is bookkeeping — dsh pairs a result to its call by
-          // callId — so this keeps writing into whatever step is open, which is
-          // the arrangement every rendered conversation so far was built on.
-          const step = open !== undefined ? open.step : (announcedIn === undefined ? stepNumber : announcedIn)
+          // dsh pairs a result to its call by callId, so any step will do —
+          // but it has to be an OPEN one (format v4), so open one if needed.
+          const step = currentStep().step
           session.append(
             'tool/result',
             {
               turn: turn,
               step: step,
-              message: {
-                id: uuid(),
-                role: 'user',
-                source: { kind: 'tool', callId: block.tool_use_id },
-                content: [{
-                  type: 'tool-result',
-                  toolCallId: block.tool_use_id,
-                  content: resultBlocksOf(block.content),
-                  isError: block.is_error === true,
-                }],
-              },
+              message: toolResultMessage(block.tool_use_id, resultBlocksOf(block.content), block.is_error === true),
             },
             { surfaceOp: 'append' },
           )
@@ -2179,6 +2296,26 @@ return {
      * old shape is still accepted because one deployment upgrading does not
      * upgrade every machine this plugin runs on.
      */
+    /**
+     * The highest step number `turn` already holds. Format v4 wants every
+     * step/start to be exactly the next one in its turn, and a turn is not
+     * this plugin's alone to number: a projection rendered into it first (a
+     * drain, a relieved half round) has already used 1..n. Read backwards and
+     * stop at the turn's own start, so a long conversation costs one turn.
+     */
+    function lastStepOf(session, turn) {
+      const events = sessionEvents(session)
+      let last = 0
+      for (let index = events.length - 1; index >= 0; index -= 1) {
+        const event = events[index]
+        const data = event.data
+        if (data === undefined || data === null || data.turn !== turn) continue
+        if (event.type === 'turn/start') break
+        if (event.type === 'step/start' && typeof data.step === 'number' && data.step > last) last = data.step
+      }
+      return last
+    }
+
     function sessionEvents(session) {
       if (session === null || session === undefined) return []
       if (typeof session.snapshotEvents === 'function') return session.snapshotEvents()
@@ -2188,6 +2325,59 @@ return {
     function machineryRow(event) {
       return event !== null && event !== undefined
         && (event.isMeta === true || event.isSynthetic === true)
+    }
+
+    /**
+     * Every tool call this session's log has already settled.
+     *
+     * A turn's own "one result per call" bookkeeping only knows the results IT
+     * wrote, and the writer is not always the same object: a catch-up
+     * projection stamps a call it cannot answer with 「这次调用没有等到结果」
+     * and then dies, taking its bookkeeping with it. When the real result
+     * arrives minutes later through the live stream, a fresh turn knows nothing
+     * about that stamp and writes a SECOND result — into whatever step is open
+     * by then, which never advertised the call. dsh does not reject that write;
+     * it rejects the whole log on the next load ("tool/result <id> has no
+     * advertised tool lifecycle"), and the conversation simply stops opening.
+     * One real conversation was lost to this before being repaired by hand.
+     */
+    function settledCallIds(session) {
+      const settled = new Set()
+      for (const event of sessionEvents(session)) {
+        if (event.type !== 'tool/result') continue
+        const message = event.data === null || event.data === undefined ? undefined : event.data.message
+        if (message === null || message === undefined) continue
+        const source = message.source
+        const id = typeof message.toolCallId === 'string' && message.toolCallId.length > 0
+          ? message.toolCallId
+          : (source !== null && source !== undefined && typeof source.callId === 'string' ? source.callId : '')
+        if (id.length > 0) settled.add(id)
+      }
+      return settled
+    }
+
+    /**
+     * The dsh-transcript note for a safety-classifier stop, or null for a
+     * message that is not one.
+     *
+     * A safety classifier can stop a response mid-stream. The CLI reports it as
+     * a `system/model_refusal_fallback` event: when it names a `fallback_model`
+     * it retries this same turn on that model, otherwise the refusal stands and
+     * the turn ends empty. Either way the plugin used to drop the event on the
+     * floor — no assistant text comes with a refused response (its content is
+     * empty) — so dsh went silent through the stop, the model switch, and the
+     * retry, and showed a blank turn when a refusal stood. One conversation hit
+     * this six times in a row. This is the same class of "dsh just went quiet"
+     * bug as an unannounced compact_boundary; it is answered the same way.
+     */
+    function refusalNote(message) {
+      if (message === null || message === undefined || message.subtype !== 'model_refusal_fallback') return null
+      const category = typeof message.api_refusal_category === 'string' && message.api_refusal_category.length > 0
+        ? '（' + message.api_refusal_category + '）' : ''
+      const fallback = typeof message.fallback_model === 'string' ? message.fallback_model : ''
+      return fallback.length > 0
+        ? '⚠ 安全防护拦下了上一段回复' + category + ' · 已自动切到 ' + fallback + ' 重答这一轮'
+        : '⚠ 安全防护拦下了这段回复' + category + ' · 这一轮到此为止'
     }
 
     function shellQuote(value) {
@@ -2312,6 +2502,74 @@ return {
       return started
     }
 
+    /**
+     * GenUI as a Claude *skill*, never as a system prompt.
+     *
+     * dsh-genui teaches its ```dsh-ui fence to the DSH engine by registering a
+     * system-prompt section — a path a Claude conversation never takes, since
+     * its pre-step rejects before any dsh model request is built. The obvious
+     * fix, `--append-system-prompt`, is the wrong tool twice over: it edits the
+     * part of Claude Code that is deliberately not ours to edit, and
+     * `--system-prompt-snapshot` (on by default) records the result once per
+     * conversation and replays it verbatim on every later request and resume —
+     * so a syntax blob injected that way can never be changed or withdrawn for
+     * that conversation again.
+     *
+     * A plugin skill has none of those properties: Claude loads it only when it
+     * judges it relevant (so it costs nothing per request), it is namespaced,
+     * `--plugin-dir` scopes it to this one process, and a path that fails to
+     * load is skipped with the session continuing. The text is genui's own
+     * SKILL.md rather than a copy maintained here, so its author's triggering
+     * description is the one that runs and an upgrade carries over by itself.
+     */
+    const GENUI_PLUGIN_ROOT = BROKER_ROOT + '/genui-plugin'
+    const GENUI_SKILL_DIR = GENUI_PLUGIN_ROOT + '/skills/dsh-ui'
+
+    /**
+     * genui's SKILL.md, read off the machine DSH runs on, or '' when genui is
+     * not installed there.
+     *
+     * Probed against DSH's own machine, not the target the Claude process runs
+     * on: the renderer is in the browser beside dsh, so dsh's profile is what
+     * decides whether anything can render the fence at all.
+     */
+    let genuiSkillProbe
+    function genuiSkill() {
+      if (genuiSkillProbe === undefined) {
+        genuiSkillProbe = captureOn(
+          'cat "$HOME"/.dsh/profiles/*/node_modules/@changfenhuang/dsh-genui/SKILL.md 2>/dev/null | head -c 60000',
+          null, 8000,
+        ).then((text) => {
+          const body = String(text)
+          // A real SKILL.md names the fence; anything else means no genui.
+          const usable = body.indexOf('dsh-ui') !== -1
+          console.log('cc-mode: dsh-genui', usable
+            ? 'SKILL.md 读到了（' + body.length + ' 字节）— Claude 会按需加载这个 skill'
+            : '没装 — 不挂 GenUI skill')
+          return usable ? body : ''
+        }).catch(() => '')
+      }
+      return genuiSkillProbe
+    }
+
+    /** Plant that skill on whichever machine runs Claude; once per target. */
+    const genuiSkillReady = new Map()
+    function ensureGenuiSkill(remote, body) {
+      const key = remote === null || remote === undefined ? '' : remote.id
+      const done = genuiSkillReady.get(key)
+      if (done !== undefined) return done
+      const started = execOn(
+        'mkdir -p ' + shellQuote(GENUI_SKILL_DIR) + ' && cat > ' + shellQuote(GENUI_SKILL_DIR + '/SKILL.md'),
+        remote, 20000, { stdin: body },
+      ).then((result) => {
+        const ok = result.decided === true && (result.code === null || result.code === 0)
+        if (!ok) console.error('cc-mode: GenUI skill 没写过去，这一轮不挂它')
+        return ok
+      }).catch(() => false)
+      genuiSkillReady.set(key, started)
+      return started
+    }
+
     async function readJsonFile(path, remote) {
       const raw = await captureOn('cat ' + shellQuote(path) + ' 2>/dev/null', remote, 5000)
       try { return JSON.parse(raw) } catch (error) { return null }
@@ -2332,12 +2590,18 @@ return {
      * the behaviour this had before.
      */
     async function isAlive(pid, remote) {
-      if (typeof pid !== 'number' || pid <= 0) return false
+      return (await liveness(pid, remote)) === 'yes'
+    }
+
+    /** 'yes', 'no', or 'unknown' when the machine did not answer. */
+    async function liveness(pid, remote) {
+      if (typeof pid !== 'number' || pid <= 0) return 'no'
       const answer = await captureOn(
         'state=$(ps -o stat= -p ' + pid + ' 2>/dev/null | head -1 | tr -d " "); '
         + 'if [ -n "$state" ]; then case "$state" in Z*) echo no;; *) echo yes;; esac; '
         + 'else kill -0 ' + pid + ' 2>/dev/null && echo yes || echo no; fi', remote, 5000)
-      return String(answer).trim().indexOf('yes') === 0
+      const text = String(answer).trim()
+      return text.indexOf('yes') === 0 ? 'yes' : (text.indexOf('no') === 0 ? 'no' : 'unknown')
     }
 
     // `stat -c` is GNU; macOS ships BSD stat (`-f`). Every stat goes through
@@ -2449,10 +2713,12 @@ return {
         const line = JSON.stringify(value) + '\n'
         // Most callers (control requests, approval answers) do not await this,
         // so a rejection must never escape as an unhandled one — it is recorded
-        // instead, and the turn that cares checks it.
-        writeChain = writeChain.then(() => deliverLine(run, line)).catch((error) => {
+        // instead, and the turn that cares checks it. Resolves to whether THIS
+        // line landed (writeError stays set once anything has failed).
+        writeChain = writeChain.then(() => deliverLine(run, line)).then(() => true, (error) => {
           run.writeError = errorText(error)
           console.error('cc-mode: 写入 Claude 失败:', run.writeError)
+          return false
         })
         return writeChain
       }
@@ -2510,8 +2776,12 @@ return {
               if (value.type === 'cc-exit') {
                 run.closed = true
                 run.exit = { exitCode: value.exitCode, signal: value.signal }
+                residentBrokers.delete(run.sessionId)
                 run.push(undefined)
                 continue
+              }
+              if (value.type === 'system' && value.subtype === 'background_tasks_changed') {
+                backgroundTaskCounts.set(run.sessionId, Array.isArray(value.tasks) ? value.tasks.length : 0)
               }
               // Checkpoint at every turn boundary. attach.json used to be
               // written only by a clean detach, so a killed dsh left a stale
@@ -2529,6 +2799,9 @@ return {
                 value.ccmodeOffset = run.consumed
                 checkpointOffset(run)
               }
+              // A tool result's end, for the per-step checkpoint the live turn
+              // takes once it has written the result (see driveTurn).
+              if (value.type === 'user') value.ccmodeOffset = run.offset - BYTES.encode(buffer).length
               // An out-of-band command this plugin issued (`/context`, `/mcp`,
               // …) can lose its reader before its answer lands — a write that
               // timed out, a stream that dropped. Those bytes are the plugin's,
@@ -2564,7 +2837,7 @@ return {
         // what turns a silent hang into one honest failure it can report.
         if (run.detached !== true && !run.closed) {
           run.readerDead = true
-          console.error('cc-mode: 读取端断开了（tail 结束），松开这一轮；Claude 进程保留')
+          console.error('cc-mode: 读取端断开了（tail 结束）；Claude 进程保留，读它的那一方会先试着重新接上')
           run.push(undefined)
         }
       })()
@@ -2630,12 +2903,30 @@ return {
 
     /** Record how far this attach has consumed, so a hard kill cannot lie. */
     function checkpointOffset(run) {
+      checkpointAt(run, typeof run.consumed === 'number' ? run.consumed : run.offset)
+    }
+
+    /**
+     * Record `offset` as where the next attach resumes. Coalesced, never
+     * dropped: a write already in flight is followed by one for the latest
+     * offset asked for, because a stale offset replays what is already shown.
+     */
+    function checkpointAt(run, offset) {
+      if (typeof offset !== 'number') return
+      run.checkpointWanted = offset
       if (run.checkpointing === true) return
       run.checkpointing = true
-      const offset = typeof run.consumed === 'number' ? run.consumed : run.offset
-      execOn('cat > ' + shellQuote(run.dir + '/attach.json'), run.remote, 10000,
-        { stdin: JSON.stringify({ offset: offset }) })
-        .then(() => { run.checkpointing = false }, () => { run.checkpointing = false })
+      const write = () => {
+        const target = run.checkpointWanted
+        execOn('cat > ' + shellQuote(run.dir + '/attach.json'), run.remote, 10000,
+          { stdin: JSON.stringify({ offset: target }) })
+          .catch(() => undefined)
+          .then(() => {
+            if (run.checkpointWanted !== target && run.detached !== true) write()
+            else run.checkpointing = false
+          })
+      }
+      write()
     }
 
     /**
@@ -2668,7 +2959,17 @@ return {
       const key = 'deliver-' + uuid()
       const payload = run.pipeDirty === true ? '\n' + line : line
       let last = ''
-      for (let attempt = 0; attempt < 2; attempt += 1) {
+      // Through a tunnel blip, not just past one: the link comes back within
+      // seconds, and the key makes every retry safe — including after a
+      // timeout, which over a frozen link says nothing about whether the
+      // daemon wrote. Two attempts back to back used to both land inside the
+      // same outage, and an interjection typed then simply never reached
+      // Claude (measured: the person saw it sent, Claude never saw it).
+      for (let attempt = 0; attempt < LINK_RETRY_WAITS_MS.length + 1; attempt += 1) {
+        if (attempt > 0) {
+          if (shuttingDown) break
+          await new Promise((resolve) => armTimeout(resolve, LINK_RETRY_WAITS_MS[attempt - 1]))
+        }
         const result = await execOn('cat > ' + shellQuote(run.dir + '/in'), run.remote, 10000,
           { stdin: payload, idemKey: key })
         if (result.decided === true && result.timedOut !== true) {
@@ -2677,16 +2978,16 @@ return {
             throw new Error('cc-mode: 写入 Claude 的输入管道失败（退出码 ' + result.code + '）' + result.stderr.trim())
           }
           run.pipeDirty = false
+          if (attempt > 0) console.log('cc-mode:', run.sessionId, '写入在第', attempt + 1, '次送达（链路刚恢复）')
           return
         }
-        // A write that timed out may have left half a line in the fifo; the
-        // next one prefixes a newline so the stump dies as its own unparseable
-        // line instead of corrupting the front of the next message.
-        if (result.timedOut === true) { run.pipeDirty = true; break }
-        last = result.reason
+        last = result.timedOut === true ? '10 秒超时' : result.reason
+        console.error('cc-mode:', run.sessionId, '写入第', attempt + 1, '次没送达（' + last + '），等链路恢复再试')
       }
+      // Whatever half-line a timed-out attempt may have left in the fifo, the
+      // next write starts with a newline so the stump dies on its own.
       run.pipeDirty = true
-      throw new Error('cc-mode: 写入 Claude 的输入管道没成功' + (last.length > 0 ? '（' + last + '）' : '（10 秒超时）'))
+      throw new Error('cc-mode: 写入 Claude 的输入管道没成功（' + last + '）')
     }
 
     /** Put one line into a run's fifo and wait until it is actually in. */
@@ -2722,6 +3023,7 @@ return {
     /** Attach this plugin to a live broker: one tail in, one cat out. */
     async function attach(run) {
       run.consumed = run.offset
+      residentBrokers.add(run.sessionId)
       if (usesDaemon(run.remote)) {
         // One long response instead of a `tail -f` at the end of a shell hop.
         // The offset is the same number either way — `tail -c +N` counts from
@@ -2744,6 +3046,50 @@ return {
         })
       }
       pumpAttached(run)
+    }
+
+    // How long a turn waits, after a result it skipped for an owed echo, before
+    // ending on that result anyway — and the marker its timer queues.
+    const OWED_ECHO_GRACE_MS = 60000
+    const OWED_ECHO_TIMEOUT = { owedEchoTimeout: true }
+    // Waits between retries of a remote step that got no answer — a tunnel
+    // being rebuilt answers nothing for a few seconds, then everything works.
+    const LINK_RETRY_WAITS_MS = [1000, 2000, 4000, 8000, 15000]
+    const REATTACH_TRIES = 6
+    const REATTACH_GAP_MS = 5000
+
+    /**
+     * The stream dropped but Claude did not: pick it up again from the last
+     * complete line, inside whatever was reading it.
+     *
+     * A tunnel blip used to end the turn on the spot — "the output ended
+     * before a result" — while the broker carried on. The rest of that round
+     * then had no reader; the next out-of-band probe read it as its own
+     * answer and threw it away (measured: two tool calls and the closing
+     * summary, gone). Only a broker known to be alive is re-attached: an
+     * unanswered liveness check is retried, never read as "alive".
+     */
+    async function reattachReader(run) {
+      for (let attempt = 1; attempt <= REATTACH_TRIES; attempt += 1) {
+        if (run.closed || run.detached === true || shuttingDown) return false
+        const alive = await liveness(run.brokerPid, run.remote)
+        if (alive === 'no') return false
+        if (alive === 'yes') {
+          run.offset = typeof run.consumed === 'number' ? run.consumed : run.offset
+          run.readerDead = false
+          await attach(run)
+          if (run.readerDead !== true) {
+            console.log('cc-mode:', run.sessionId, '读取流断了，第', attempt, '次重新接上，从', run.offset, '字节续读')
+            return true
+          }
+          // attach pushed its own end-of-stream marker; it is not news.
+          const at = run.queue.lastIndexOf(undefined)
+          if (at !== -1) run.queue.splice(at, 1)
+        }
+        console.error('cc-mode:', run.sessionId, '读取流断了，第', attempt, '次重连没成（broker', alive, '）')
+        await new Promise((resolve) => armTimeout(resolve, REATTACH_GAP_MS))
+      }
+      return false
     }
 
     /** Let go of the process without ending it. */
@@ -2834,12 +3180,26 @@ return {
     }
 
     async function ensureRun(sessionId, cwd, signal) {
+      // Nothing gets launched while this plugin is being torn down. A turn's
+      // own cleanup (its /context probe) used to land here mid-shutdown: the
+      // tunnel was already closing, meta.json read back as nothing, and a
+      // second broker was started on a conversation whose first was still
+      // mid-turn — two Claudes on one fifo and one transcript.
+      if (shuttingDown) throw new Error('cc-mode: 插件正在停止，不启动 Claude')
       const state = stateOf(sessionId)
       const remote = remoteOf(state)
       // The dsh workspace path names a directory on THIS machine, so a remote
       // conversation cannot open in it. Everything downstream — the transcript
       // slug, the launch's `cd`, run.cwd — follows from this one substitution.
-      if (remote !== null) cwd = await remoteCwdOf(state, remote)
+      if (remote !== null) {
+        // The state may have been made before dsh handed over the session, when
+        // its project was not yet known; the memory is read again here so the
+        // launch below cannot record the target's home over the project's choice.
+        if ((typeof state.remoteCwd !== 'string' || state.remoteCwd === '') && !remoteLockedFor(state)) {
+          state.remoteCwd = lookupDir(workspaceOf(sessionId), remote.id)
+        }
+        cwd = await remoteCwdOf(state, remote)
+      }
       const snapshot = launchSnapshot(state)
       const live = runs.get(sessionId)
       if (live !== undefined && !live.closed && live.snapshot === snapshot && hearsRun(live)) {
@@ -2848,8 +3208,15 @@ return {
         // reader tailing a deleted log and a writer whose `cat > .../in`
         // silently recreates the fifo path as an ordinary file — the prompt
         // then goes nowhere and the turn waits forever. One `kill -0` per turn
-        // is cheap insurance.
-        if (await isAlive(live.brokerPid, remote)) return live
+        // is cheap insurance. Only a definite "no" tears the run down: when the
+        // link is frozen the probe cannot tell, and the run is far more likely
+        // fine than not — its writes already retry until the link is back.
+        const alive = await liveness(live.brokerPid, remote)
+        if (alive === 'yes') return live
+        if (alive === 'unknown') {
+          console.log('cc-mode: could not reach the broker for', sessionId, '— keeping the current Claude')
+          return live
+        }
         console.log('cc-mode: the broker for', sessionId, 'is gone — starting a fresh Claude and resuming')
         detach(sessionId)
       }
@@ -2859,9 +3226,33 @@ return {
 
       // Is a broker for this session already running, from before an update or
       // a restart? Then attach instead of starting a second Claude.
-      const meta = await readJsonFile(dir + '/meta.json', remote)
-      const exited = await readJsonFile(dir + '/exit.json', remote)
-      const brokerLives = meta !== null && exited === null && await isAlive(meta.brokerPid, remote)
+      // No answer is not "no broker". The branch below kills a broker and
+      // starts another, so every "no" it acts on has to be one the machine
+      // actually said. A tunnel being rebuilt says nothing for a few seconds;
+      // ask again through that before giving up on the turn.
+      let meta = null
+      let exited = null
+      let alive = 'no'
+      for (let attempt = 0; ; attempt += 1) {
+        meta = await readJsonFile(dir + '/meta.json', remote)
+        const present = meta === null ? await fileExistsOfShellWord(shellQuote(dir + '/meta.json'), remote) : 'yes'
+        let doubt = meta === null && present !== 'no'
+          ? 'meta.json ' + (present === 'yes' ? '读不出来' : '没有答复')
+          : ''
+        if (doubt.length === 0) {
+          exited = await readJsonFile(dir + '/exit.json', remote)
+          alive = meta !== null && exited === null ? await liveness(meta.brokerPid, remote) : 'no'
+          if (alive === 'unknown') doubt = 'broker 的死活没有答复'
+        }
+        if (doubt.length === 0) break
+        if (attempt >= LINK_RETRY_WAITS_MS.length || shuttingDown) {
+          throw new Error('cc-mode: 问不清目标机上这个对话有没有在跑的 Claude（' + doubt + '），不敢再起一个 — 稍后重发即可')
+        }
+        console.error('cc-mode:', sessionId, '启动前的确认没有答复（' + doubt + '），等链路恢复再问')
+        await new Promise((resolve) => armTimeout(resolve, LINK_RETRY_WAITS_MS[attempt]))
+        if (signal !== undefined && signal.aborted) throw new Error('cc-mode: 这一轮已被取消')
+      }
+      const brokerLives = alive === 'yes'
       const sameLaunch = meta !== null && meta.snapshot === snapshot
 
       if (live !== undefined) detach(sessionId)
@@ -2956,6 +3347,11 @@ return {
         argv.push('--model', state.model)
       }
       if (state.effort.length > 0) argv.push('--effort', state.effort)
+      // GenUI, as a skill on this one process — not in the system prompt.
+      const genuiBody = await genuiSkill()
+      if (genuiBody.length > 0 && await ensureGenuiSkill(remote, genuiBody)) {
+        argv.push('--plugin-dir', GENUI_PLUGIN_ROOT)
+      }
       // Multi-agent: hand this conversation the tools that open and drive OTHER
       // dsh conversations. The endpoint is addressed per conversation, so the
       // process cannot act as anyone but itself — which is why this is wired at
@@ -3209,6 +3605,8 @@ return {
             + 'kill ' + (typeof meta.brokerPid === 'number' ? meta.brokerPid : 0) + ' 2>/dev/null; true', remote, 5000)
         }
         await captureOn('rm -rf ' + shellQuote(dir), remote, 5000)
+        residentBrokers.delete(sessionId)
+        backgroundTaskCounts.delete(sessionId)
         console.log('cc-mode: reaped a Claude broker for', sessionId,
           '— idle', Math.round(idleMs / 60000), 'min'
           + (orphaned ? ', no live dsh session' : '') + (remote === null ? '' : ' @ ' + remote.id))
@@ -3216,10 +3614,22 @@ return {
     }
 
     /** End the Claude process for good — an explicit act, never a side effect. */
+    // What other plugins need to manage Claude processes without guessing:
+    // which conversations have one resident (attached at some point since
+    // this plugin started, not since stopped, reaped or seen to exit), and how
+    // much background work each last reported. agent-mesh's memory budget
+    // used to count every Claude-mode conversation as resident and every
+    // turn-less one as idle — so it kept "stopping" long-dead ones, and then
+    // stopped a live one whose background build was still running.
+    const residentBrokers = new Set()
+    const backgroundTaskCounts = new Map()
+
     async function stopRun(sessionId) {
       const dir = sessionDir(sessionId)
       const remote = remoteOf(stateOf(sessionId))
       detach(sessionId, false)
+      residentBrokers.delete(sessionId)
+      backgroundTaskCounts.delete(sessionId)
       const meta = await readJsonFile(dir + '/meta.json', remote)
       if (meta === null) return false
       await captureOn(
@@ -3731,8 +4141,8 @@ return {
     /**
      * 插件自己发给 Claude 的探测命令。
      *
-     * `/context` 由 probeContextWindow 自动发（每次启动、每次换模型），`/mcp`
-     * 由握手读取发——都走带外通道，人从来没敲过。Claude Code 仍然把它们当成
+     * `/context` 以前由插件在每轮之后自动发（现在改走旁路进程，不再进对话；
+     * 旧 transcript 里还留着），`/mcp` 由握手读取发——都走带外通道，人从来没敲过。Claude Code 仍然把它们当成
      * 普通的用户消息写进 transcript，于是导入一段对话时，这些问和答会作为
      * 「用户说的话」冒出来：一条谁也没发过的 /context，后面跟一张上下文表格。
      *
@@ -4204,29 +4614,85 @@ return {
      */
     const syncInFlight = new Map()
 
-    function syncImportedTranscript(sessionId, session) {
-      if (session === undefined || syncInFlight.has(sessionId)) return Promise.resolve(0)
+    /**
+     * How much of the tail a cursor-less conversation reads on a manual sync.
+     * Only ever used to FIND messages; duplicates are dropped by content, so
+     * reading too much costs a scan, not a doubled transcript.
+     */
+    const SYNC_BOOTSTRAP_TAIL = 2000000
+
+    /** The text of every message already in dsh's own log. */
+    function renderedTexts(session) {
+      const texts = new Set()
+      for (const event of sessionEvents(session)) {
+        if (event.type !== 'assistant/message' && event.type !== 'user/message') continue
+        const message = event.data === undefined || event.data === null ? undefined : event.data.message
+        const content = message === undefined || message === null ? undefined : message.content
+        if (!Array.isArray(content)) continue
+        for (const block of content) {
+          if (block === null || typeof block !== 'object') continue
+          if (block.type !== 'text' && block.type !== 'reasoning') continue
+          const text = typeof block.text === 'string' ? block.text.trim() : ''
+          if (text.length > 0) texts.add(text)
+        }
+      }
+      return texts
+    }
+
+    /**
+     * Mirror whatever another writer appended to this conversation's Claude
+     * transcript.
+     *
+     * `bootstrap` is the manual entry point (the ⋯ menu's 「同步终端那边的新消息」).
+     * It exists because only an IMPORTED conversation is born with a mirror
+     * cursor (`jsonlOffset`, the file's size at import). A conversation born in
+     * dsh never had one, and the cursor was this function's first gate — so
+     * `claude --resume`-ing such a conversation in a terminal produced output
+     * that could never reach dsh, with no way to ask for it. A cursor cannot
+     * simply be invented either: starting at 0 re-projects the whole history
+     * including everything dsh rendered live, and starting at the file's end
+     * drops exactly the terminal output being asked for. So a bootstrap pass
+     * reads the tail, drops anything whose tool call OR whose text dsh already
+     * has, and leaves the cursor at the file's end — after which the ordinary
+     * incremental path above works for this conversation like any other.
+     */
+    function syncTranscript(sessionId, session, bootstrap) {
+      if (session === undefined) return Promise.resolve({ written: 0, reason: 'no-session' })
+      if (syncInFlight.has(sessionId)) return Promise.resolve({ written: 0, reason: 'in-flight' })
       const state = stateOf(sessionId, session)
-      if (state.mode !== 'claude' || typeof state.jsonlOffset !== 'number') return Promise.resolve(0)
-      if (typeof state.claudeSessionId !== 'string' || state.claudeSessionId.length === 0) return Promise.resolve(0)
-      if (activeTurns.has(sessionId)) return Promise.resolve(0)
+      if (state.mode !== 'claude') return Promise.resolve({ written: 0, reason: 'not-claude' })
+      const hasCursor = typeof state.jsonlOffset === 'number'
+      if (!hasCursor && bootstrap !== true) return Promise.resolve({ written: 0, reason: 'no-cursor' })
+      if (typeof state.claudeSessionId !== 'string' || state.claudeSessionId.length === 0) {
+        return Promise.resolve({ written: 0, reason: 'no-claude-session' })
+      }
+      if (activeTurns.has(sessionId)) return Promise.resolve({ written: 0, reason: 'turn-running' })
       const cwd = projectCwd(sessionId, session)
-      if (typeof cwd !== 'string' || cwd.length === 0) return Promise.resolve(0)
+      if (typeof cwd !== 'string' || cwd.length === 0) return Promise.resolve({ written: 0, reason: 'no-cwd' })
 
       const work = (async () => {
         const path = '"$HOME"/.claude/projects/' + shellQuote(projectSlug(cwd)) + '/' + shellQuote(state.claudeSessionId + '.jsonl')
         const size = await fileSizeOfShellWord(path, remoteOf(state))
-        if (size <= state.jsonlOffset) return 0
+        if (size <= 0) return { written: 0, reason: 'no-transcript' }
+        const from = hasCursor ? state.jsonlOffset : Math.max(0, size - SYNC_BOOTSTRAP_TAIL)
+        if (size <= from) {
+          // Nothing new. A bootstrap still leaves the cursor behind, so the
+          // next terminal round syncs without being asked.
+          if (!hasCursor) { state.jsonlOffset = size; persistStates() }
+          return { written: 0, reason: 'up-to-date', bootstrapped: !hasCursor }
+        }
 
         const raw = await captureOn(
-          'tail -c +' + (state.jsonlOffset + 1) + ' ' + path + ' | head -c 3000000', remoteOf(state), 20000)
+          'tail -c +' + (from + 1) + ' ' + path + ' | head -c 3000000', remoteOf(state), 20000)
         const text = String(raw)
         // Only whole lines advance the offset — a line the terminal is mid-way
-        // through writing stays for the next pass.
+        // through writing stays for the next pass. A bootstrap starts mid-file,
+        // so its own first line is usually a fragment; it fails to parse and is
+        // skipped like any other unreadable row.
         const lastNewline = text.lastIndexOf('\n')
-        if (lastNewline === -1) return 0
+        if (lastNewline === -1) return { written: 0, reason: 'no-whole-line' }
         const consumed = text.slice(0, lastNewline + 1)
-        const newOffset = state.jsonlOffset + BYTES.encode(consumed).length
+        const newOffset = hasCursor ? from + BYTES.encode(consumed).length : size
 
         const rows = []
         for (const line of consumed.split('\n')) {
@@ -4240,7 +4706,7 @@ return {
         }
         state.jsonlOffset = newOffset
         persistStates()
-        if (rows.length === 0) return 0
+        if (rows.length === 0) return { written: 0, reason: 'nothing-to-mirror', bootstrapped: !hasCursor }
 
         // Whatever is left after the offset is genuinely someone else's
         // writing — the terminal side, while dsh was idle. Mirror it. The old
@@ -4256,30 +4722,46 @@ return {
             seenCalls.add(event.data.callId)
           }
         }
+        // A bootstrap pass starts from the tail rather than from a cursor, so
+        // most of what it reads is this side's own work. Tool calls alone are
+        // not enough to recognise it: a round that only talked has no call to
+        // key on. Text this conversation already shows is the other half.
+        const seenTexts = hasCursor ? null : renderedTexts(session)
         const unseen = rows.filter((event) => {
           const content = event.message.content
+          if (typeof content === 'string') {
+            return seenTexts === null || !seenTexts.has(content.trim())
+          }
           if (!Array.isArray(content)) return true
           for (const block of content) {
             if (block === null || typeof block !== 'object') continue
             const id = block.type === 'tool_use' ? block.id : (block.type === 'tool_result' ? block.tool_use_id : undefined)
             if (typeof id === 'string' && seenCalls.has(id)) return false
+            if (seenTexts !== null && block.type === 'text' && typeof block.text === 'string'
+              && seenTexts.has(block.text.trim())) return false
           }
           return true
         })
         if (unseen.length === 0) {
           console.log('cc-mode:', sessionId, 'transcript grew by', rows.length, 'row(s) this side already rendered')
-          return 0
+          return { written: 0, reason: 'already-rendered', bootstrapped: !hasCursor }
         }
         const written = queueProjection(sessionId, unseen, '')
-        console.log('cc-mode:', sessionId, 'mirrored', written, 'terminal message(s) into the imported conversation')
-        return written
+        console.log('cc-mode:', sessionId, 'mirrored', written, 'message(s) another writer appended'
+          + (hasCursor ? '' : ' (bootstrap pass)'))
+        return { written: written, reason: 'mirrored', bootstrapped: !hasCursor }
       })()
 
       syncInFlight.set(sessionId, work)
       return work.catch((error) => {
         console.error('cc-mode: transcript sync failed:', errorText(error))
-        return 0
+        return { written: 0, reason: 'failed', error: errorText(error) }
       }).finally(() => { syncInFlight.delete(sessionId) })
+    }
+
+    /** The automatic pass: incremental only, never a bootstrap. */
+    function syncImportedTranscript(sessionId, session) {
+      return syncTranscript(sessionId, session, false)
     }
 
     /**
@@ -4359,6 +4841,38 @@ return {
      */
     const drainInFlight = new Map()
 
+    /**
+     * Where reading this conversation's out.log picks up again: the recorded
+     * checkpoint, or — when there is none (a round that never reached one, a
+     * watchdog that cleared it) — the result line of the last call the dsh log
+     * has, which is where what dsh saw ends. null when neither is known.
+     * The drain and the live follow must agree on this: the follow used to
+     * start at the end of the file instead, and everything between the
+     * restart and the follow was never shown.
+     */
+    async function resumeOffsetOf(session, dir, remote) {
+      const attachState = await readJsonFile(dir + '/attach.json', remote)
+      if (attachState !== null && typeof attachState.offset === 'number') return attachState.offset
+      let callId = ''
+      const logged = sessionEvents(session)
+      for (let index = logged.length - 1; index >= 0; index -= 1) {
+        const event = logged[index]
+        if (event.type === 'tool/call' && event.data && typeof event.data.callId === 'string') {
+          callId = event.data.callId
+          break
+        }
+      }
+      if (callId.length === 0) return null
+      const lineNoRaw = await captureOn(
+        'grep -n -m1 -F ' + shellQuote('"tool_use_id":"' + callId + '"') + ' ' + shellQuote(dir + '/out.log') + ' | cut -d: -f1', remote, 15000)
+      const lineNo = parseInt(String(lineNoRaw).trim(), 10)
+      if (isNaN(lineNo) || lineNo < 1) return null
+      const offsetRaw = await captureOn(
+        'head -n ' + (lineNo - 1) + ' ' + shellQuote(dir + '/out.log') + ' | wc -c', remote, 15000)
+      const offset = parseInt(String(offsetRaw).trim(), 10)
+      return isNaN(offset) ? null : offset
+    }
+
     function drainDetachedOutput(sessionId, session) {
       if (session === undefined) return Promise.resolve(0)
       if (activeTurns.has(sessionId) || runs.has(sessionId) || drainInFlight.has(sessionId)) return Promise.resolve(0)
@@ -4368,34 +4882,13 @@ return {
       const dir = sessionDir(sessionId)
       const remote = remoteOf(state)
       const work = (async () => {
-        const meta = await readJsonFile(dir + '/meta.json', remote)
-        if (meta === null) return 0
-        const attachState = await readJsonFile(dir + '/attach.json', remote)
-        let offset = attachState !== null && typeof attachState.offset === 'number' ? attachState.offset : null
-        if (offset === null) {
-          // No recorded offset (the watchdog clears it on a stalled detach).
-          // Anchor on the call dsh's crash recovery settled as
-          // TOOL_OUTCOME_UNKNOWN: its REAL result is in the broker log, and
-          // everything from that line on is the missing tail.
-          let callId = ''
-          const logged = sessionEvents(session)
-          for (let index = logged.length - 1; index >= 0; index -= 1) {
-            const event = logged[index]
-            if (event.type === 'tool/call' && event.data && typeof event.data.callId === 'string') {
-              callId = event.data.callId
-              break
-            }
-          }
-          if (callId.length === 0) return 0
-          const lineNoRaw = await captureOn(
-            'grep -n -m1 -F ' + shellQuote('"tool_use_id":"' + callId + '"') + ' ' + shellQuote(dir + '/out.log') + ' | cut -d: -f1', remote, 15000)
-          const lineNo = parseInt(String(lineNoRaw).trim(), 10)
-          if (isNaN(lineNo) || lineNo < 1) return 0
-          const offsetRaw = await captureOn(
-            'head -n ' + (lineNo - 1) + ' ' + shellQuote(dir + '/out.log') + ' | wc -c', remote, 15000)
-          offset = parseInt(String(offsetRaw).trim(), 10)
-          if (isNaN(offset)) return 0
-        }
+        // Not gated on meta.json: stopping a Claude deletes it (stopRun), and
+        // a stop is exactly when unread output gets stranded — a turn dsh
+        // closed as interrupted on restart, whose answer Claude finished
+        // anyway, then an eviction before anyone opened the conversation.
+        // That answer was never drained. out.log is all a drain reads.
+        let offset = await resumeOffsetOf(session, dir, remote)
+        if (offset === null) return 0
         // Same as the live attach: an abandoned probe's round is not history.
         const pastCommand = await pastPendingCommand(sessionId)
         if (typeof pastCommand === 'number' && pastCommand > offset) offset = pastCommand
@@ -4463,7 +4956,7 @@ return {
         }
 
         const written = queueProjection(sessionId, fresh,
-          '（dsh 重启期间 Claude 继续完成了这一轮，以下是断档期间的内容。）')
+          '（这段是 Claude 在 dsh 没有跟着的时候说的——dsh 重启、插件更新或读取端断开都会这样——补录在这里。）')
         // 记的是「补到哪儿」，不是文件末尾：这一趟只补到了最后一个 result，
         // 后面若还有内容，下一趟才好接着补。记成 size 等于宣布那段不存在。
         await new Promise((resolve) => {
@@ -4514,6 +5007,11 @@ return {
     // indefinitely: this stops short of the reaper's 45 minutes, so a
     // conversation everyone has forgotten still becomes collectable.
     const IDLE_TASK_QUIET_MS = 30 * 60 * 1000
+    // Inside a round Claude opened on its own, silence is just a tool running:
+    // a foreground command reports nothing but a tool_progress every 30 s. The
+    // ten-second window above let go in the middle of such a round, and the
+    // half it had read was never projected.
+    const IDLE_ROUND_QUIET_MS = IDLE_TASK_QUIET_MS
     // One stretch of out.log per projection, matching the drain path's cap.
     const IDLE_STRETCH_MAX = 3000000
 
@@ -4766,6 +5264,8 @@ return {
         // reader existed.
         let tasksOpen = 0
         try { tasksOpen = await lastBackgroundTaskCount(run.dir, run.remote) } catch (error) { tasksOpen = 0 }
+        // Between a round's first line and its `result`.
+        let inRound = false
         let quiet = null
         let relieved = false
         const disarm = () => {
@@ -4787,7 +5287,7 @@ return {
             const waiter = run.waiter
             run.waiter = null
             if (waiter !== null && waiter !== undefined) waiter()
-          }, tasksOpen > 0 ? IDLE_TASK_QUIET_MS : IDLE_QUIET_MS)
+          }, inRound ? IDLE_ROUND_QUIET_MS : (tasksOpen > 0 ? IDLE_TASK_QUIET_MS : IDLE_QUIET_MS))
         }
 
         // The live agent for this session, when one is still registered (jobs
@@ -4842,9 +5342,15 @@ return {
           armQuiet()
           while (true) {
             const message = await idleNext(run)
+            if (message === undefined && run.readerDead === true && run.idleStop !== true
+              && await reattachReader(run)) continue
             if (message === undefined) break
             if (message === IDLE_STOPPED) { relieved = true; break }
-            if (message !== null && typeof message === 'object') await handle(message)
+            if (message !== null && typeof message === 'object') {
+              if (message.type === 'result') inRound = false
+              else if (message.type !== 'system' || message.subtype === 'init') inRound = true
+              await handle(message)
+            }
             // Something arrived, so the conversation is not quiet after all —
             // and `tasksOpen` may have just changed what quiet is worth.
             armQuiet()
@@ -4871,6 +5377,15 @@ return {
           // any session this plugin is still attached to, and drainDetachedOutput
           // picks up from the offset recorded here if Claude does speak again.
           if (run.idleExpired === true) {
+            // Record where projection stopped, not how far the pump read: bytes
+            // past `idleFrom` were never rendered, and a resume point beyond
+            // them would skip them for good. The drain re-reads from here and
+            // only ever projects whole rounds.
+            if (typeof run.idleFrom === 'number' && typeof run.consumed === 'number' && run.idleFrom < run.consumed) {
+              console.log('cc-mode:', sessionId, 'letting go with', run.consumed - run.idleFrom,
+                'unprojected byte(s) — the next drain starts at', run.idleFrom)
+              run.consumed = run.idleFrom
+            }
             console.log('cc-mode:', sessionId, 'went quiet — releasing the stream')
             detach(sessionId)
           }
@@ -4927,10 +5442,15 @@ return {
         // this was reading files, and two readers on one queue lose messages.
         if (runs.has(sessionId) || activeTurns.has(sessionId)) return false
 
-        const attachState = await readJsonFile(dir + '/attach.json', remote)
-        const offset = attachState !== null && typeof attachState.offset === 'number'
-          ? attachState.offset
-          : await fileSize(dir + '/out.log', remote)
+        const known = await resumeOffsetOf(session, dir, remote)
+        const offset = known !== null ? known : await fileSize(dir + '/out.log', remote)
+        // Nothing unread and no background work: Claude cannot speak up on its
+        // own, so a reader here only times out ten seconds later. The client
+        // asks every five, and each ask used to build and tear down a whole
+        // stream for every open conversation. When it does speak, the bytes
+        // past `offset` make the next ask follow (and drain what finished).
+        if (await nothingToFollow(dir, remote, offset)) return false
+        if (runs.has(sessionId) || activeTurns.has(sessionId)) return false
         const run = createRun(sessionId, dir, snapshot, meta.claudeSessionId, remote)
         run.brokerPid = meta.brokerPid
         run.cwd = meta.cwd || (session.header ? session.header.cwd : '')
@@ -4946,6 +5466,26 @@ return {
         console.error('cc-mode: could not follow the live Claude again:', errorText(error))
         return false
       }).finally(() => { followInFlight.delete(sessionId) })
+    }
+
+    /**
+     * True only when the log provably has nothing past `offset` and its last
+     * word on background work was "none". An unanswered probe is NOT nothing:
+     * it answers false, and the caller follows as it always did.
+     */
+    async function nothingToFollow(dir, remote, offset) {
+      const log = shellQuote(dir + '/out.log')
+      const raw = String(await captureOn('printf "probe "; (stat -c %s ' + log + ' 2>/dev/null || stat -f %z ' + log + ')'
+        + ' && tail -c 2000000 ' + log + ' | grep -F \'"background_tasks_changed"\' | tail -1', remote, 10000))
+      const match = /^probe (\d+)\n?([^]*)$/.exec(raw.trim())
+      if (match === null) return false
+      if (Number(match[1]) > offset) return false
+      const line = match[2].trim()
+      if (line.length === 0) return true
+      try {
+        const value = JSON.parse(line)
+        return !(Array.isArray(value.tasks) && value.tasks.length > 0)
+      } catch (error) { return false }
     }
 
     /** Relieve the idle reader and wait until it has actually let go. */
@@ -4972,6 +5512,17 @@ return {
     // the content is written into that turn. No model call is made.
     const pendingProjections = new Map()
 
+    /** Render whatever projection is queued for this session into `turn`. */
+    function renderPendingProjections(session, sessionId, turn) {
+      const queued = pendingProjections.get(sessionId)
+      if (queued === undefined || queued.length === 0) return 0
+      pendingProjections.delete(sessionId)
+      let total = 0
+      for (const batch of queued) total += projectClaudeEvents(session, batch.rows, batch.notice, turn)
+      console.log('cc-mode: rendered', total, 'projected message(s) into turn', turn, 'on', sessionId)
+      return total
+    }
+
     function queueProjection(sessionId, rows, notice) {
       if ((rows === undefined || rows.length === 0) && (notice === undefined || notice.length === 0)) return 0
       const queued = pendingProjections.get(sessionId) || []
@@ -4992,7 +5543,14 @@ return {
     /**
      * Ask dsh to open a turn this plugin can render into — but only when it can
      * actually be claimed. A turn already running will render the queue itself
-     * when it starts the next one, and its own end re-checks.
+     * when it starts the next one, and dsh going idle re-checks (agent/status).
+     *
+     * "Running" is dsh's word, not this plugin's: activeTurns is set only once
+     * a turn has its Claude, and cleared before dsh closes the turn. A carrier
+     * sent in either gap lands in a running loop — and dsh 0.2 does not start a
+     * turn for followups queued during one that ended 'blocked', so it sat in
+     * the composer as `claude-in-dsh:render-pending`, carriersInFlight stayed
+     * set, and every later projection for that conversation waited behind it.
      */
     function wakeForProjection(sessionId) {
       if (agents === undefined) return
@@ -5002,13 +5560,14 @@ return {
       let agent
       try { agent = agents.get(sessionId) } catch (error) { agent = undefined }
       if (agent === undefined || typeof agent.followup !== 'function') return
+      if (agent.status === 'running') return
       carriersInFlight.add(sessionId)
       try {
         agent.followup({
           id: uuid(),
           role: 'user',
           content: [{ type: 'text', text: CARRIER_TEXT }],
-          source: { kind: 'plugin', plugin: 'claude-in-dsh' },
+          source: { kind: 'plugin:claude-in-dsh' },
         })
       } catch (error) {
         carriersInFlight.delete(sessionId)
@@ -5088,6 +5647,32 @@ return {
       let written = 0
       // 跳过一条探测命令之后，紧跟着的那一条回答也一起吞掉（探测是一问一答）。
       let skippingProbe = false
+      // Claude logs one line per content block, so one API message — several
+      // parallel tool calls — arrives as several rows sharing message.id. Each
+      // row used to open its own step, and a step then closed on a call whose
+      // result sat in the next one: format v4 refuses that ("step/end leaves
+      // unresolved tool call") and the whole conversation stops loading. Rows
+      // of one message are held and written as one step, as a live turn does.
+      let held = null
+      const flushHeld = () => {
+        if (held === null) return
+        const message = held
+        held = null
+        if (message.blocks.length === 0) return
+        openStep()
+        // 这些是从 out.log 的字节区间补投出来的消息，原始流没有留在手边。
+        append('assistant/message', { turn: turn, step: step, message: {
+          id: uuid(), role: 'assistant', content: message.blocks,
+          source: { kind: 'model', provider: PROVIDER, model: message.model || 'claude-code' },
+        }, stream: [] })
+        written += 1
+        for (const block of message.blocks) {
+          if (block.type !== 'tool-call') continue
+          knownCallIds.add(block.id)
+          openedHere.push(block.id)
+          append('tool/call', { turn: turn, step: step, callId: block.id, name: block.name, arguments: block.arguments })
+        }
+      }
       for (const event of kept) {
         const message = event.message
         const content = typeof message.content === 'string'
@@ -5095,6 +5680,7 @@ return {
           : (Array.isArray(message.content) ? message.content : [])
 
         if (event.type === 'user') {
+          flushHeld()
           const results = content.filter((block) => block && block.type === 'tool_result')
           if (results.length > 0) {
             for (const block of results) {
@@ -5104,16 +5690,21 @@ return {
               if (answeredCallIds.has(resultFor)) continue
               answeredCallIds.add(resultFor)
               if (!stepOpen) openStep()
-              append('tool/result', { turn: turn, step: step, message: {
-                id: uuid(), role: 'user',
-                source: { kind: 'tool', callId: resultFor },
-                content: [{
-                  type: 'tool-result',
-                  toolCallId: resultFor,
-                  content: resultBlocksOf(block.content),
-                  isError: block.is_error === true,
-                }],
-              } })
+              if (!knownCallIds.has(resultFor)) {
+                // Its call was never written — the stretch began mid-round.
+                // Format v4 refuses a result that settles no advertised call
+                // (the whole log stops loading), so its output rides along as
+                // text instead of being lost.
+                const output = resultBlocksOf(block.content).map((part) => part.text).join('\n').trim()
+                append('assistant/message', { turn: turn, step: step, message: {
+                  id: uuid(), role: 'assistant',
+                  content: [{ type: 'text', text: '（一个工具调用的开头没接上，这是它的输出）\n\n' + (output.length > 0 ? output : '（空）') }],
+                  source: { kind: 'model', provider: PROVIDER, model: NOTICE_MODEL },
+                }, stream: [] })
+                written += 1
+                continue
+              }
+              append('tool/result', { turn: turn, step: step, message: toolResultMessage(resultFor, resultBlocksOf(block.content), block.is_error === true) })
               written += 1
             }
             continue
@@ -5146,38 +5737,28 @@ return {
         if (skippingProbe) { skippingProbe = false; continue }
         const blocks = assistantBlocksOf(content)
           .filter((block) => block.type !== 'tool-call' || !knownCallIds.has(block.id))
-        if (blocks.length === 0) continue
-        openStep()
-        // 这些是从 out.log 的字节区间补投出来的消息，原始流没有留在手边。
-        append('assistant/message', { turn: turn, step: step, message: {
-          id: uuid(), role: 'assistant', content: blocks,
-          source: { kind: 'model', provider: PROVIDER, model: message.model || 'claude-code' },
-        }, stream: [] })
-        written += 1
-        for (const block of blocks) {
-          if (block.type !== 'tool-call') continue
-          knownCallIds.add(block.id)
-          openedHere.push(block.id)
-          append('tool/call', { turn: turn, step: step, callId: block.id, name: block.name, arguments: block.arguments })
+        const id = typeof message.id === 'string' && message.id.length > 0 ? message.id : undefined
+        if (held !== null && id !== undefined && held.id === id) {
+          for (const block of blocks) {
+            if (block.type === 'tool-call' && held.blocks.some((other) => other.type === 'tool-call' && other.id === block.id)) continue
+            held.blocks.push(block)
+          }
+          continue
         }
+        flushHeld()
+        held = { id: id, model: message.model, blocks: blocks }
       }
+      flushHeld()
 
-      closeStep()
       // Only calls this projection opened and could not answer; the session-wide
-      // teardown would stamp every older unanswered call red.
+      // teardown would stamp every older unanswered call red. Inside the step,
+      // before it closes: v4 refuses a result outside an open step.
       for (const callId of openedHere) {
         if (answeredCallIds.has(callId)) continue
-        append('tool/result', { turn: turn, step: step, message: {
-          id: uuid(), role: 'user',
-          source: { kind: 'tool', callId: callId },
-          content: [{
-            type: 'tool-result',
-            toolCallId: callId,
-            content: [{ type: 'text', text: '这次调用没有等到结果（上一次运行被中断）。' }],
-            isError: true,
-          }],
-        } })
+        if (!stepOpen) openStep()
+        append('tool/result', { turn: turn, step: step, message: toolResultMessage(callId, [{ type: 'text', text: '这次调用没有等到结果（上一次运行被中断）。' }], true) })
       }
+      closeStep()
       return written
     }
 
@@ -5752,7 +6333,7 @@ return {
         const args = dshToolArgs(productName, block.input === undefined ? {} : block.input)
         run.subCallParent.set(subCallId, parentCallId)
         run.subCallInfo.set(subCallId, { name: name, arguments: args })
-        session.append('tool/code-dispatch-start', {
+        session.append('tool/ptc-dispatch-start', {
           rootCallId: rootCallOf(run, parentCallId),
           parentCallId: parentCallId,
           subCallId: subCallId,
@@ -5769,7 +6350,7 @@ return {
         const subCallId = String(block.tool_use_id || '')
         const info = run.subCallInfo.get(subCallId) || { name: 'tool', arguments: {} }
         run.subCallInfo.delete(subCallId)
-        session.append('tool/code-dispatch', {
+        session.append('tool/ptc-dispatch', {
           rootCallId: rootCallOf(run, parentCallId),
           parentCallId: parentCallId,
           subCallId: subCallId,
@@ -5930,6 +6511,13 @@ return {
 
     /** Open the next step of the child's single turn — the main transcript's bracket. */
     function ccChildStep(record) {
+      // Same rule as the main transcript: a step holding an unanswered call
+      // cannot close (format v4), so the next message joins it instead. The
+      // CLI splits one message into an event per block, and parallel calls
+      // used to land in two steps — the first closing with its call open.
+      if (record.stepOpen) {
+        for (const entry of record.pending) if (entry[1] === record.step) return record.step
+      }
       ccChildCloseStep(record)
       record.step += 1
       ccChildAppend(record, 'step/start', { turn: 1, step: record.step })
@@ -5988,17 +6576,7 @@ return {
         ccChildAppend(record, 'tool/result', {
           turn: 1,
           step: record.stepOpen ? record.step : ccChildStep(record),
-          message: {
-            id: uuid(),
-            role: 'user',
-            source: { kind: 'tool', callId: subCallId },
-            content: [{
-              type: 'tool-result',
-              toolCallId: subCallId,
-              content: resultBlocksOf(block.content),
-              isError: block.is_error === true,
-            }],
-          },
+          message: toolResultMessage(subCallId, resultBlocksOf(block.content), block.is_error === true),
         })
       }
     }
@@ -6046,7 +6624,9 @@ return {
         entry.job = jobs.start({
           kind: 'claude-task',
           label: entry.label,
-          owner: agent,
+          // dsh 0.2 names the owner (and every caller) by session id; an agent
+          // object here stringifies to "[object Object]" and the row is refused.
+          owner: String(agent.id),
           run: () => ({
             cancel: () => {
               // Best-effort: ask the running CLI to stop the task. The broker
@@ -6068,7 +6648,7 @@ return {
       // shared tool-jobs completion notice stays away: the task_notification
       // already wakes Claude's own round, and a second, dsh-side "job
       // finished" user message would steer a duplicate turn into the product.
-      try { void jobs.wait(entry.job, 24 * 3600 * 1000, agent).catch(() => undefined) } catch (error) { /* best effort */ }
+      try { void jobs.wait(entry.job, 24 * 3600 * 1000, String(agent.id)).catch(() => undefined) } catch (error) { /* best effort */ }
       run.ccTasks.set(taskId, entry)
     }
 
@@ -6087,18 +6667,9 @@ return {
         record.answered.add(callId)
         ccChildAppend(record, 'tool/result', {
           turn: 1,
-          step: record.stepOpen ? record.step : entry[1],
-          message: {
-            id: uuid(),
-            role: 'user',
-            source: { kind: 'tool', callId: callId },
-            content: [{
-              type: 'tool-result',
-              toolCallId: callId,
-              content: [{ type: 'text', text: '这次调用没有等到结果（子代理的这一轮被中断）。' }],
-              isError: true,
-            }],
-          },
+          // An open step (format v4), never the one the call was made in.
+          step: record.stepOpen ? record.step : ccChildStep(record),
+          message: toolResultMessage(callId, [{ type: 'text', text: '这次调用没有等到结果（子代理的这一轮被中断）。' }], true),
         })
       }
       record.pending.clear()
@@ -6192,7 +6763,14 @@ return {
 
     function carriesRuntimeNoise(message) {
       const source = message.source
-      return source !== undefined && source.kind === 'plugin' && RUNTIME_NOISE.has(source.plugin)
+      if (source === undefined || typeof source.kind !== 'string') return false
+      // Format v4 retired { kind: 'plugin', plugin }: first-party producers now
+      // stamp their own name as the kind, any other plugin is 'plugin:<name>'.
+      // Older logs still carry the v3 spelling.
+      const producer = source.kind === 'plugin' ? source.plugin
+        : source.kind.indexOf('plugin:') === 0 ? source.kind.slice(7)
+        : source.kind
+      return RUNTIME_NOISE.has(producer)
     }
 
     /**
@@ -6272,10 +6850,17 @@ return {
      * header naming a provider dsh can actually serve, so the session can prompt
      * again. A no-op for sessions that were never poisoned.
      */
-    function repairHeader(session) {
+    function repairHeader(session, agent) {
       const current = session.requestHeader()
       if (current === undefined || current.config === undefined) return false
       if (current.config.provider !== PROVIDER) return false
+      // Format v4 admits request/header only inside an open turn; one written
+      // from the engine picker (always between turns) makes the whole log
+      // unreadable. Better an unrepaired header than an unopenable session.
+      if (agent === undefined || agent.status !== 'running') {
+        console.error('cc-mode: this session still carries a Claude request header — pick a model in DSH mode to replace it')
+        return false
+      }
       const events = sessionEvents(session)
       for (let index = events.length - 1; index >= 0; index -= 1) {
         const event = events[index]
@@ -6288,6 +6873,17 @@ return {
       }
       console.error('cc-mode: this session has no pre-Claude model header to restore — pick a model in DSH mode')
       return false
+    }
+
+    /**
+     * Count a prompt the running turn is about to write as owed an echo.
+     * A line starting with "/" is a slash command: the CLI runs it rather than
+     * echoing it, so it is never owed.
+     */
+    function owePromptReplay(active, text) {
+      if (typeof text === 'string' && text.trimStart().startsWith('/')) return false
+      active.owedReplays += 1
+      return true
     }
 
     /** Whether this run has produced anything at all since it was attached. */
@@ -6306,12 +6902,7 @@ return {
       // projection into THIS turn (dsh numbered it, so every start sits in the
       // window with its updates) and end the turn without touching Claude.
       if (messages.some((message) => isCarrier(message))) carriersInFlight.delete(sessionId)
-      const queued = pendingProjections.get(sessionId)
-      if (queued !== undefined && queued.length > 0) {
-        pendingProjections.delete(sessionId)
-        let total = 0
-        for (const batch of queued) total += projectClaudeEvents(session, batch.rows, batch.notice, turn)
-        console.log('cc-mode: rendered', total, 'projected message(s) into turn', turn, 'on', sessionId)
+      if (renderPendingProjections(session, sessionId, turn) > 0) {
         // Anything the user actually said in the same wake still deserves a
         // real turn: fall through only when there is nothing human here.
         if (!hasHumanMessage(messages)) return
@@ -6402,6 +6993,11 @@ return {
           // over what it saw — before this turn starts shifting the same queue.
           stage = 'stop-idle-drain'
           await stopIdleDrain(runs.get(sessionId))
+          // Relieving it mid-round projects the half round it was reading —
+          // what Claude did on its own just before this prompt. It belongs in
+          // this turn, ahead of the answer; queued for a carrier it would land
+          // after it, in a turn of its own.
+          renderPendingProjections(session, sessionId, turn)
           stage = 'ensure-run'
           run = await ensureRun(sessionId, cwd, signal)
         } catch (error) {
@@ -6410,7 +7006,13 @@ return {
         }
       } finally { try { stuckWatch() } catch (error) { /* already fired */ } }
       const transcript = createTranscript(session, turn)
-      activeTurns.set(sessionId, { turn: turn, run: run, transcript: transcript })
+      // Prompts this turn wrote that Claude has not yet echoed back (it runs
+      // with --replay-user-messages). A `result` while one is still owed closes
+      // a round that began BEFORE this turn's prompt was picked up — a round
+      // Claude opened on its own when a background task finished. Ending the
+      // turn on it used to hand the prompt's real answer to nobody.
+      const active = { turn: turn, run: run, transcript: transcript, owedReplays: 0 }
+      activeTurns.set(sessionId, active)
 
       let interrupted = false
       let abortedAt = 0
@@ -6421,6 +7023,13 @@ return {
       let roundEndsAt
       // How many times this turn was resumed after waiting out a usage limit.
       let continues = 0
+      // A safety classifier stopped a response this turn (a `message_delta`
+      // whose stop_reason is "refusal"; see refusalNote), and whether the turn
+      // has already told dsh so. Both shapes — fallback retry and a refusal
+      // that stands — begin with that delta, so this is the catch-all; the
+      // `model_refusal_fallback` event below adds the richer wording.
+      let refusalSeen = false
+      let refusalNoted = false
       const onAbort = () => {
         if (interrupted) return
         interrupted = true
@@ -6445,6 +7054,18 @@ return {
         console.log('cc-mode: turn', turn, 'armed for cancel on', sessionId)
       }
 
+      // A result skipped while this turn still owed an echo, and the timer that
+      // ends the turn on it anyway if the echo never comes. A prompt the CLI
+      // does not replay would otherwise hold the turn open forever — and the
+      // watchdog stays quiet, because output DID arrive.
+      let heldResult = null
+      let heldTimer = null
+      const releaseHeld = () => { if (heldTimer !== null) { heldTimer(); heldTimer = null } }
+      const armHeld = () => {
+        releaseHeld()
+        heldTimer = armTimeout(() => { heldTimer = null; run.push(OWED_ECHO_TIMEOUT) }, OWED_ECHO_GRACE_MS)
+      }
+
       try {
         // Terminal Claude records every typed prompt here; a -p session does not,
         // and that index is exactly what `claude --resume` lists.
@@ -6457,6 +7078,9 @@ return {
         for (const image of images) {
           promptContent.push({ type: 'image', source: { type: 'base64', media_type: image.mediaType, data: image.data } })
         }
+        // Owed before the write, not after: the echo can come back before the
+        // write's own promise does.
+        owePromptReplay(active, prompt)
         await run.write({
           type: 'user',
           message: { role: 'user', content: promptContent },
@@ -6498,6 +7122,21 @@ return {
 
         while (true) {
           const message = await run.next()
+          releaseHeld()
+          if (message === OWED_ECHO_TIMEOUT) {
+            if (heldResult === null) continue
+            console.error('cc-mode:', sessionId, 'turn', turn, '— waited', OWED_ECHO_GRACE_MS / 1000,
+              's for Claude to echo', active.owedReplays, 'prompt(s); ending the turn on the last result instead')
+            active.owedReplays = 0
+            roundEndsAt = heldResult.ccmodeOffset
+            return
+          }
+          // The echo came: whatever result ends the turn now is its own.
+          if (message !== undefined && message.type === 'user' && message.isReplay === true) heldResult = null
+          // The grace counts from the last sign of life, not from the result.
+          if (heldResult !== null) armHeld()
+          if (message === undefined && run.readerDead === true && !interrupted && !signal.aborted
+            && await reattachReader(run)) continue
           if (message === undefined) {
             if (!acknowledgedAtLeastOnce(run) && !shuttingDown) {
               throw new Error(run.readerDead === true
@@ -6553,6 +7192,13 @@ return {
                   + before.toLocaleString('en-US') + ' → ' + after.toLocaleString('en-US') + ' tokens')
               }
             }
+            // A safety classifier stopped the response; the CLI retries on the
+            // named fallback within this same turn. Say so instead of leaving
+            // dsh silent through the switch (refusalNote owns the wording).
+            if (message.subtype === 'model_refusal_fallback' && parent === null) {
+              const text = refusalNote(message)
+              if (text !== null) { transcript.note(text); refusalNoted = true }
+            }
             continue
           }
           if (message.type === 'control_request') {
@@ -6565,6 +7211,11 @@ return {
             continue
           }
           if (message.type === 'stream_event') {
+            const event = message.event
+            if (event !== null && event !== undefined && event.type === 'message_delta'
+              && event.delta !== null && event.delta !== undefined && event.delta.stop_reason === 'refusal') {
+              refusalSeen = true
+            }
             if (parent === null) transcript.streamEvent(message.event)
             continue
           }
@@ -6580,21 +7231,47 @@ return {
             continue
           }
           if (message.type === 'user') {
+            if (message.isReplay === true && parent === null && active.owedReplays > 0) active.owedReplays -= 1
             if (message.isReplay === true || machineryRow(message)) continue
-            if (parent === null) transcript.toolResults(message.message || {})
-            else {
+            if (parent === null) {
+              transcript.toolResults(message.message || {})
+              // Everything up to this line is in the log now: a tool result
+              // flushes the message that asked for it first. Checkpointing only
+              // at a round's result left a long round (95 steps, no result yet)
+              // with no offset at all, so a dsh restart mid-round resumed at the
+              // end of out.log and everything Claude said meanwhile was never
+              // shown. Replaying from here is safe: projection skips calls and
+              // results the log already has.
+              checkpointAt(run, message.ccmodeOffset)
+            } else {
               subagentResults(session, run, parent, message.message || {})
               mirrorParentedResult(run, parent, message.message || {})
             }
             continue
           }
+          if (message.type === 'result' && active.owedReplays > 0 && !interrupted && !signal.aborted) {
+            console.log('cc-mode:', sessionId, 'turn', turn, '— a round Claude opened on its own ended before it picked up',
+              active.owedReplays, 'prompt(s) of this turn; still waiting for the answer')
+            heldResult = message
+            armHeld()
+            continue
+          }
           if (message.type === 'result') {
+            noteContextWindow(sessionId, session, message)
             // Some slash commands answer in the result alone. Nothing rendered
             // plus a result carrying text is exactly that case — show it rather
             // than closing a turn that looks like it did nothing.
             const resultText = typeof message.result === 'string' ? message.result : ''
             if (message.is_error !== true && resultText.length > 0 && !transcript.hadAssistant()) {
               transcript.assistantMessage({ content: [{ type: 'text', text: resultText }], model: 'claude-code' })
+            }
+            // A refusal that stands (a category with no fallback) ends the turn
+            // with a non-error, empty result: no fallback event fired and no
+            // text was rendered, so without this the turn is simply blank.
+            if (refusalSeen && !refusalNoted && message.is_error !== true
+              && resultText.length === 0 && !transcript.hadAssistant()) {
+              transcript.note('⚠ 安全防护拦下了这段回复 · 这一轮没有产出，换个说法再发一次')
+              refusalNoted = true
             }
             // An interrupt makes the product report an error result; that is the
             // cancel the user asked for, not a failure worth a transcript notice.
@@ -6627,6 +7304,7 @@ return {
         }
       } finally {
         done = true
+        releaseHeld()
         // Claude appends this turn to its own transcript too. The mirror
         // compares that file against a recorded offset, so without advancing
         // it here the plugin reads its OWN output back and reports it as
@@ -6647,7 +7325,6 @@ return {
         armTimeout(() => { syncClaudeTitle(sessionId, session).catch(() => undefined) }, 5000)
         // `force`: the window is cached per model choice, but the composition
         // moved with this very turn — the panel should not open on last turn's.
-        if (run.cwd) probeContextWindow(sessionId, run.cwd, true).catch(() => undefined)
         if (cancelKill !== null) { try { cancelKill() } catch (error) { /* fired */ } }
         signal.removeEventListener('abort', onAbort)
         transcript.finish()
@@ -6774,10 +7451,18 @@ return {
           continue
         }
         try {
+          const owed = owePromptReplay(active, text)
           active.run.write({
             type: 'user',
             message: { role: 'user', content: content },
             parent_tool_use_id: null,
+          }).then((landed) => {
+            if (landed === true) return
+            // Never landed, so never echoed: an owed echo that cannot come
+            // would hold the turn open past its real end.
+            if (owed) active.owedReplays = Math.max(0, active.owedReplays - 1)
+            // The person saw it go out; say plainly that Claude did not get it.
+            safely('steer note', () => active.transcript.note('⚠ 上面这句插话没能送到 Claude（和目标机的连接断了），需要的话请重发'))
           })
           console.log('cc-mode: steered the running turn' + (images.length > 0 ? ' with ' + images.length + ' image(s)' : ''))
         } catch (error) {
@@ -6785,6 +7470,36 @@ return {
         }
       }
     })
+
+    // dsh going idle is the moment to pick up anything that queued behind the
+    // turn that just ended. Deferred a tick: this fires from inside the loop's
+    // own phase change, and waking it there would race the driver it leaves.
+    ctx.on('agent/status', ({ agent, status }) => {
+      if (status === 'running' || agent === undefined) return
+      const sessionId = String(agent.id)
+      Promise.resolve().then(() => {
+        wakeForProjection(sessionId)
+        resumeQueuedTurns(agent, sessionId)
+      })
+    })
+
+    /**
+     * Run what the person queued while Claude was working.
+     *
+     * dsh 0.2's loop goes on to the next queued message only when a turn ends
+     * on its own; a turn whose pre-step answered `reject` — every Claude turn
+     * — returns straight out and leaves the queue standing. Messages typed
+     * while Claude worked sat under the composer as "N 条排队消息" and never
+     * ran. One wake claims one queued message; the next idle wakes again.
+     */
+    function resumeQueuedTurns(agent, sessionId) {
+      if (stateOf(sessionId).mode !== 'claude') return
+      if (agent.status === 'running' || typeof agent.wakeDriver !== 'function') return
+      const inbox = agent.inbox
+      if (inbox === undefined || inbox.hasPending !== true) return
+      console.log('cc-mode:', sessionId, 'running the', inbox.nextTurn.length, 'message(s) queued behind the last turn')
+      try { agent.wakeDriver() } catch (error) { console.error('cc-mode: could not run the queued messages:', errorText(error)) }
+    }
 
     // ---------- the seam ----------
 
@@ -6798,7 +7513,9 @@ return {
       } catch (error) {
         if (!payload.signal.aborted) {
           try {
-            const step = 900
+            // The next step of this turn — v4 refuses any other number, and
+            // a turn that failed partway already used some.
+            const step = lastStepOf(agent.session, payload.turn) + 1
             agent.session.append('step/start', { turn: payload.turn, step: step })
             agent.session.append('assistant/message', {
               turn: payload.turn,
@@ -6868,6 +7585,8 @@ return {
         route: state.route === undefined ? null : state.route,
         effort: state.effort,
         running: run !== undefined && run.reader !== null && !run.closed,
+        resident: residentBrokers.has(sessionId),
+        backgroundTasks: backgroundTaskCounts.get(sessionId) || 0,
         // A cold conversation still has one — the sidebar's "copy the resume id"
         // entry asks for exactly the sessions that are not running.
         claudeSessionId: run !== undefined && run.claudeSessionId
@@ -6916,6 +7635,12 @@ return {
         drainDetachedOutput(sessionId, session)
           .then(() => resumeIdleFollow(sessionId, session))
           .catch(() => undefined)
+        // A queue left standing by an earlier run of this plugin has no status
+        // change coming to start it; being looked at is the next best moment.
+        try {
+          const agent = agents === undefined ? undefined : agents.get(sessionId)
+          if (agent !== undefined) resumeQueuedTurns(agent, sessionId)
+        } catch (error) { /* no live agent */ }
         // A round whose title was not on disk yet when the turn looked.
         syncClaudeTitle(sessionId, session).catch(() => undefined)
         // Likewise for an imported conversation's terminal side.
@@ -7010,6 +7735,9 @@ return {
           } else {
             state.remote = args.remote
           }
+          // Same rule as setRemote: a directory on the old machine means
+          // nothing on the new one, and this project may have one remembered.
+          if (state.remote === args.remote) state.remoteCwd = lookupDir(workspaceOf(sessionId), args.remote)
         }
         // Same lock as the target itself: the conversation's transcript is
         // filed under its project directory, so moving it strands the history.
@@ -7029,7 +7757,7 @@ return {
         if (agents !== undefined) {
           try {
             const agent = agents.get(sessionId)
-            if (agent !== undefined) repairHeader(agent.session)
+            if (agent !== undefined) repairHeader(agent.session, agent)
           } catch (error) {
             console.error('cc-mode: header repair failed:', errorText(error))
           }
@@ -7228,29 +7956,29 @@ return {
        * stream, so a refresh simply does not happen then — the panel keeps the
        * last honest answer instead of blocking or lying.
        */
-      harness.handle('context.breakdown', (args) => {
+      harness.handle('context.breakdown', async (args) => {
         const sessionId = String(args.sessionId || '')
-        const state = stateOf(sessionId, sessionOf(sessionId))
+        const session = sessionOf(sessionId)
+        const state = stateOf(sessionId, session)
         if (state.mode !== 'claude') return { known: false }
-        const report = contextReports.get(sessionId)
-        const stale = report === undefined || Date.now() - report.at > 30000
-        if (stale && args.refresh !== false) {
-          const session = sessionOf(sessionId)
-          const run = runs.get(sessionId)
-          const cwd = run !== undefined && typeof run.cwd === 'string' && run.cwd.length > 0
-            ? run.cwd
-            : (session !== undefined && session.header ? session.header.cwd : '')
-          if (typeof cwd === 'string' && cwd.length > 0) {
-            probeContextWindow(sessionId, cwd, true).catch(() => undefined)
-          }
-        }
-        if (report === undefined) return { known: false }
+        const total = contextTokensOf(session)
+        if (total === 0) return { known: false }
+        // Where its Claude runs, by the same rule ensureRun launches it with —
+        // not from a live run, which there is none of until the first turn
+        // after a restart.
+        const run = runs.get(sessionId)
+        const remote = remoteOf(state)
+        let cwd = run !== undefined && typeof run.cwd === 'string' ? run.cwd : ''
+        if (cwd.length === 0) cwd = remote === null ? workspaceOf(sessionId) : await remoteCwdOf(state, remote).catch(() => '')
+        if (cwd.length === 0) return { known: false }
+        const composition = await probeComposition(sessionId, cwd).catch(() => undefined)
+        if (composition === undefined) return { known: false }
         return {
           known: true,
-          systemTokens: report.system,
-          toolsTokens: report.tools,
-          messageTokens: report.messages,
-          at: report.at,
+          systemTokens: composition.system,
+          toolsTokens: composition.tools,
+          messageTokens: Math.max(0, total - composition.system - composition.tools),
+          at: Date.now(),
         }
       }),
 
@@ -7272,12 +8000,19 @@ return {
        */
       harness.handle('claude.sources', async (args) => {
         const sessionId = String(args.sessionId || '')
-        const workspace = workspaceOf(sessionId)
+        // 刚建的空会话，dsh 可能还没把它交过来，认不出项目；客户端带来的 cwd
+        // 就是这个项目的本机目录，用它认。
+        const workspace = workspaceOf(sessionId) || String(args.cwd || '')
         const here = String(args.cwd || workspace || '')
+        // 这个会话自己在目录芯片上选过的目录，比项目记忆更新——选完目录再点导入，
+        // 列的就该是那里的对话。只读不建：不为一次浏览凭空造出会话状态。
+        const own = states.get(sessionId)
+        const chosen = own !== undefined && typeof own.remoteCwd === 'string' ? own.remoteCwd : ''
         const targets = [...REMOTES.values()]
         // 并行问，否则几个目标的 home 查询会一个接一个地串起来等。
         const resolved = await Promise.all(targets.map(async (remote) => {
-          let cwd = lookupDir(workspace, remote.id) || remote.dir
+          const mine = chosen.length > 0 && own.remote === remote.id ? chosen : ''
+          let cwd = mine || lookupDir(workspace, remote.id) || remote.dir
           if (cwd.length === 0) {
             try { cwd = await remoteHome(remote) } catch (error) { cwd = '' }
           }
@@ -7302,6 +8037,24 @@ return {
         String(args.cwd || ''), String(args.claudeSessionId || ''), 40, browsingRemote(args))),
 
       /** Adopt an existing Claude conversation into this (blank) dsh session. */
+      /**
+       * Pull in whatever another writer appended to this conversation's Claude
+       * transcript — the ⋯ menu's sync entry.
+       *
+       * The case it serves: a conversation driven here, then picked up in a
+       * terminal with `claude --resume <uuid>`. Both write the same transcript
+       * file, and until now only an IMPORTED conversation had the cursor that
+       * made the mirror run, so a terminal round on a dsh-born conversation was
+       * invisible here with no way to ask for it. `bootstrap` is that way.
+       */
+      harness.handle('transcript.sync', async (args) => {
+        const sessionId = String((args && args.sessionId) || '')
+        const session = sessionOf(sessionId)
+        if (session === undefined) return { ok: false, reason: 'no-session' }
+        const result = await syncTranscript(sessionId, session, true)
+        return { ok: result.reason !== 'failed', ...result }
+      }),
+
       harness.handle('claude.adopt', async (args) => {
         const sessionId = String(args.sessionId || '')
         const claudeSessionId = String(args.claudeSessionId || '')
@@ -7505,8 +8258,34 @@ return {
 
     // Hygiene on start and every half hour; detaching keeps Claude alive, this
     // keeps that from meaning forever.
-    loadPersistedStates().catch((error) => console.error('cc-mode: could not restore settings:', errorText(error)))
+    loadPersistedStates()
+      .then(() => armTimeout(() => { catchUpAfterRestart().catch(() => undefined) }, 3000))
+      .catch((error) => console.error('cc-mode: could not restore settings:', errorText(error)))
     armTimeout(rebindServices, 2000)
+
+    /**
+     * Pick up every loaded Claude conversation whose Claude kept working while
+     * dsh was down. Until now that waited for someone to open the conversation
+     * (state.get): one left in the background stayed frozen at the restart —
+     * no progress in the sidebar, no "done" — while its Claude finished the
+     * job. After the settings load, because the target lives in them.
+     */
+    async function catchUpAfterRestart() {
+      if (agents === undefined || shuttingDown) return
+      let picked = 0
+      for (const agent of agents.list()) {
+        const sessionId = String(agent.id)
+        const session = agent.session
+        if (session === undefined || stateOf(sessionId, session).mode !== 'claude') continue
+        try {
+          await drainDetachedOutput(sessionId, session)
+          if (await resumeIdleFollow(sessionId, session)) picked += 1
+        } catch (error) {
+          console.error('cc-mode: catching up', sessionId, 'after the restart failed:', errorText(error))
+        }
+      }
+      if (picked > 0) console.log('cc-mode: following', picked, 'Claude conversation(s) that kept working across the restart')
+    }
 
     // A conversation left with an unanswered Claude tool call rejects every
     // later model request ("assistant message with 'tool_calls' must be followed
@@ -7520,6 +8299,6 @@ return {
     reapIdleBrokers().catch((error) => console.error('cc-mode: reap failed:', errorText(error)))
     ctx.interval(() => { reapIdleBrokers().catch(() => undefined) }, 10 * 60 * 1000)
 
-    console.log('cc-mode: host v100 ready — approval bridge', approval === undefined ? 'off' : 'on')
+    console.log('cc-mode: host v117 ready — approval bridge', approval === undefined ? 'off' : 'on')
   },
 }

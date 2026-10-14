@@ -2,6 +2,44 @@
 
 本文件记录 claude-in-dsh 的版本变化。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 1.13.0 — 未发布
+
+### 变化
+
+- **模型清单落后了一代：补上 5.5 代和 Fable 5.1，默认改成 Opus 5.5**。清单里最新的 Opus 还是 Opus 5，所以 Opus 5.5 发布之后在选择器里**根本列不出来**，想选也选不到；更隐蔽的是另一头——`routeLabel` / 状态恢复都按 `claude-opus-5-5[1m]` 去掉后缀后的 id **精确**匹配清单（不是前缀匹配），清单里没有这一行，座位上就只能显示那串原始 route 字符串。根因是这份清单按设计是手工维护的（Claude Code 没有模型清单命令），而手工维护的副本必然悄悄过期，和当年 broker 那份手工粘贴的源码一个道理。补齐 `claude-opus-5-5`、`claude-sonnet-5-5`、`claude-haiku-5-5`、`claude-fable-5-1`；`DEFAULT_MODEL` 从 `claude-opus-5` 改成 `claude-opus-5-5`（产品自己的默认，同样 1M 窗口，只影响**新**会话——存过模型的会话照旧保留自己的选择）。Haiku 5.5 标成 `reasoning: true`：它和 Haiku 4.5 不一样，是吃 `--effort` 的（`low`–`max`），所以 effort 座位该对它亮起来。
+
+  这一版的 id、显示名和家族不是凭记忆写的，是从装好的 `claude`（2.1.296）自己带的模型表里逐行核对的；新增的一条测试就拿那张表对账，**哪个家族落后一代就会直接报出来**（查不到 CLI 的机器上整条 skip）。
+
+  顺带一句 CLI 侧的行为差异，不是插件改的：Opus 5.5 的 effort 默认是 `medium`，而 Opus 5 是 `high`。effort 选「默认」的会话从 Opus 5 换到 Opus 5.5 会低一档，想要原来的深度就把 effort 显式选成 `high`。
+
+- **选目录那个框换成了真正的目录选择器**。它以前是一个套着 dsh 模型选择器 class 的下拉菜单：路径挤在 groupTitle 那一行小字里，「✓ 就用这个目录」「＋ 新建文件夹」「⬆ 上一级」和那台机器上全部子目录（含一堆点开头的隐藏目录）混在同一列 option 里排下去——一个「选哪一层」的问题被摊成一张没有层次的清单。现在是一个对话框：面包屑一行交代现在在哪儿、每一段都能点回去，列表一屏只放目录（隐藏目录默认收起，底部一个开关），底部「新建文件夹 / 显示隐藏目录 / 取消 / 确定」。确定提交的就是面包屑上那一层，所以「进哪儿就选哪儿」，不再有「选中了但没进去」这种二义；原来那行「上一级」也去掉了——面包屑的倒数第二段就是它。路径仍然一律由那台机器的 shell 说了算（`remote.dirs` 回的是它 `cd` 之后的 `pwd`），客户端只在这个 pwd 上接一段目录名，拼完再交回去 `cd` 一次。
+
+### 变化
+
+- **⋯ 菜单里「复制 Claude 会话 UUID」下面多了一行「同步终端那边的新消息」**。场景：一个对话在 dsh 里开着，之后在终端 `claude --resume <那个 uuid>` 接着聊——两边写的是同一个 transcript 文件，但终端说的话在 dsh 里看不到。镜像机制其实一直都有，卡在第一道门上：它要 `jsonlOffset` 这个游标，而游标**只有导入来的对话**才有（导入时记下文件大小）。在 dsh 里原生建的对话永远没有，于是同步对它整个关闭，也没有任何手动入口。游标也不能凭空造——从 0 开始会把 dsh 自己渲染过的历史重投一遍，从文件末尾开始又恰好丢掉要同步的那段。所以这个菜单项走一条 bootstrap 路径：读 transcript 尾部，凡是 tool call id 或正文已经在 dsh 日志里的一律跳过，然后把游标落在文件末尾——**从此这个对话就和导入对话一样走增量路径，不用再手动点**。写了 0 条时菜单行会说出原因（这一轮还在跑 / 不是 Claude 对话 / 找不到 transcript…），不闷着。
+
+### 修复
+
+- **一个调用被回了两条 tool/result，整份会话日志再也打不开**。现场（courtify/zhongxin 的一个对话）：补录投影遇到一个没等到结果的调用，按设计给它盖了「这次调用没有等到结果（上一次运行被中断）。」把 step 1 收尾；两分钟后真结果（`Command did not complete within its 120s timeout…`）从 Claude 的流里到了，被当成一条正常结果写进当时开着的 **step 2**——而那一步从没声明过这个调用。dsh 不拒绝这次写入，它**拒绝下一次加载**：`tool/result <id> has no advertised tool lifecycle`，对话直接打不开。
+
+  根因是一轮的「一个调用一条结果」那份记账只认得它自己写过的，而代码注释写的本来是「One result per call, **whoever writes it**」——漏的正是 whoever：补录投影盖完章就消亡，记账跟着没了，两分钟后全新的一轮对那个章一无所知。现在 `answered` 从会话日志里种（`settledCallIds`），不再从空集合开始，所以无论先前是谁盖的章都算。
+
+  同时给 `repair-v4-log.mjs` 加了第 6 条规则：同一个调用的重复 tool/result → 改写成可忽略事件，原内容留在里面。它原有的「结不了任何调用的 tool/result」那条认不出这种形态——`advertised` 是整份日志累积的集合，第二条的 callId 当然在里面；判「还开着没有」要用 `unresolved` 那份账。扫过全部会话：另有一个对话中了同一个 bug（8 处），还有两个是另一类旧坏行（步号重编）。
+
+- **`/restart` 失效——其实整个斜杠命令菜单在 Claude 会话里都废了**。dsh 0.2 的 `CommandContribution` 把菜单行的文案收成了方法（`label?(): string` / `description?(): string`，为了换语言时不必重新注册），而插件三处 `commandUi.register` 传的都是字符串。后果远不止「这一行少个说明」：候选合成是一个遍历所有 contribution 的循环，循环体里直接写 `contribution.description()`，所以**任何一个**传了字符串，整个 `candidates()` 就抛 TypeError。插件所有命令的 `available` 都是「这是个 Claude 会话吗」，于是症状正好对得上——DSH 会话里菜单好的（全被 `available=false` 跳过），一进 Claude 会话 `/restart` 连同 Claude 自己那 68 个命令一起消失。注册时不报错，所以日志里也看不到。三处都改成函数，另加一条静态形状检查：每个 `commandUi.register` 的顶层 `label`/`description` 若出现必须是函数（popupSelect 选项里的 `label` 是另一个契约，`SelectOption.label` 本就是 string，不受影响）。
+
+- **会话行 ⋯ 菜单的两项改用 dsh 的正式槽位，不再克隆 DOM**。原来的做法是把 dsh 已经渲染出来的菜单行克隆一份、改掉文字插进 DOM，再用一个 MutationObserver 加 300ms 轮询不停重插——因为 dsh 的 Menu 会自己量尺寸并在最终位置重渲染，那次 reconcile 会丢掉 React 不认识的节点。dsh 0.2 把这个座位正式声明了：`sidebar.workspaces.session.menu.item`，而它自己的 JSDoc 例子恰好就是「复制 session id」这一项。迁过去之后克隆、观察者、这两项的轮询、以及为了排序而发明的插入锚点全部删掉，两行成为 dsh 列表真正的子节点（它的键盘遍历和焦点归还因此认得它们），外观靠穿 dsh `MenuItemButton` 自己的 class 保证逐字一致——实测两项的 `item`/`itemWrap` class 和「置顶会话」那几行完全相同。可见性也从"点击时记下是哪一行"变成组件自己按 `engines` 判断，实测非 Claude 对话的菜单里这两项不出现。顺带把迁移过程中克隆方案暴露的一个 bug 一起带走了：克隆源写的是 `items[0]`，而第一次注入后 `items[0]` 已经是我们自己的行，于是第二项克隆了第一项，连 marker class 和改写过的文案一起抄走，页面上是一行顶着两个 marker、写着「同步终端那边的新消息复制 Claude 会话 UUID」的东西。
+
+  **项目行（workspace row）的「导入 Claude Code 对话」仍然是克隆**：那个菜单 dsh 直接渲染 rename/delete，契约里没有给它槽位（只有 `session.menu.item` / `session.row.action` / `directoryFlow` 三个），所以克隆器和它的轮询为这一项保留；克隆源现在会排除我们自己的行。
+
+- **安全分类器拦下一段回复时，dsh 整段安静，像卡住了**。Claude Code 在 `-p --output-format stream-json` 这条路上，用一条 `system/model_refusal_fallback` 事件报告「上一段被安全分类器停了」：带 `fallback_model` 时在本轮切到那个模型重答（实测切 Opus 5 → Opus 4.8），该拒绝类别没有 fallback 时拒绝维持、这一轮空收。两种支都先出一条 `stop_reason` 为 `"refusal"` 的 `message_delta`，而被拒的 assistant 消息内容是空的——没有任何文字跟着回来。插件以前把 `model_refusal_fallback`、`informational` 这些 system 事件连同空回复一律 `continue` 丢掉（合成的「你刚才那段被安全分类器停了」user 消息则由 `isSynthetic` 正确挡下），于是在停流 + 切模型 + 重试的整段里，dsh 的 transcript 一个字都不写——有过一个对话连着撞六次，就是连着静默六次；拒绝维持那次还留下一个彻底空白的轮。这和当年 `compact_boundary` 不报、「dsh 突然安静然后若无其事继续」是同一类 bug，照同样的办法处理：重试支写一条点名 fallback 模型和拒绝类别的提示，拒绝维持那支在空结果上写一条「这一轮没有产出」。判定走通用信号（`message_delta` 的 `stop_reason === "refusal"`），所以两种支都兜得住。
+
+- **导入对话等几个面板是半透明的，身后的聊天内容直接透上来**。它们拿 `--dsw-specific-menu` 当底色，而那是**菜单面**的 token：dsh 0.2 起它的值是 `#f8f9fa94` / `#43454a73` 这种半透明色，设计上必须配 `backdrop-filter: blur(40px) saturate(150%)` 才成立——dsh 自己每一处用它的地方都是成对出现的。只取底色不取模糊，等于把一块毛玻璃的配方抄走了一半。dsh 自己的对话框卡用的是 l2 实色面 + `--dsw-elevation-prominent`（0.5px 描边画在投影里，所以组件 `border: 0`），遮罩用 `--dsw-alias-bg-mask-1`；现在照它来。顺带把这些面板的内距、圆角和底部按钮对齐 dsh 的 Button（36px 高、`--dsw-radius-md`、14/22 字）。
+
+- **输入框下方的用量读数点一下会刷新，但悬停时毫无反应**，看着像一行死文字。那个 `ccmode-usage-clickable` 类名一直在 DOM 上，样式表里却从来没有这条规则。现在照隔壁 dsh 自己的 StatsPills 来：药丸形，hover 起一块 `--dsw-alias-interactive-bg-hover` 底色，`:active` 再深一档，键盘聚焦也有同样的底色加一圈 focus ring（它本来就是 `role="button"` + `tabIndex=0`）。
+
+- **删掉一个被遮住的重名函数**。`baseName` 在客户端半边声明了两次，后一个把前一个整个盖掉了——前面那个处理路径的版本一个调用者都没有，改它等于改空气。
+
 ## 1.12.0 — 未发布
 
 ### 修复

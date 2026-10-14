@@ -569,7 +569,10 @@ test('同一个 dsh 项目 + 同一个目标，下一个会话开在上次那里
   assert.equal(made.lookupDir('/Users/me/projects/C', 'box'), '', '没去过的项目不瞎猜')
 })
 
-test('升级不会让每个目标都忘掉自己在哪儿工作', () => {
+// 旧版只按目标记的键（`box` → 某个项目的目录）当年是升级兜底，结果成了一条
+// 永远不更新的全局默认：任何没在这台机器上用过的项目，新会话都静默开到
+// 别的项目里去（实测 worker → ~/code/courtify/zhongxin）。
+test('没记过的项目不借别的项目的目录，旧版的无工作区键不再读', () => {
   const lastDirs = new Map()
   const names = ['dirKey', 'lookupDir', 'rememberDir']
   const made = new Function('lastDirs', 'persistStates', `
@@ -577,12 +580,62 @@ test('升级不会让每个目标都忘掉自己在哪儿工作', () => {
     return { dirKey, lookupDir, rememberDir }
   `)(lastDirs, () => undefined)
 
-  // 旧版存下来的键只有目标名，没有工作区。
   lastDirs.set('box', '/srv/legacy')
-  assert.equal(made.lookupDir('/Users/me/projects/A', 'box'), '/srv/legacy', '先用旧记忆兜底')
-
-  // 一旦这个项目自己记下过，就不再回退。
+  assert.equal(made.lookupDir('/Users/me/projects/A', 'box'), '')
+  assert.equal(made.lookupDir('', 'box'), '', '还不知道项目时也不猜')
   made.rememberDir({ id: 'box' }, '/srv/a', '/Users/me/projects/A')
   assert.equal(made.lookupDir('/Users/me/projects/A', 'box'), '/srv/a')
-  assert.equal(made.lookupDir('/Users/me/projects/Z', 'box'), '/srv/legacy', '没记过的项目仍然兜底')
+})
+
+test('加载时丢掉无工作区的旧键', () => {
+  const load = source.slice(source.indexOf("const savedDirs = stored['#lastDirs']"))
+  assert.match(load.slice(0, 600), /if \(!id\.includes\('\\u0000'\) \|\| id\.startsWith\('\\u0000'\)\) continue/)
+})
+
+// 新会话默认开在本机，再在界面上切到目标：mode.set 以前不读项目记忆，目录
+// 留空，Claude 开在 home，启动时还把 home 记成这个项目的目录——下一个会话
+// 就「固定」在 home 了。
+test('界面上切目标和 mesh 的 setRemote 同一条规则：换目标就换成这个项目在它上面的目录', () => {
+  const handler = source.slice(source.indexOf("harness.handle('mode.set'"), source.indexOf("harness.handle('remote.cwd.set'"))
+  assert.match(handler, /if \(state\.remote === args\.remote\) state\.remoteCwd = lookupDir\(workspaceOf\(sessionId\), args\.remote\)/)
+  // 显式给了目录时，它在后面覆盖记忆值。
+  assert.ok(handler.indexOf('lookupDir(workspaceOf(sessionId), args.remote)') < handler.indexOf('state.remoteCwd = args.remoteCwd.trim()'))
+})
+
+test('启动前目录还空着就再查一次项目记忆，不把目标的 home 记成项目目录', () => {
+  const start = source.indexOf('async function ensureRun(')
+  const ensureRun = source.slice(start, source.indexOf('const dir = sessionDir(sessionId)', start))
+  const reread = ensureRun.indexOf('state.remoteCwd = lookupDir(workspaceOf(sessionId), remote.id)')
+  assert.notEqual(reread, -1)
+  assert.ok(reread < ensureRun.indexOf('cwd = await remoteCwdOf(state, remote)'))
+  assert.match(ensureRun, /state\.remoteCwd === ''\) && !remoteLockedFor\(state\)/)
+})
+
+// 新会话里在目录芯片上换了目录，再点导入，列的还是项目记忆里的老目录；
+// 从空草稿点导入时 dsh 还没交出会话，认不出项目，退回了别的项目的目录。
+test('导入的目录：本会话选过的优先，其次项目记忆；项目认不出时用客户端带来的 cwd', async () => {
+  const handlers = {}
+  const lastDirs = new Map([['/Users/me/proj\u0000box', '/srv/remembered']])
+  const names = ['dirKey', 'lookupDir']
+  const register = new Function('harness', 'states', 'lastDirs', 'REMOTES', 'workspaceOf', 'remoteHome', `
+    ${names.map(sliceFunction).join('\n')}
+    harness.handle('claude.sources', ${(() => {
+      const start = source.indexOf("harness.handle('claude.sources', ") + "harness.handle('claude.sources', ".length
+      const end = source.indexOf("harness.handle('claude.conversations'")
+      return source.slice(start, source.lastIndexOf('}),', end) + 1)
+    })()})
+  `)
+  const states = new Map()
+  const REMOTES = new Map([['box', { id: 'box', label: 'box', dir: '' }]])
+  register({ handle: (name, fn) => { handlers[name] = fn } }, states, lastDirs, REMOTES, () => '', async () => '/home/me')
+  const boxOf = async (args) => (await handlers['claude.sources'](args)).sources.find((entry) => entry.id === 'box').cwd
+
+  assert.equal(await boxOf({ sessionId: 's', cwd: '/Users/me/proj' }), '/srv/remembered', '认不出项目时用客户端的 cwd')
+  states.set('s', { remote: 'box', remoteCwd: '/srv/just-picked' })
+  assert.equal(await boxOf({ sessionId: 's', cwd: '/Users/me/proj' }), '/srv/just-picked', '本会话刚选的优先')
+  states.set('s', { remote: 'other', remoteCwd: '/srv/elsewhere' })
+  assert.equal(await boxOf({ sessionId: 's', cwd: '/Users/me/proj' }), '/srv/remembered', '别的目标上选的目录不串过来')
+  assert.equal(states.size, 1)
+  assert.equal(await boxOf({ sessionId: 'new', cwd: '/Users/me/other' }), '/home/me', '没记过就用目标的 home')
+  assert.equal(states.has('new'), false, '浏览不凭空造会话状态')
 })

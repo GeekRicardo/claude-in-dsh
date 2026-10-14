@@ -36,7 +36,7 @@ function sliceFunction(name) {
   throw new Error(`${name} 的花括号没有配平`)
 }
 
-const liveness = new Function('captureOn', `${sliceFunction('isAlive')}\nreturn isAlive`)(
+const liveness = new Function('captureOn', `${sliceFunction('isAlive')}\n${sliceFunction('liveness')}\nreturn isAlive`)(
   // captureOn(命令串, 目标, 超时)：插件里唯一的远端执行入口。本机档就是 /bin/sh -c。
   async (command) => {
     const { execFileSync: run } = await import('node:child_process')
@@ -134,4 +134,11 @@ test('每一条离开 broker 的路都先写记录', () => {
   }
   assert.match(broker, /out\.on\('error'/, '日志写入流的 error 必须有人接')
   assert.match(broker, /fifoReader\.on\('error'/, 'fifo 读取流的 error 必须有人接')
+})
+
+test('没有答复不等于死了：三态里的 unknown', async () => {
+  const probe = (answer) => new Function('captureOn', `${sliceFunction('liveness')}\nreturn liveness`)(async () => answer)
+  assert.equal(await probe('yes\n')(42), 'yes')
+  assert.equal(await probe('no\n')(42), 'no')
+  assert.equal(await probe('')(42), 'unknown', '超时、隧道断了都是空串——不能当成死了去杀、去重起')
 })

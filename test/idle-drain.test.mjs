@@ -39,6 +39,7 @@ function build(overrides) {
     IDLE_STOPPED: IDLE_STOPPED,
     IDLE_QUIET_MS: 10000,
     IDLE_TASK_QUIET_MS: 30 * 60 * 1000,
+    IDLE_ROUND_QUIET_MS: 30 * 60 * 1000,
     lastBackgroundTaskCount: async () => 0,
     idleSignal: new AbortController().signal,
     shuttingDown: false,
@@ -189,6 +190,35 @@ test('静默窗口里又来了消息就重新计时', async () => {
   await rig.stopIdleDrain(run)
 })
 
+test('自发的一轮跑到一半（前台工具在跑）不按十秒静默放手', async () => {
+  // 实测：唤醒轮里 Claude 前台 sleep 20，期间只有每 30 秒一条 tool_progress，
+  // 十秒窗口到点就在轮次中途放手了——已读的半轮没投影，续读点又在它后面。
+  const rig = build()
+  const run = makeRun()
+  rig.startIdleDrain('s', run)
+  run.push({ type: 'system', subtype: 'init' })
+  run.push({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: {} }] } })
+  await settle()
+  assert.equal(pending(rig).ms, TASK_QUIET, '轮次没收尾，静默只是工具在跑')
+  run.push({ type: 'result', ccmodeOffset: 300 })
+  await settle()
+  assert.equal(pending(rig).ms, QUIET, '收尾之后才回到短窗口')
+  await rig.stopIdleDrain(run)
+})
+
+test('真的超时放手时，续读点退回到最后一个投影过的边界', async () => {
+  const rig = build()
+  const run = makeRun()
+  rig.startIdleDrain('s', run, 100)
+  await settle()
+  run.consumed = 450
+  pending(rig).fn()
+  await settle()
+  await settle()
+  assert.equal(run.consumed, 100, '100 之后的字节没渲染过，记到 450 就等于宣布它们不存在')
+  assert.deepEqual(rig.calls.detached, ['s'])
+})
+
 test('轮次的投影终点取自 result 自带的位置', async () => {
   const rig = build()
   const run = makeRun()
@@ -279,6 +309,9 @@ function buildFollow(world) {
     launchSnapshot: () => 'bypassPermissions|',
     isAlive: async (pid) => world.alivePids.includes(pid),
     fileSize: async () => 9999,
+    // 续读位置的完整规则（检查点 → 锚最后一个调用）在 restart-catchup 里测；这里只给检查点。
+    resumeOffsetOf: async () => (world.attach === undefined || world.attach === null ? null : world.attach.offset),
+    nothingToFollow: async () => world.quiet === true,
     readJsonFile: async (p) => {
       if (p.endsWith('meta.json')) return world.meta
       if (p.endsWith('exit.json')) return world.exit === undefined ? null : world.exit
@@ -309,6 +342,27 @@ test('会话被打开时，还活着的 Claude 会被重新跟上', async () => 
   assert.deepEqual(rig.calls.attached, [1411490], '从上次记下的位置接着读')
   assert.deepEqual(rig.calls.followed, [1411490])
   assert.equal(rig.runs.has('s'), true, 'run 要登记，否则下一轮会再起一个进程')
+})
+
+test('没有没读的字节、也没有后台任务时不去跟——跟上去十秒后也只会放手', async () => {
+  // 客户端每 5 秒问一次 state，原来每问一次就为每个打开的对话建一条流再拆掉。
+  const rig = buildFollow({ meta: LIVE_META, alivePids: [4242], attach: { offset: 500 }, quiet: true })
+  assert.equal(await rig.resumeIdleFollow('s', SESSION), false)
+  assert.deepEqual(rig.calls.attached, [])
+  assert.equal(rig.runs.size, 0)
+})
+
+function buildProbe(answer) {
+  const deps = { shellQuote: (v) => "'" + v + "'", captureOn: async () => answer }
+  return new Function(...Object.keys(deps), sliceFunction('nothingToFollow') + '; return nothingToFollow')(...Object.values(deps))
+}
+
+test('跟不跟的探针：问不出来不等于没东西', async () => {
+  assert.equal(await buildProbe('probe 500\n')('/d', null, 500), true, '读到头了、从没开过后台任务')
+  assert.equal(await buildProbe('probe 500\n{"type":"system","subtype":"background_tasks_changed","tasks":[]}')('/d', null, 500), true)
+  assert.equal(await buildProbe('probe 500\n{"type":"system","subtype":"background_tasks_changed","tasks":[{"id":"b1"}]}')('/d', null, 500), false, '后台还有活')
+  assert.equal(await buildProbe('probe 900\n')('/d', null, 500), false, '有没读的字节')
+  assert.equal(await buildProbe('')('/d', null, 500), false, '目标机没答复：照旧去跟')
 })
 
 test('broker 已经死了就不跟——更不会顺手起一个新的', async () => {

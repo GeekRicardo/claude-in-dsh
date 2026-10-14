@@ -48,6 +48,8 @@ function build(dirs, options = {}) {
     states: new Map((options.known ?? []).map((id) => [id, {}])),
     runs: new Map((options.attached ?? []).map((id) => [id, {}])),
     activeTurns: new Map(),
+    residentBrokers: new Set(),
+    backgroundTaskCounts: new Map(),
     agents: { list: () => [] },
     shArgv: (command) => ['/bin/sh', '-c', command],
     shellQuote: (value) => "'" + String(value).replace(/'/g, "'\\''") + "'",

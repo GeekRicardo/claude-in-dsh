@@ -95,3 +95,66 @@ test('源码里 steering 不再当场 append，而是走 writeSteered', () => {
     '当场 append 就会夹在 tool/call 和 tool/result 中间')
   assert.ok(block.indexOf('writeSteered(') !== -1, 'steering 要走延迟写')
 })
+
+// ---- 下面驱动的是真正的 createTranscript（按名字从源码切出来），不是复刻品。
+
+function realTranscript() {
+  const slice = (name) => {
+    const start = source.indexOf(`function ${name}(`)
+    assert.notEqual(start, -1, `找不到 ${name}`)
+    let depth = 0
+    for (let i = source.indexOf('{', start); i < source.length; i += 1) {
+      if (source[i] === '{') depth += 1
+      else if (source[i] === '}' && --depth === 0) return source.slice(start, i + 1)
+    }
+  }
+  const names = ['createTranscript', 'stepForAssistant', 'appendChunk', 'runKindOf', 'runMemberOf', 'extendsRun',
+    'blockTypeOf', 'finishedBlock', 'assistantBlocksOf', 'tokenUsageOf', 'resultBlocksOf', 'toolResultMessage',
+    'uuid', 'dshToolName', 'dshToolArgs', 'lastStepOf', 'sessionEvents', 'settledCallIds']
+  // flushAssistant lives inside createTranscript, so it comes along.
+  const events = []
+  const session = { append: (type) => events.push(type), snapshotEvents: () => [] }
+  const make = new Function('PROVIDER', 'console', 'errorText', 'DSH_TOOL_NAMES', 'ARG_RENAMES',
+    names.map(slice).join('\n') + '\nreturn createTranscript')
+  const transcript = make('claude-code', console, String, {}, {})(session, 1)
+  const text = (value) => {
+    transcript.streamEvent({ type: 'content_block_start', index: 0, content_block: { type: 'text' } })
+    transcript.streamEvent({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: value } })
+  }
+  return { transcript, events, text }
+}
+
+test('正文流到一半时插话：插话排在这段正文之后，而不是跑到它上面', () => {
+  // 实测：一篇 2500 字的回答写到一半来了一句插话，转录里插话排在整篇回答上面。
+  const { transcript, events, text } = realTranscript()
+  transcript.streamEvent({ type: 'message_start' })
+  text('长连接系统里')
+  transcript.deferUserMessage(() => events.push('user/message'))
+  assert.equal(events.includes('user/message'), false, '这段正文还没落成，插话不能先写')
+  transcript.streamEvent({ type: 'content_block_stop', index: 0 })
+  transcript.assistantMessage({ content: [{ type: 'text', text: '长连接系统里……' }], model: 'm' })
+  assert.equal(events.includes('user/message'), false, '消息还没收尾（message_stop 之前），插话继续等')
+  transcript.streamEvent({ type: 'message_stop' })
+  const at = events.indexOf('assistant/message')
+  assert.ok(at !== -1 && events.indexOf('user/message') > at, events.join(' '))
+})
+
+test('正文落成时还带着工具调用：插话继续等到结果配对齐', () => {
+  const { transcript, events, text } = realTranscript()
+  transcript.streamEvent({ type: 'message_start' })
+  text('先看一下')
+  transcript.deferUserMessage(() => events.push('user/message'))
+  transcript.assistantMessage({ content: [{ type: 'text', text: '先看一下' }, { type: 'tool_use', id: 'c1', name: 'Bash', input: {} }], model: 'm' })
+  assert.equal(events.includes('user/message'), false, '调用还没结果')
+  transcript.toolResults({ content: [{ type: 'tool_result', tool_use_id: 'c1', content: 'ok' }] })
+  assert.ok(events.indexOf('user/message') > events.indexOf('tool/result'), events.join(' '))
+})
+
+test('正文永远没落成（被打断）：收尾时插话照样补上', () => {
+  const { transcript, events, text } = realTranscript()
+  transcript.streamEvent({ type: 'message_start' })
+  text('写到一半')
+  transcript.deferUserMessage(() => events.push('user/message'))
+  transcript.finish()
+  assert.ok(events.includes('user/message'), '吃掉一条人说的话比顺序难看严重得多')
+})

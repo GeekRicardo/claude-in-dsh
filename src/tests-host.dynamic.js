@@ -61,9 +61,9 @@ return {
           const block = data.message && data.message.content ? data.message.content[0] : {}
           const text = (block.content || []).map((part) => part.text || '').join(' ').replace(/\s+/g, ' ').slice(0, 60)
           rows.push('tool/result' + (block.isError ? '!ERR' : '') + ' ' + text)
-        } else if (event.type === 'tool/code-dispatch-start') {
+        } else if (event.type === 'tool/ptc-dispatch-start') {
           rows.push('  sub/start ' + data.name + ' parent=' + String(data.parentCallId).slice(-6))
-        } else if (event.type === 'tool/code-dispatch') {
+        } else if (event.type === 'tool/ptc-dispatch') {
           rows.push('  sub/end   ' + data.name + (data.isError ? '!ERR' : ''))
         } else if (event.type === 'request/header') {
           rows.push('request/header ' + JSON.stringify(data.header && data.header.config))
